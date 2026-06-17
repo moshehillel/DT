@@ -1,0 +1,20 @@
+{
+  "project": "Diamant Telecom",
+  "flows": [
+    {
+      "name": "Repair Status Lookup",
+      "file": "twilio/repair-status-lookup.flow.json",
+      "purpose": "Customers call in, enter their phone number, and hear the current repair/return status on file."
+    },
+    {
+      "name": "Phones For Sale Menu",
+      "file": "twilio/phones-for-sale.flow.json",
+      "purpose": "Customers call in, hear phones currently for sale, choose one, and hear detailed specs and price."
+    }
+  ],
+  "backend_placeholders": {
+    "repairStatusLookup": "https://YOUR_FIREBASE_FUNCTION_URL/twilio/repair-status",
+    "phoneInventoryList": "https://YOUR_FIREBASE_FUNCTION_URL/twilio/phones",
+    "phoneInventoryDetails": "https://YOUR_FIREBASE_FUNCTION_URL/twilio/phones/detail"
+  }
+}

@@ -1,0 +1,332 @@
+{
+  "description": "Diamant Telecom - customer repair status lookup by phone number",
+  "states": [
+    {
+      "name": "Trigger",
+      "type": "trigger",
+      "transitions": [
+        {
+          "event": "incomingCall",
+          "next": "gather_customer_phone"
+        }
+      ],
+      "properties": {
+        "offset": {
+          "x": 0,
+          "y": 0
+        }
+      }
+    },
+    {
+      "name": "gather_customer_phone",
+      "type": "gather-input-on-call",
+      "transitions": [
+        {
+          "event": "keypress",
+          "next": "lookup_repair_status"
+        },
+        {
+          "event": "timeout",
+          "next": "say_no_phone_entered"
+        }
+      ],
+      "properties": {
+        "voice": "Polly.Joanna",
+        "language": "en-US",
+        "say": "Welcome to Diamant Telecom. To check your repair or return status, please enter the customer phone number on file, including area code, then press pound.",
+        "timeout": 8,
+        "finish_on_key": "#",
+        "num_digits": 10,
+        "offset": {
+          "x": 220,
+          "y": 80
+        }
+      }
+    },
+    {
+      "name": "lookup_repair_status",
+      "type": "make-http-request",
+      "transitions": [
+        {
+          "event": "success",
+          "next": "status_found_split"
+        },
+        {
+          "event": "failed",
+          "next": "say_lookup_error"
+        }
+      ],
+      "properties": {
+        "method": "POST",
+        "content_type": "application/json",
+        "url": "https://YOUR_FIREBASE_FUNCTION_URL/twilio/repair-status",
+        "parameters": [
+          {
+            "key": "phone",
+            "value": "{{widgets.gather_customer_phone.Digits}}"
+          },
+          {
+            "key": "caller",
+            "value": "{{contact.channel.address}}"
+          }
+        ],
+        "offset": {
+          "x": 520,
+          "y": 80
+        }
+      }
+    },
+    {
+      "name": "status_found_split",
+      "type": "split-based-on",
+      "transitions": [
+        {
+          "event": "match",
+          "next": "say_repair_status",
+          "conditions": [
+            {
+              "friendly_name": "Repair found",
+              "arguments": [
+                "{{widgets.lookup_repair_status.parsed.found}}"
+              ],
+              "type": "equal_to",
+              "value": "true"
+            }
+          ]
+        },
+        {
+          "event": "noMatch",
+          "next": "say_no_repair_found"
+        }
+      ],
+      "properties": {
+        "input": "{{widgets.lookup_repair_status.parsed.found}}",
+        "offset": {
+          "x": 820,
+          "y": 80
+        }
+      }
+    },
+    {
+      "name": "say_repair_status",
+      "type": "say-play",
+      "transitions": [
+        {
+          "event": "audioComplete",
+          "next": "gather_next_step"
+        }
+      ],
+      "properties": {
+        "voice": "Polly.Joanna",
+        "language": "en-US",
+        "say": "We found your repair for {{widgets.lookup_repair_status.parsed.model}}. Current status is {{widgets.lookup_repair_status.parsed.status}}. {{widgets.lookup_repair_status.parsed.customerMessage}}",
+        "offset": {
+          "x": 1120,
+          "y": 40
+        }
+      }
+    },
+    {
+      "name": "say_no_repair_found",
+      "type": "say-play",
+      "transitions": [
+        {
+          "event": "audioComplete",
+          "next": "gather_next_step"
+        }
+      ],
+      "properties": {
+        "voice": "Polly.Joanna",
+        "language": "en-US",
+        "say": "Sorry, we could not find a repair using that phone number. You can try again or stay on the line for the store.",
+        "offset": {
+          "x": 1120,
+          "y": 220
+        }
+      }
+    },
+    {
+      "name": "gather_next_step",
+      "type": "gather-input-on-call",
+      "transitions": [
+        {
+          "event": "keypress",
+          "next": "next_step_split"
+        },
+        {
+          "event": "timeout",
+          "next": "say_goodbye"
+        }
+      ],
+      "properties": {
+        "voice": "Polly.Joanna",
+        "language": "en-US",
+        "say": "Press 1 to check another phone number. Press 2 to hear phones currently for sale. Press 3 to speak with the store.",
+        "timeout": 6,
+        "num_digits": 1,
+        "offset": {
+          "x": 1420,
+          "y": 120
+        }
+      }
+    },
+    {
+      "name": "next_step_split",
+      "type": "split-based-on",
+      "transitions": [
+        {
+          "event": "match",
+          "next": "gather_customer_phone",
+          "conditions": [
+            {
+              "friendly_name": "Check another number",
+              "arguments": [
+                "{{widgets.gather_next_step.Digits}}"
+              ],
+              "type": "equal_to",
+              "value": "1"
+            }
+          ]
+        },
+        {
+          "event": "match",
+          "next": "say_inventory_transfer_note",
+          "conditions": [
+            {
+              "friendly_name": "Phones for sale",
+              "arguments": [
+                "{{widgets.gather_next_step.Digits}}"
+              ],
+              "type": "equal_to",
+              "value": "2"
+            }
+          ]
+        },
+        {
+          "event": "match",
+          "next": "connect_store",
+          "conditions": [
+            {
+              "friendly_name": "Speak with store",
+              "arguments": [
+                "{{widgets.gather_next_step.Digits}}"
+              ],
+              "type": "equal_to",
+              "value": "3"
+            }
+          ]
+        },
+        {
+          "event": "noMatch",
+          "next": "gather_next_step"
+        }
+      ],
+      "properties": {
+        "input": "{{widgets.gather_next_step.Digits}}",
+        "offset": {
+          "x": 1720,
+          "y": 120
+        }
+      }
+    },
+    {
+      "name": "connect_store",
+      "type": "connect-call-to",
+      "transitions": [
+        {
+          "event": "callCompleted"
+        },
+        {
+          "event": "hangup"
+        }
+      ],
+      "properties": {
+        "noun": "number",
+        "to": "+15555555555",
+        "caller_id": "{{contact.channel.address}}",
+        "offset": {
+          "x": 2020,
+          "y": 40
+        }
+      }
+    },
+    {
+      "name": "say_inventory_transfer_note",
+      "type": "say-play",
+      "transitions": [
+        {
+          "event": "audioComplete"
+        }
+      ],
+      "properties": {
+        "voice": "Polly.Joanna",
+        "language": "en-US",
+        "say": "Phones for sale are handled by the Diamant Telecom phones for sale flow. Assign another Twilio number to that flow, or connect this option to a subflow after publishing both flows.",
+        "offset": {
+          "x": 2020,
+          "y": 160
+        }
+      }
+    },
+    {
+      "name": "say_no_phone_entered",
+      "type": "say-play",
+      "transitions": [
+        {
+          "event": "audioComplete",
+          "next": "gather_customer_phone"
+        }
+      ],
+      "properties": {
+        "voice": "Polly.Joanna",
+        "language": "en-US",
+        "say": "I did not receive a phone number. Let's try again.",
+        "offset": {
+          "x": 520,
+          "y": 300
+        }
+      }
+    },
+    {
+      "name": "say_lookup_error",
+      "type": "say-play",
+      "transitions": [
+        {
+          "event": "audioComplete",
+          "next": "connect_store"
+        }
+      ],
+      "properties": {
+        "voice": "Polly.Joanna",
+        "language": "en-US",
+        "say": "Sorry, the lookup system is not available right now. Please stay on the line and we will connect you with the store.",
+        "offset": {
+          "x": 820,
+          "y": 360
+        }
+      }
+    },
+    {
+      "name": "say_goodbye",
+      "type": "say-play",
+      "transitions": [
+        {
+          "event": "audioComplete"
+        }
+      ],
+      "properties": {
+        "voice": "Polly.Joanna",
+        "language": "en-US",
+        "say": "Thank you for calling Diamant Telecom. Goodbye.",
+        "offset": {
+          "x": 1720,
+          "y": 360
+        }
+      }
+    }
+  ],
+  "initial_state": "Trigger",
+  "flags": {
+    "allow_concurrent_calls": true
+  }
+}

@@ -1,0 +1,400 @@
+{
+  "description": "Diamant Telecom - customers hear phones currently for sale and details for each phone",
+  "states": [
+    {
+      "name": "Trigger",
+      "type": "trigger",
+      "transitions": [
+        {
+          "event": "incomingCall",
+          "next": "load_inventory"
+        }
+      ],
+      "properties": {
+        "offset": {
+          "x": 0,
+          "y": 0
+        }
+      }
+    },
+    {
+      "name": "load_inventory",
+      "type": "make-http-request",
+      "transitions": [
+        {
+          "event": "success",
+          "next": "inventory_available_split"
+        },
+        {
+          "event": "failed",
+          "next": "say_inventory_error"
+        }
+      ],
+      "properties": {
+        "method": "GET",
+        "content_type": "application/json",
+        "url": "https://YOUR_FIREBASE_FUNCTION_URL/twilio/phones",
+        "offset": {
+          "x": 260,
+          "y": 80
+        }
+      }
+    },
+    {
+      "name": "inventory_available_split",
+      "type": "split-based-on",
+      "transitions": [
+        {
+          "event": "match",
+          "next": "gather_phone_choice",
+          "conditions": [
+            {
+              "friendly_name": "Phones available",
+              "arguments": [
+                "{{widgets.load_inventory.parsed.available}}"
+              ],
+              "type": "equal_to",
+              "value": "true"
+            }
+          ]
+        },
+        {
+          "event": "noMatch",
+          "next": "say_no_inventory"
+        }
+      ],
+      "properties": {
+        "input": "{{widgets.load_inventory.parsed.available}}",
+        "offset": {
+          "x": 560,
+          "y": 80
+        }
+      }
+    },
+    {
+      "name": "gather_phone_choice",
+      "type": "gather-input-on-call",
+      "transitions": [
+        {
+          "event": "keypress",
+          "next": "load_phone_details"
+        },
+        {
+          "event": "timeout",
+          "next": "repeat_inventory"
+        }
+      ],
+      "properties": {
+        "voice": "Polly.Joanna",
+        "language": "en-US",
+        "say": "Welcome to Diamant Telecom. Here are phones currently for sale. {{widgets.load_inventory.parsed.menuText}} Press the phone number option you want details for. Press 9 to speak with the store.",
+        "timeout": 10,
+        "num_digits": 1,
+        "offset": {
+          "x": 860,
+          "y": 80
+        }
+      }
+    },
+    {
+      "name": "load_phone_details",
+      "type": "make-http-request",
+      "transitions": [
+        {
+          "event": "success",
+          "next": "phone_choice_split"
+        },
+        {
+          "event": "failed",
+          "next": "say_inventory_error"
+        }
+      ],
+      "properties": {
+        "method": "POST",
+        "content_type": "application/json",
+        "url": "https://YOUR_FIREBASE_FUNCTION_URL/twilio/phones/detail",
+        "parameters": [
+          {
+            "key": "choice",
+            "value": "{{widgets.gather_phone_choice.Digits}}"
+          },
+          {
+            "key": "caller",
+            "value": "{{contact.channel.address}}"
+          }
+        ],
+        "offset": {
+          "x": 1160,
+          "y": 80
+        }
+      }
+    },
+    {
+      "name": "phone_choice_split",
+      "type": "split-based-on",
+      "transitions": [
+        {
+          "event": "match",
+          "next": "connect_store",
+          "conditions": [
+            {
+              "friendly_name": "Speak with store",
+              "arguments": [
+                "{{widgets.gather_phone_choice.Digits}}"
+              ],
+              "type": "equal_to",
+              "value": "9"
+            }
+          ]
+        },
+        {
+          "event": "match",
+          "next": "say_phone_details",
+          "conditions": [
+            {
+              "friendly_name": "Valid phone choice",
+              "arguments": [
+                "{{widgets.load_phone_details.parsed.found}}"
+              ],
+              "type": "equal_to",
+              "value": "true"
+            }
+          ]
+        },
+        {
+          "event": "noMatch",
+          "next": "say_invalid_choice"
+        }
+      ],
+      "properties": {
+        "input": "{{widgets.gather_phone_choice.Digits}}",
+        "offset": {
+          "x": 1460,
+          "y": 80
+        }
+      }
+    },
+    {
+      "name": "say_phone_details",
+      "type": "say-play",
+      "transitions": [
+        {
+          "event": "audioComplete",
+          "next": "gather_after_details"
+        }
+      ],
+      "properties": {
+        "voice": "Polly.Joanna",
+        "language": "en-US",
+        "say": "{{widgets.load_phone_details.parsed.detailText}}",
+        "offset": {
+          "x": 1760,
+          "y": 40
+        }
+      }
+    },
+    {
+      "name": "gather_after_details",
+      "type": "gather-input-on-call",
+      "transitions": [
+        {
+          "event": "keypress",
+          "next": "after_details_split"
+        },
+        {
+          "event": "timeout",
+          "next": "say_goodbye"
+        }
+      ],
+      "properties": {
+        "voice": "Polly.Joanna",
+        "language": "en-US",
+        "say": "Press 1 to hear all phones again. Press 2 to speak with the store. Press 3 to end this call.",
+        "timeout": 7,
+        "num_digits": 1,
+        "offset": {
+          "x": 2060,
+          "y": 80
+        }
+      }
+    },
+    {
+      "name": "after_details_split",
+      "type": "split-based-on",
+      "transitions": [
+        {
+          "event": "match",
+          "next": "load_inventory",
+          "conditions": [
+            {
+              "friendly_name": "Hear list again",
+              "arguments": [
+                "{{widgets.gather_after_details.Digits}}"
+              ],
+              "type": "equal_to",
+              "value": "1"
+            }
+          ]
+        },
+        {
+          "event": "match",
+          "next": "connect_store",
+          "conditions": [
+            {
+              "friendly_name": "Speak with store",
+              "arguments": [
+                "{{widgets.gather_after_details.Digits}}"
+              ],
+              "type": "equal_to",
+              "value": "2"
+            }
+          ]
+        },
+        {
+          "event": "match",
+          "next": "say_goodbye",
+          "conditions": [
+            {
+              "friendly_name": "End call",
+              "arguments": [
+                "{{widgets.gather_after_details.Digits}}"
+              ],
+              "type": "equal_to",
+              "value": "3"
+            }
+          ]
+        },
+        {
+          "event": "noMatch",
+          "next": "gather_after_details"
+        }
+      ],
+      "properties": {
+        "input": "{{widgets.gather_after_details.Digits}}",
+        "offset": {
+          "x": 2360,
+          "y": 80
+        }
+      }
+    },
+    {
+      "name": "repeat_inventory",
+      "type": "say-play",
+      "transitions": [
+        {
+          "event": "audioComplete",
+          "next": "gather_phone_choice"
+        }
+      ],
+      "properties": {
+        "voice": "Polly.Joanna",
+        "language": "en-US",
+        "say": "I did not receive a choice. I will repeat the list.",
+        "offset": {
+          "x": 1160,
+          "y": 300
+        }
+      }
+    },
+    {
+      "name": "say_invalid_choice",
+      "type": "say-play",
+      "transitions": [
+        {
+          "event": "audioComplete",
+          "next": "gather_phone_choice"
+        }
+      ],
+      "properties": {
+        "voice": "Polly.Joanna",
+        "language": "en-US",
+        "say": "Sorry, that phone option was not found. Please choose one of the available options.",
+        "offset": {
+          "x": 1760,
+          "y": 300
+        }
+      }
+    },
+    {
+      "name": "say_no_inventory",
+      "type": "say-play",
+      "transitions": [
+        {
+          "event": "audioComplete",
+          "next": "connect_store"
+        }
+      ],
+      "properties": {
+        "voice": "Polly.Joanna",
+        "language": "en-US",
+        "say": "There are no phones listed for sale right now. Please stay on the line and we will connect you with the store.",
+        "offset": {
+          "x": 860,
+          "y": 300
+        }
+      }
+    },
+    {
+      "name": "say_inventory_error",
+      "type": "say-play",
+      "transitions": [
+        {
+          "event": "audioComplete",
+          "next": "connect_store"
+        }
+      ],
+      "properties": {
+        "voice": "Polly.Joanna",
+        "language": "en-US",
+        "say": "Sorry, the phone inventory system is not available right now. Please stay on the line and we will connect you with the store.",
+        "offset": {
+          "x": 560,
+          "y": 320
+        }
+      }
+    },
+    {
+      "name": "connect_store",
+      "type": "connect-call-to",
+      "transitions": [
+        {
+          "event": "callCompleted"
+        },
+        {
+          "event": "hangup"
+        }
+      ],
+      "properties": {
+        "noun": "number",
+        "to": "+15555555555",
+        "caller_id": "{{contact.channel.address}}",
+        "offset": {
+          "x": 2660,
+          "y": 40
+        }
+      }
+    },
+    {
+      "name": "say_goodbye",
+      "type": "say-play",
+      "transitions": [
+        {
+          "event": "audioComplete"
+        }
+      ],
+      "properties": {
+        "voice": "Polly.Joanna",
+        "language": "en-US",
+        "say": "Thank you for calling Diamant Telecom. Goodbye.",
+        "offset": {
+          "x": 2660,
+          "y": 220
+        }
+      }
+    }
+  ],
+  "initial_state": "Trigger",
+  "flags": {
+    "allow_concurrent_calls": true
+  }
+}
