@@ -6,7 +6,7 @@ This folder contains two draft Twilio Studio voice flows.
 
 - `repair-status-lookup.flow.json`
   - Customer calls.
-  - Enters the phone number on file.
+  - Enters the phone number on file or the numbers from the repair ticket.
   - Flow calls a backend endpoint to find repair/return status.
   - Customer hears the status or gets connected to the store.
 
@@ -21,9 +21,9 @@ This folder contains two draft Twilio Studio voice flows.
 These URLs are placeholders inside the flow JSON files:
 
 ```text
-https://YOUR_FIREBASE_FUNCTION_URL/twilio/repair-status
-https://YOUR_FIREBASE_FUNCTION_URL/twilio/phones
-https://YOUR_FIREBASE_FUNCTION_URL/twilio/phones/detail
+https://REGION-PROJECT_ID.cloudfunctions.net/repairStatus
+https://REGION-PROJECT_ID.cloudfunctions.net/phoneInventoryList
+https://REGION-PROJECT_ID.cloudfunctions.net/phoneInventoryDetails
 ```
 
 Expected `repair-status` response:
@@ -31,6 +31,7 @@ Expected `repair-status` response:
 ```json
 {
   "found": true,
+  "ticketNumber": "DR-20260617-0001",
   "model": "iPhone 13",
   "status": "Ready",
   "customerMessage": "Your phone is ready for pickup today."
@@ -68,7 +69,7 @@ with the real store phone number.
 Replace:
 
 ```text
-https://YOUR_FIREBASE_FUNCTION_URL
+https://REGION-PROJECT_ID.cloudfunctions.net
 ```
 
 with the deployed Firebase Functions base URL.

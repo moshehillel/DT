@@ -13,8 +13,8 @@
     }
   ],
   "backend_placeholders": {
-    "repairStatusLookup": "https://YOUR_FIREBASE_FUNCTION_URL/twilio/repair-status",
-    "phoneInventoryList": "https://YOUR_FIREBASE_FUNCTION_URL/twilio/phones",
-    "phoneInventoryDetails": "https://YOUR_FIREBASE_FUNCTION_URL/twilio/phones/detail"
+    "repairStatusLookup": "https://REGION-PROJECT_ID.cloudfunctions.net/repairStatus",
+    "phoneInventoryList": "https://REGION-PROJECT_ID.cloudfunctions.net/phoneInventoryList",
+    "phoneInventoryDetails": "https://REGION-PROJECT_ID.cloudfunctions.net/phoneInventoryDetails"
   }
 }

@@ -33,7 +33,7 @@
       "properties": {
         "method": "GET",
         "content_type": "application/json",
-        "url": "https://YOUR_FIREBASE_FUNCTION_URL/twilio/phones",
+        "url": "https://REGION-PROJECT_ID.cloudfunctions.net/phoneInventoryList",
         "offset": {
           "x": 260,
           "y": 80
@@ -112,7 +112,7 @@
       "properties": {
         "method": "POST",
         "content_type": "application/json",
-        "url": "https://YOUR_FIREBASE_FUNCTION_URL/twilio/phones/detail",
+        "url": "https://REGION-PROJECT_ID.cloudfunctions.net/phoneInventoryDetails",
         "parameters": [
           {
             "key": "choice",

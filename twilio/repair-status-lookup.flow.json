@@ -1,5 +1,5 @@
 {
-  "description": "Diamant Telecom - customer repair status lookup by phone number",
+  "description": "Diamant Telecom - customer repair status lookup by phone number or ticket number",
   "states": [
     {
       "name": "Trigger",
@@ -7,7 +7,7 @@
       "transitions": [
         {
           "event": "incomingCall",
-          "next": "gather_customer_phone"
+          "next": "gather_repair_lookup"
         }
       ],
       "properties": {
@@ -18,7 +18,7 @@
       }
     },
     {
-      "name": "gather_customer_phone",
+      "name": "gather_repair_lookup",
       "type": "gather-input-on-call",
       "transitions": [
         {
@@ -33,10 +33,9 @@
       "properties": {
         "voice": "Polly.Joanna",
         "language": "en-US",
-        "say": "Welcome to Diamant Telecom. To check your repair or return status, please enter the customer phone number on file, including area code, then press pound.",
+        "say": "Welcome to Diamant Telecom. To check your repair or return status, enter the customer phone number on file, or enter the numbers from your repair ticket, then press pound.",
         "timeout": 8,
         "finish_on_key": "#",
-        "num_digits": 10,
         "offset": {
           "x": 220,
           "y": 80
@@ -59,11 +58,15 @@
       "properties": {
         "method": "POST",
         "content_type": "application/json",
-        "url": "https://YOUR_FIREBASE_FUNCTION_URL/twilio/repair-status",
+        "url": "https://REGION-PROJECT_ID.cloudfunctions.net/repairStatus",
         "parameters": [
           {
             "key": "phone",
-            "value": "{{widgets.gather_customer_phone.Digits}}"
+            "value": "{{widgets.gather_repair_lookup.Digits}}"
+          },
+          {
+            "key": "ticketLookup",
+            "value": "{{widgets.gather_repair_lookup.Digits}}"
           },
           {
             "key": "caller",
@@ -119,7 +122,7 @@
       "properties": {
         "voice": "Polly.Joanna",
         "language": "en-US",
-        "say": "We found your repair for {{widgets.lookup_repair_status.parsed.model}}. Current status is {{widgets.lookup_repair_status.parsed.status}}. {{widgets.lookup_repair_status.parsed.customerMessage}}",
+        "say": "We found repair ticket {{widgets.lookup_repair_status.parsed.ticketNumber}} for {{widgets.lookup_repair_status.parsed.model}}. Current status is {{widgets.lookup_repair_status.parsed.status}}. {{widgets.lookup_repair_status.parsed.customerMessage}}",
         "offset": {
           "x": 1120,
           "y": 40
@@ -138,7 +141,7 @@
       "properties": {
         "voice": "Polly.Joanna",
         "language": "en-US",
-        "say": "Sorry, we could not find a repair using that phone number. You can try again or stay on the line for the store.",
+        "say": "Sorry, we could not find a repair using that phone number or ticket number. You can try again or stay on the line for the store.",
         "offset": {
           "x": 1120,
           "y": 220
@@ -161,7 +164,7 @@
       "properties": {
         "voice": "Polly.Joanna",
         "language": "en-US",
-        "say": "Press 1 to check another phone number. Press 2 to hear phones currently for sale. Press 3 to speak with the store.",
+        "say": "Press 1 to check another phone number or ticket. Press 2 to hear phones currently for sale. Press 3 to speak with the store.",
         "timeout": 6,
         "num_digits": 1,
         "offset": {
@@ -176,7 +179,7 @@
       "transitions": [
         {
           "event": "match",
-          "next": "gather_customer_phone",
+          "next": "gather_repair_lookup",
           "conditions": [
             {
               "friendly_name": "Check another number",
@@ -274,13 +277,13 @@
       "transitions": [
         {
           "event": "audioComplete",
-          "next": "gather_customer_phone"
+          "next": "gather_repair_lookup"
         }
       ],
       "properties": {
         "voice": "Polly.Joanna",
         "language": "en-US",
-        "say": "I did not receive a phone number. Let's try again.",
+        "say": "I did not receive a phone number or ticket number. Let's try again.",
         "offset": {
           "x": 520,
           "y": 300
