@@ -1,6 +1,7 @@
 const crypto = require("node:crypto");
 const { onRequest } = require("firebase-functions/v2/https");
 const { onDocumentUpdated } = require("firebase-functions/v2/firestore");
+const { onSchedule } = require("firebase-functions/v2/scheduler");
 const logger = require("firebase-functions/logger");
 const admin = require("firebase-admin");
 const twilio = require("twilio");
@@ -18,6 +19,10 @@ const RCUK_API_KEY = process.env.RCUK_API_KEY || "";
 const RCUK_API_BASE_URL = process.env.RCUK_API_BASE_URL || "https://myaccount.rcuk.com/api";
 const RCUK_ADD_RENTAL_PATH = process.env.RCUK_ADD_RENTAL_PATH || "/rental/add-rental";
 const RCUK_GET_RENTAL_PATH = process.env.RCUK_GET_RENTAL_PATH || "/rental/get-rental";
+const SOLA_API_KEY = process.env.SOLA_API_KEY || "";
+const SOLA_API_BASE_URL = process.env.SOLA_API_BASE_URL || "https://x1.cardknox.com";
+const SOLA_CREATE_CHARGE_PATH = process.env.SOLA_CREATE_CHARGE_PATH || "/gatewayjson";
+const RENTAL_REMINDER_TIME_ZONE = process.env.RENTAL_REMINDER_TIME_ZONE || "America/New_York";
 
 function digitsOnly(value) {
   return String(value || "").replace(/\D/g, "");
@@ -293,12 +298,57 @@ function getTwilioClient() {
   return twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
 }
 
+async function sendCustomerNotification({ to, method, body }) {
+  const client = getTwilioClient();
+  if (!client) {
+    return {
+      status: "Queued",
+      detail: "Twilio credentials are not configured",
+    };
+  }
+
+  if (method === "Phone call") {
+    const call = await client.calls.create({
+      to,
+      from: TWILIO_FROM_NUMBER,
+      twiml: `<Response><Say>${escapeXml(body)}</Say></Response>`,
+    });
+    return {
+      status: "Sent",
+      detail: `Call ${call.sid}`,
+    };
+  }
+
+  const message = await client.messages.create({
+    to,
+    from: TWILIO_FROM_NUMBER,
+    body,
+  });
+  return {
+    status: "Sent",
+    detail: `SMS ${message.sid}`,
+  };
+}
+
 async function logNotification(reportId, report, status, detail) {
   await db.collection("notificationLogs").add({
     reportId,
     servedByEmployeeId: report.servedByEmployeeId || "",
     customerPhone: report.customerPhone || "",
     method: report.details?.notificationPreference || "Text message",
+    status,
+    detail,
+    createdAt: admin.firestore.FieldValue.serverTimestamp(),
+  });
+}
+
+async function writeNotificationLog(logId, reportId, report, method, status, detail, type) {
+  await db.collection("notificationLogs").doc(logId).set({
+    reportId,
+    type,
+    servedByEmployeeId: report.servedByEmployeeId || "",
+    customerPhone: report.customerPhone || "",
+    method,
     status,
     detail,
     createdAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -397,28 +447,51 @@ exports.shopifyOrderWebhook = onRequest({ region: REGION }, async (req, res) => 
   }
 
   const order = req.body || {};
-  const reportId = `shopify-${order.id}`;
+  const pendingReportId = `shopify-${order.id}`;
+  const lineItems = order.line_items || [];
+  const lineItemsText = lineItems
+    .map((item) => `${item.quantity || 1}x ${item.title || item.name || "Item"}`)
+    .join(", ");
 
-  await db.collection("reports").doc(reportId).set(
+  await db.collection("pendingReports").doc(pendingReportId).set(
     {
       type: "sale",
       source: "shopify_pos",
+      status: "pending",
       shopifyOrderId: String(order.id || ""),
       shopifyOrderName: order.name || "",
       createdAt: order.created_at || new Date().toISOString(),
-      servedBy: order.staff_member?.name || "Shopify POS",
-      servedByEmployeeId: order.staff_member?.id ? String(order.staff_member.id) : "shopify-pos",
       customerPhone: order.customer?.phone || order.phone || "",
       customerPhoneDigits: digitsOnly(order.customer?.phone || order.phone || ""),
       paymentAmount: order.total_price || "",
       paymentMethod: "Shopify POS",
-      notes: "Imported from Shopify POS webhook",
+      notes: "Imported from Shopify POS. Employee must claim and complete missing fields.",
+      imported: {
+        shopifyOrderId: String(order.id || ""),
+        shopifyOrderName: order.name || "",
+        totalPrice: order.total_price || "",
+        subtotalPrice: order.subtotal_price || "",
+        totalTax: order.total_tax || "",
+        currency: order.currency || "",
+        customerPhone: order.customer?.phone || order.phone || "",
+        customerEmail: order.customer?.email || order.email || "",
+        customerName: [order.customer?.first_name, order.customer?.last_name].filter(Boolean).join(" "),
+        staffName: order.staff_member?.name || "",
+        staffId: order.staff_member?.id ? String(order.staff_member.id) : "",
+        locationName: order.location?.name || "",
+        locationId: order.location_id ? String(order.location_id) : "",
+        lineItems,
+        lineItemsText,
+        paymentGatewayNames: order.payment_gateway_names || [],
+        financialStatus: order.financial_status || "",
+        fulfillmentStatus: order.fulfillment_status || "",
+      },
       details: {
         request: "Shopify POS sale",
         productType: "Shopify order",
-        model: (order.line_items || []).map((item) => item.title).join(", "),
+        model: lineItemsText,
         imei: "",
-        lineItems: order.line_items || [],
+        lineItems,
       },
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     },
@@ -531,5 +604,264 @@ exports.rcukGetRental = onRequest({ region: REGION }, async (req, res) => {
       ok: false,
       message: error.message || "RCUK get rental failed.",
     });
+  }
+});
+
+function normalizeSolaCharge(data) {
+  const charge = data.charge || data.payment || data.data || data;
+  return {
+    transactionId: charge.xRefNum
+      || charge.xRefnum
+      || charge.xAuthCode
+      || charge.transactionId
+      || charge.transaction_id
+      || charge.payment_id
+      || charge.paymentId
+      || charge.id
+      || "",
+    paymentUrl: charge.payment_url
+      || charge.paymentUrl
+      || charge.checkout_url
+      || charge.checkoutUrl
+      || charge.url
+      || "",
+    status: charge.xStatus || charge.status || data.status || "",
+    raw: data,
+  };
+}
+
+exports.solaCreateCharge = onRequest({ region: REGION }, async (req, res) => {
+  if (handleCors(req, res)) return;
+  if (req.method !== "POST") {
+    sendJson(res, 405, { error: "POST required" });
+    return;
+  }
+
+  const payload = getPayload(req);
+  const amount = Number.parseFloat(payload.amount || "0");
+  const paymentToken = payload.paymentToken || payload.solaToken || payload.sut || payload.xToken || "";
+
+  if (!Number.isFinite(amount) || amount <= 0) {
+    sendJson(res, 400, {
+      ok: false,
+      message: "A valid amount is required.",
+    });
+    return;
+  }
+
+  if (!paymentToken) {
+    sendJson(res, 400, {
+      ok: false,
+      message: "A Sola hosted-card token or SUT is required.",
+    });
+    return;
+  }
+
+  if (!SOLA_API_KEY) {
+    sendJson(res, 501, {
+      ok: false,
+      message: "Sola is not configured yet. Set SOLA_API_KEY on Firebase Functions.",
+    });
+    return;
+  }
+
+  try {
+    const solaPayload = {
+      xKey: SOLA_API_KEY,
+      xVersion: "5.0.0",
+      xSoftwareName: "Diamant Telecom Reports",
+      xSoftwareVersion: "0.1.0",
+      xCommand: "cc:sale",
+      xAmount: amount.toFixed(2),
+      xToken: paymentToken,
+      xCurrency: payload.currency || "USD",
+      xDescription: payload.description || "Diamant Telecom rental",
+      xCustom01: payload.rentalId || "",
+      xBillPhone: payload.customerPhone || "",
+    };
+
+    const response = await fetch(`${SOLA_API_BASE_URL}${SOLA_CREATE_CHARGE_PATH}`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(solaPayload),
+    });
+    const text = await response.text();
+    let data;
+    try {
+      data = text ? JSON.parse(text) : {};
+    } catch {
+      data = {
+        message: text || "Sola returned a non-JSON response.",
+      };
+    }
+    const normalized = normalizeSolaCharge(data);
+    const approved = String(data.xResult || data.xStatus || data.status || "").toLowerCase() === "approved"
+      || String(data.xStatus || data.status || "").toLowerCase() === "success";
+
+    if (!response.ok || !approved) {
+      sendJson(res, 400, {
+        ok: false,
+        message: data.xError || data.xErrorCode || data.message || "Sola charge failed.",
+        ...normalized,
+      });
+      return;
+    }
+
+    sendJson(res, 200, {
+      ok: true,
+      message: data.xResult || data.message || "Sola charge approved.",
+      ...normalized,
+      status: "approved",
+    });
+  } catch (error) {
+    logger.error("solaCreateCharge failed", error);
+    sendJson(res, 500, {
+      ok: false,
+      message: error.message || "Sola charge failed.",
+    });
+  }
+});
+
+function tomorrowDateString() {
+  const date = new Date();
+  date.setDate(date.getDate() + 1);
+  return [
+    date.getFullYear(),
+    String(date.getMonth() + 1).padStart(2, "0"),
+    String(date.getDate()).padStart(2, "0"),
+  ].join("-");
+}
+
+exports.sendRentalReturnReminders = onSchedule(
+  {
+    region: REGION,
+    schedule: "every day 10:00",
+    timeZone: RENTAL_REMINDER_TIME_ZONE,
+  },
+  async () => {
+    const tomorrow = tomorrowDateString();
+    const snapshot = await db
+      .collection("reports")
+      .where("type", "==", "rental")
+      .where("details.returnDueDate", "==", tomorrow)
+      .limit(500)
+      .get();
+
+    const body = "Hi, this is a friendly reminder from Diamant Telecom to return the phone you rented from us by tomorrow to avoid extra charges.";
+
+    await Promise.all(snapshot.docs.map(async (doc) => {
+      const report = doc.data() || {};
+      const logId = `rental-return-reminder-${doc.id}-${tomorrow}`;
+      const logRef = db.collection("notificationLogs").doc(logId);
+      const existingLog = await logRef.get();
+      if (existingLog.exists) return;
+
+      const method = report.details?.returnReminderPreference || "Text message";
+      const to = report.customerPhone || "";
+
+      if (!to) {
+        await writeNotificationLog(logId, doc.id, report, method, "Skipped", "No customer phone number", "rental-return-reminder");
+        return;
+      }
+
+      try {
+        const result = await sendCustomerNotification({ to, method, body });
+        await writeNotificationLog(logId, doc.id, report, method, result.status, result.detail, "rental-return-reminder");
+      } catch (error) {
+        logger.error("sendRentalReturnReminders failed", error);
+        await writeNotificationLog(logId, doc.id, report, method, "Failed", error.message, "rental-return-reminder");
+      }
+    }));
+  },
+);
+
+function buildPhoneOrderHandlerMessage(order) {
+  return [
+    `Phone order assigned: ${order.model || "phone order"}.`,
+    `Customer: ${order.customerName || "-"} ${order.customerPhone || ""}.`,
+    `Address: ${order.address || "-"}.`,
+    `Total: ${order.orderTotal || "0"}.`,
+    `Payment: ${order.paymentStatus || "Collect payment"}.`,
+    order.contactDetails ? `Contact: ${order.contactDetails}.` : "",
+    order.notes ? `Notes: ${order.notes}.` : "",
+  ].filter(Boolean).join(" ");
+}
+
+exports.notifyPhoneOrderAssigned = onRequest({ region: REGION }, async (req, res) => {
+  if (handleCors(req, res)) return;
+  if (req.method !== "POST") {
+    sendJson(res, 405, { error: "POST required" });
+    return;
+  }
+
+  try {
+    const order = getPayload(req);
+    const customerBody = `Diamant Telecom: your phone order for ${order.model || "your phone"} was assigned to ${order.assignedTo || "our team"}. We will contact you with updates.`;
+    const handlerBody = buildPhoneOrderHandlerMessage(order);
+    const results = [];
+
+    if (order.customerPhone) {
+      results.push({
+        to: order.customerPhone,
+        ...(await sendCustomerNotification({ to: order.customerPhone, method: "Text message", body: customerBody })),
+      });
+    }
+
+    if (order.assignedPhone) {
+      results.push({
+        to: order.assignedPhone,
+        ...(await sendCustomerNotification({ to: order.assignedPhone, method: "Text message", body: handlerBody })),
+      });
+    }
+
+    await db.collection("notificationLogs").add({
+      reportId: order.id || "",
+      type: "phone-order-assigned",
+      customerPhone: order.customerPhone || "",
+      assignedPhone: order.assignedPhone || "",
+      status: results.some((result) => result.status === "Sent") ? "Sent" : "Queued",
+      detail: JSON.stringify(results),
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    sendJson(res, 200, { ok: true, results });
+  } catch (error) {
+    logger.error("notifyPhoneOrderAssigned failed", error);
+    sendJson(res, 500, { ok: false, message: error.message || "Phone order assignment notification failed." });
+  }
+});
+
+exports.notifyPhoneOrderDelivered = onRequest({ region: REGION }, async (req, res) => {
+  if (handleCors(req, res)) return;
+  if (req.method !== "POST") {
+    sendJson(res, 405, { error: "POST required" });
+    return;
+  }
+
+  try {
+    const order = getPayload(req);
+    const body = `Diamant Telecom: your phone order for ${order.model || "your phone"} has been delivered. Thank you.`;
+
+    if (!order.customerPhone) {
+      sendJson(res, 400, { ok: false, message: "customerPhone is required." });
+      return;
+    }
+
+    const result = await sendCustomerNotification({ to: order.customerPhone, method: "Text message", body });
+    await db.collection("notificationLogs").add({
+      reportId: order.id || "",
+      type: "phone-order-delivered",
+      customerPhone: order.customerPhone || "",
+      status: result.status,
+      detail: result.detail,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    sendJson(res, 200, { ok: true, result });
+  } catch (error) {
+    logger.error("notifyPhoneOrderDelivered failed", error);
+    sendJson(res, 500, { ok: false, message: error.message || "Phone order delivered notification failed." });
   }
 });

@@ -3,6 +3,9 @@ import { createRoot } from "react-dom/client";
 import "./styles.css";
 
 const STORAGE_KEY = "diamant-telecom-reports-v1";
+const PENDING_REPORTS_KEY = "diamant-telecom-pending-reports-v1";
+const PHONE_ORDERS_KEY = "diamant-telecom-phone-orders-v1";
+const ORDER_HANDLERS_KEY = "diamant-telecom-order-handlers-v1";
 const EMPLOYEE_KEY = "diamant-telecom-employees-v1";
 const ACTIVE_EMPLOYEE_KEY = "diamant-telecom-active-employee-v1";
 const SESSION_KEY = "diamant-telecom-session-v1";
@@ -11,6 +14,9 @@ const ADMIN_PIN = "admin123";
 const FUNCTIONS_BASE_URL = import.meta.env.VITE_FUNCTIONS_BASE_URL || "";
 
 const defaultEmployees = ["Moshe", "Employee 1"];
+const defaultOrderHandlers = [
+  { id: "handler-default", name: "Moshe", phone: "", location: "Main store" },
+];
 const paymentMethods = ["Cash", "CC", "Check", "Card", "Zelle", "Cash App", "Apple Pay", "Other"];
 const repairStatuses = [
   "Received",
@@ -20,6 +26,7 @@ const repairStatuses = [
   "Ready",
   "Picked up",
   "Delivered",
+  "Completed",
   "Cancelled",
 ];
 
@@ -90,6 +97,13 @@ const reportTypes = {
       { name: "deposit", label: "Deposit", placeholder: "0.00" },
     ],
   },
+  phoneOrder: {
+    title: "Phone order",
+    label: "Phone order",
+    mark: "O",
+    description: "Manual deliveries",
+    fields: [],
+  },
 };
 
 function readJson(key, fallback) {
@@ -137,6 +151,9 @@ function App() {
   const [activeType, setActiveType] = useState("sale");
   const [employees, setEmployees] = useStoredState(EMPLOYEE_KEY, defaultEmployees);
   const [reports, setReports] = useStoredState(STORAGE_KEY, []);
+  const [pendingReports, setPendingReports] = useStoredState(PENDING_REPORTS_KEY, []);
+  const [phoneOrders, setPhoneOrders] = useStoredState(PHONE_ORDERS_KEY, []);
+  const [orderHandlers, setOrderHandlers] = useStoredState(ORDER_HANDLERS_KEY, defaultOrderHandlers);
   const [notifications, setNotifications] = useStoredState("diamant-telecom-notifications-v1", []);
   const [resetRequests, setResetRequests] = useStoredState(RESET_REQUESTS_KEY, []);
   const [activeEmployee, setActiveEmployee] = useState(
@@ -223,6 +240,88 @@ function App() {
     setFormNonce((value) => value + 1);
   }
 
+  function claimPendingReport(pendingReportId) {
+    setPendingReports((current) =>
+      current.map((report) =>
+        report.id === pendingReportId
+          ? {
+              ...report,
+              claimedBy: activeEmployee,
+              claimedAt: new Date().toISOString(),
+            }
+          : report,
+      ),
+    );
+  }
+
+  function savePendingReport(pendingReportId, completedReport) {
+    setReports((current) => [completedReport, ...current]);
+    setPendingReports((current) => current.filter((report) => report.id !== pendingReportId));
+  }
+
+  function createPhoneOrder(order) {
+    setPhoneOrders((current) => [order, ...current]);
+    queuePhoneOrderAssignedNotifications(order);
+    setFormNonce((value) => value + 1);
+  }
+
+  function completePhoneOrder(orderId) {
+    const order = phoneOrders.find((item) => item.id === orderId);
+    if (!order) return;
+
+    const deliveredAt = new Date().toISOString();
+    const completedReport = {
+      id: crypto.randomUUID(),
+      type: "phoneOrder",
+      createdAt: deliveredAt,
+      servedBy: order.assignedTo || activeEmployee,
+      customerPhone: order.customerPhone,
+      customerPhoneDigits: digitsOnly(order.customerPhone),
+      paymentAmount: order.orderTotal,
+      paymentMethod: order.paymentMethod,
+      notes: order.notes,
+      details: {
+        status: "Delivered",
+        location: order.location,
+        assignedTo: order.assignedTo,
+        assignedPhone: order.assignedPhone,
+        customerName: order.customerName,
+        contactDetails: order.contactDetails,
+        address: order.address,
+        model: order.model,
+        orderTotal: order.orderTotal,
+        paymentStatus: order.paymentStatus,
+        createdBy: order.createdBy,
+        orderedAt: order.createdAt,
+        deliveredAt,
+      },
+    };
+
+    setReports((current) => [completedReport, ...current]);
+    setPhoneOrders((current) => current.filter((item) => item.id !== orderId));
+    queuePhoneOrderDeliveredNotification(order);
+  }
+
+  function addOrderHandler(handler) {
+    const name = handler.name.trim();
+    const location = handler.location.trim();
+    if (!name || !location) return;
+
+    setOrderHandlers((current) => [
+      ...current,
+      {
+        id: crypto.randomUUID(),
+        name,
+        phone: handler.phone.trim(),
+        location,
+      },
+    ]);
+  }
+
+  function removeOrderHandler(handlerId) {
+    setOrderHandlers((current) => current.filter((handler) => handler.id !== handlerId));
+  }
+
   function updateRepairStatus(reportId, status) {
     const report = reports.find((item) => item.id === reportId);
     const oldStatus = report?.details?.status;
@@ -256,6 +355,63 @@ function App() {
     window.alert(
       `${method} queued for ${report.customerPhone}. This will send automatically after Firebase Cloud Functions / SMS provider is connected.`,
     );
+  }
+
+  async function sendPhoneOrderNotification(endpoint, payload) {
+    if (!FUNCTIONS_BASE_URL) return;
+
+    try {
+      await fetch(`${FUNCTIONS_BASE_URL}/${endpoint}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+    } catch {
+      // Local queue still records the notification; live delivery depends on deployed functions.
+    }
+  }
+
+  function queuePhoneOrderAssignedNotifications(order) {
+    const handlerMessage = `Phone order assigned: ${order.model}. Customer: ${order.customerName || "-"} ${order.customerPhone || ""}. Address: ${order.address || "-"}. Total: ${formatMoney(Number(order.orderTotal || 0))}. Payment: ${order.paymentStatus}. ${order.notes || ""}`;
+    const customerMessage = `Diamant Telecom: your phone order for ${order.model || "your phone"} was assigned to ${order.assignedTo}. We will contact you with updates.`;
+    const queued = [
+      {
+        id: crypto.randomUUID(),
+        reportId: order.id,
+        createdAt: new Date().toISOString(),
+        customerPhone: order.customerPhone,
+        method: "Text message",
+        status: "Queued for backend",
+        message: customerMessage,
+      },
+      {
+        id: crypto.randomUUID(),
+        reportId: order.id,
+        createdAt: new Date().toISOString(),
+        customerPhone: order.assignedPhone,
+        method: "Text message",
+        status: order.assignedPhone ? "Queued for backend" : "Missing handler phone",
+        message: handlerMessage,
+      },
+    ];
+
+    setNotifications((current) => [...queued, ...current]);
+    sendPhoneOrderNotification("notifyPhoneOrderAssigned", order);
+  }
+
+  function queuePhoneOrderDeliveredNotification(order) {
+    const notification = {
+      id: crypto.randomUUID(),
+      reportId: order.id,
+      createdAt: new Date().toISOString(),
+      customerPhone: order.customerPhone,
+      method: "Text message",
+      status: "Queued for backend",
+      message: `Diamant Telecom: your phone order for ${order.model || "your phone"} has been delivered. Thank you.`,
+    };
+
+    setNotifications((current) => [notification, ...current]);
+    sendPhoneOrderNotification("notifyPhoneOrderDelivered", order);
   }
 
   function addEmployee(name) {
@@ -381,13 +537,35 @@ function App() {
 
         <NotificationCenter notifications={appNotifications} />
 
-        {activeView === "reports" ? (
+        {activeView === "pendingReports" ? (
+          <PendingReportsPage
+            pendingReports={pendingReports}
+            activeEmployee={activeEmployee}
+            onClaim={claimPendingReport}
+            onSave={savePendingReport}
+          />
+        ) : activeView === "openRepairs" ? (
+          <OpenRepairsPage
+            reports={filteredReports}
+            onStatusChange={updateRepairStatus}
+          />
+        ) : activeView === "reports" ? (
           <>
             {activeType === "rental" ? (
               <RentalReportForm
                 key={`${activeType}-${formNonce}`}
                 activeEmployee={activeEmployee}
                 onSave={saveReport}
+              />
+            ) : activeType === "phoneOrder" ? (
+              <PhoneOrderPage
+                key={`${activeType}-${formNonce}`}
+                activeEmployee={activeEmployee}
+                sessionRole={sessionRole}
+                phoneOrders={phoneOrders}
+                orderHandlers={orderHandlers}
+                onCreate={createPhoneOrder}
+                onDelivered={completePhoneOrder}
               />
             ) : (
               <ReportForm
@@ -417,8 +595,11 @@ function App() {
             reports={reports}
             notifications={notifications}
             resetRequests={resetRequests}
+            orderHandlers={orderHandlers}
             onMarkResetHandled={markResetHandled}
             onResetPassword={requestPasswordReset}
+            onAddOrderHandler={addOrderHandler}
+            onRemoveOrderHandler={removeOrderHandler}
           />
         )}
       </main>
@@ -604,6 +785,28 @@ function Sidebar({
 
       {activeView === "reports" ? (
         <nav className="report-tabs" aria-label="Report type">
+          <button
+            className="tab pending-tab"
+            type="button"
+            onClick={() => onViewChange("pendingReports")}
+          >
+            <span className="tab-mark">P</span>
+            <span>
+              <strong>Pending reports</strong>
+              <small>Claim POS imports</small>
+            </span>
+          </button>
+          <button
+            className="tab open-repairs-tab"
+            type="button"
+            onClick={() => onViewChange("openRepairs")}
+          >
+            <span className="tab-mark">O</span>
+            <span>
+              <strong>Open repairs</strong>
+              <small>Active tickets</small>
+            </span>
+          </button>
           {Object.entries(reportTypes).map(([type, config]) => (
             <button
               className={`tab ${activeType === type ? "active" : ""}`}
@@ -618,6 +821,42 @@ function Sidebar({
               </span>
             </button>
           ))}
+        </nav>
+      ) : null}
+      {activeView === "openRepairs" ? (
+        <nav className="report-tabs" aria-label="Repair view">
+          <button className="tab active" type="button">
+            <span className="tab-mark">O</span>
+            <span>
+              <strong>Open repairs</strong>
+              <small>Active tickets</small>
+            </span>
+          </button>
+          <button className="tab" type="button" onClick={() => onViewChange("reports")}>
+            <span className="tab-mark">B</span>
+            <span>
+              <strong>Back</strong>
+              <small>New reports</small>
+            </span>
+          </button>
+        </nav>
+      ) : null}
+      {activeView === "pendingReports" ? (
+        <nav className="report-tabs" aria-label="Pending view">
+          <button className="tab active" type="button">
+            <span className="tab-mark">P</span>
+            <span>
+              <strong>Pending reports</strong>
+              <small>Claim POS imports</small>
+            </span>
+          </button>
+          <button className="tab" type="button" onClick={() => onViewChange("reports")}>
+            <span className="tab-mark">B</span>
+            <span>
+              <strong>Back</strong>
+              <small>New reports</small>
+            </span>
+          </button>
         </nav>
       ) : null}
     </aside>
@@ -816,6 +1055,7 @@ function RentalReportForm({ activeEmployee, onSave }) {
     simPhone: "",
     returnDays: "",
     paymentMethod: "Cash",
+    returnReminderPreference: "Text message",
     customerPhone: "",
     notes: "",
   });
@@ -826,6 +1066,14 @@ function RentalReportForm({ activeEmployee, onSave }) {
     cli: "",
     usDdi: "",
     getNumbersAttempted: false,
+    raw: null,
+  });
+  const [solaState, setSolaState] = useState({
+    status: "idle",
+    message: "",
+    paymentToken: "",
+    transactionId: "",
+    paymentUrl: "",
     raw: null,
   });
 
@@ -848,20 +1096,42 @@ function RentalReportForm({ activeEmployee, onSave }) {
   const numbersReady = hasCli && (!needsUsNumber || hasUsDdi);
   const rentalSubmitted = submitState.status === "submitted" || submitState.status === "numbers-ready";
   const minimumDaysValid = getMinimumRentalDays(form.rentalRegion) <= totalDays;
+  const requiresSolaCharge = form.paymentMethod === "CC";
+  const solaChargeComplete = !requiresSolaCharge || solaState.status === "paid";
   const canSubmitRental = isRentalFormComplete(form)
     && zoneDaysValid
     && minimumDaysValid
     && totalPrice > 0
     && isRcukRental;
   const canSave = isSimpleRental
-    ? isRentalFormComplete(form) && minimumDaysValid && totalPrice > 0
-    : rentalSubmitted && submitState.getNumbersAttempted;
+    ? isRentalFormComplete(form) && minimumDaysValid && totalPrice > 0 && solaChargeComplete
+    : rentalSubmitted && submitState.getNumbersAttempted && solaChargeComplete;
 
   function updateField(name, value) {
     setForm((current) => ({ ...current, [name]: value }));
+    if (["paymentMethod", "customerPhone", "startDate", "endDate", "serviceType", "addSms", "rentalRegion"].includes(name)) {
+      setSolaState({
+        status: "idle",
+        message: "",
+        paymentToken: "",
+        transactionId: "",
+        paymentUrl: "",
+        raw: null,
+      });
+    }
     setSubmitState((current) => (
       current.status === "idle" ? current : { ...current, message: "Rental changed. Submit to RCUK again before saving.", status: "idle", rentalId: "", cli: "", usDdi: "", getNumbersAttempted: false, raw: null }
     ));
+  }
+
+  function updateSolaToken(value) {
+    setSolaState((current) => ({
+      ...current,
+      paymentToken: value,
+      status: current.status === "paid" ? "idle" : current.status,
+      transactionId: current.status === "paid" ? "" : current.transactionId,
+      message: value.trim() ? "Sola token ready to charge." : "",
+    }));
   }
 
   function buildRentalPayload() {
@@ -883,9 +1153,78 @@ function RentalReportForm({ activeEmployee, onSave }) {
       return_days: form.returnDays,
       customer_phone: form.customerPhone,
       payment_method: form.paymentMethod,
+      return_reminder_preference: form.returnReminderPreference,
       total_price: totalPrice,
       notes: form.notes,
     };
+  }
+
+  async function chargeWithSola() {
+    if (!requiresSolaCharge || !totalPrice) return;
+
+    if (!FUNCTIONS_BASE_URL) {
+      setSolaState((current) => ({
+        ...current,
+        status: "error",
+        message: "Set VITE_FUNCTIONS_BASE_URL to your Firebase Functions URL before charging with Sola.",
+      }));
+      return;
+    }
+
+    setSolaState((current) => ({ ...current, status: "charging", message: "Opening Sola charge..." }));
+
+    try {
+      const response = await fetch(`${FUNCTIONS_BASE_URL}/solaCreateCharge`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          amount: totalPrice,
+          currency: "USD",
+          customerPhone: form.customerPhone,
+          rentalId: submitState.rentalId,
+          paymentToken: solaState.paymentToken,
+          description: `${form.rentalRegion} ${form.deviceKind} rental`,
+        }),
+      });
+      const data = await response.json();
+      const status = isSolaPaidStatus(data.status) ? "paid" : "pending";
+
+      if (!response.ok || !data.ok) {
+        setSolaState({
+          status: "error",
+          message: data.message || "Sola charge could not be started.",
+          paymentToken: solaState.paymentToken,
+          transactionId: data.transactionId || "",
+          paymentUrl: data.paymentUrl || "",
+          raw: data.raw || data,
+        });
+        return;
+      }
+
+      if (data.paymentUrl) {
+        window.open(data.paymentUrl, "_blank", "noopener,noreferrer");
+      }
+
+      setSolaState({
+        status,
+        message: status === "paid"
+          ? "Sola payment approved."
+          : "Sola payment started, but approval was not returned yet.",
+        paymentToken: solaState.paymentToken,
+        transactionId: data.transactionId || data.paymentId || "",
+        paymentUrl: data.paymentUrl || "",
+        raw: data.raw || data,
+      });
+    } catch (error) {
+      setSolaState({
+        status: "error",
+        message: error.message || "Could not connect to Sola.",
+        paymentToken: solaState.paymentToken,
+        transactionId: "",
+        paymentUrl: "",
+        raw: null,
+      });
+    }
   }
 
   async function submitRentalToRcuk() {
@@ -1028,6 +1367,7 @@ function RentalReportForm({ activeEmployee, onSave }) {
         endDate: form.endDate,
         returnTime: `${form.returnDays || 0} days`,
         returnDueDate: calculateReturnDueDate(form.endDate, form.returnDays),
+        returnReminderPreference: form.returnReminderPreference,
         totalDays,
         ukDays: numberValue(form.ukDays),
         euDays: numberValue(form.euDays),
@@ -1039,6 +1379,8 @@ function RentalReportForm({ activeEmployee, onSave }) {
         dailyRate,
         totalPrice,
         pricingLabel: rentalPricing.label,
+        solaStatus: requiresSolaCharge ? solaState.status : "",
+        solaTransactionId: requiresSolaCharge ? solaState.transactionId : "",
       },
     });
   }
@@ -1153,10 +1495,34 @@ function RentalReportForm({ activeEmployee, onSave }) {
               </select>
             </label>
             <label className="field">
+              <span>Return reminder</span>
+              <select value={form.returnReminderPreference} onChange={(event) => updateField("returnReminderPreference", event.target.value)}>
+                <option>Text message</option>
+                <option>Phone call</option>
+              </select>
+            </label>
+            <label className="field">
               <span>Served by</span>
               <input value={activeEmployee} disabled readOnly />
             </label>
           </div>
+
+          {requiresSolaCharge ? (
+            <div className="payment-panel">
+              <div>
+                <p className="eyebrow">Card payment</p>
+                <h3>Sola charge</h3>
+              </div>
+              <label className="field">
+                <span>Sola token / SUT</span>
+                <input value={solaState.paymentToken} onChange={(event) => updateSolaToken(event.target.value)} />
+              </label>
+              <button className="secondary-button" type="button" onClick={chargeWithSola} disabled={!totalPrice || !solaState.paymentToken || solaState.status === "charging"}>
+                Charge with Sola
+              </button>
+              <p className={solaState.status === "error" ? "summary-error" : "muted"}>{solaState.message}</p>
+            </div>
+          ) : null}
 
           <label className="field full">
             <span>Notes</span>
@@ -1197,6 +1563,9 @@ function RentalReportForm({ activeEmployee, onSave }) {
           {(isRcukRental ? !canSubmitRental : !canSave) ? (
             <div className="summary-error">{isRcukRental ? "Complete all rental fields before submitting." : "Complete all rental fields before saving."}</div>
           ) : null}
+          {requiresSolaCharge && !solaChargeComplete ? (
+            <div className="summary-error">Sola payment approval is required before saving a CC rental.</div>
+          ) : null}
           {isRcukRental ? (
             <div className="rental-result">
               <span>Rental ID</span>
@@ -1234,7 +1603,7 @@ function ReportHistory({
       acc[report.type] += 1;
       return acc;
     },
-    { count: 0, amount: 0, call: 0, sale: 0, repair: 0, sim: 0, rental: 0 },
+        { count: 0, amount: 0, call: 0, sale: 0, repair: 0, sim: 0, rental: 0, phoneOrder: 0 },
   );
 
   function updateFilter(name, value) {
@@ -1272,6 +1641,7 @@ function ReportHistory({
             <option value="repair">Repairs</option>
             <option value="sim">SIM activations</option>
             <option value="rental">Phone rentals</option>
+            <option value="phoneOrder">Phone orders</option>
           </select>
         </label>
         <label className="field">
@@ -1330,6 +1700,7 @@ function ReportHistory({
         <span className="metric">Repairs <strong>{totals.repair}</strong></span>
         <span className="metric">SIM <strong>{totals.sim}</strong></span>
         <span className="metric">Rentals <strong>{totals.rental}</strong></span>
+        <span className="metric">Orders <strong>{totals.phoneOrder}</strong></span>
         <span className="metric">Queued notices <strong>{notifications.length}</strong></span>
       </div>
 
@@ -1382,7 +1753,464 @@ function ReportHistory({
   );
 }
 
-function AdminPage({ employees, reports, notifications, resetRequests, onMarkResetHandled, onResetPassword }) {
+function OpenRepairsPage({ reports, onStatusChange }) {
+  const openRepairs = reports.filter((report) =>
+    report.type === "repair" && !["Completed", "Cancelled"].includes(report.details?.status),
+  );
+
+  return (
+    <section className="history">
+      <div className="history-header">
+        <div>
+          <p className="eyebrow">Repair queue</p>
+          <h2>Open repairs</h2>
+        </div>
+        <span className="metric">Open <strong>{openRepairs.length}</strong></span>
+      </div>
+
+      <div className="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Ticket</th>
+              <th>Date</th>
+              <th>Customer</th>
+              <th>Phone</th>
+              <th>Damage</th>
+              <th>Paid</th>
+              <th>Served by</th>
+              <th>Status</th>
+            </tr>
+          </thead>
+          <tbody>
+            {openRepairs.length ? (
+              openRepairs.map((repair) => (
+                <tr key={repair.id}>
+                  <td><strong>{repair.details?.ticketNumber || "-"}</strong></td>
+                  <td>{formatShortDate(repair.createdAt)}</td>
+                  <td>{repair.customerPhone || "-"}</td>
+                  <td>{repair.details?.model || "-"}</td>
+                  <td>{repair.details?.damage || "-"}</td>
+                  <td>{repair.details?.paymentStatus || "-"}</td>
+                  <td>{repair.servedBy || "-"}</td>
+                  <td>
+                    <select
+                      className="status-select"
+                      value={repair.details?.status || repairStatuses[0]}
+                      onChange={(event) => onStatusChange(repair.id, event.target.value)}
+                    >
+                      {repairStatuses.map((status) => (
+                        <option key={status}>{status}</option>
+                      ))}
+                    </select>
+                  </td>
+                </tr>
+              ))
+            ) : (
+              <tr>
+                <td colSpan="8" className="empty-state">No open repairs.</td>
+              </tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  );
+}
+
+function PendingReportsPage({ pendingReports, activeEmployee, onClaim, onSave }) {
+  return (
+    <section className="history">
+      <div className="history-header">
+        <div>
+          <p className="eyebrow">Shared queue</p>
+          <h2>Pending reports</h2>
+        </div>
+        <span className="metric">Pending <strong>{pendingReports.length}</strong></span>
+      </div>
+
+      <div className="pending-grid">
+        {pendingReports.length ? (
+          pendingReports.map((pendingReport) => (
+            <PendingReportCard
+              key={pendingReport.id}
+              pendingReport={pendingReport}
+              activeEmployee={activeEmployee}
+              onClaim={onClaim}
+              onSave={onSave}
+            />
+          ))
+        ) : (
+          <p className="empty-state">No pending reports.</p>
+        )}
+      </div>
+    </section>
+  );
+}
+
+function PendingReportCard({ pendingReport, activeEmployee, onClaim, onSave }) {
+  const imported = pendingReport.imported || {};
+  const claimedBySomeoneElse = pendingReport.claimedBy && pendingReport.claimedBy !== activeEmployee;
+  const isClaimedByMe = pendingReport.claimedBy === activeEmployee;
+  const [fields, setFields] = useState({
+    customerPhone: pendingReport.customerPhone || imported.customerPhone || "",
+    productType: pendingReport.details?.productType || "Phone",
+    model: pendingReport.details?.model || imported.lineItemsText || "",
+    imei: pendingReport.details?.imei || "",
+    notes: pendingReport.notes || "",
+    paymentAmount: pendingReport.paymentAmount || imported.totalPrice || "",
+    paymentMethod: pendingReport.paymentMethod || "Shopify POS",
+  });
+
+  function updateField(name, value) {
+    setFields((current) => ({ ...current, [name]: value }));
+  }
+
+  const canSave = isClaimedByMe
+    && fields.customerPhone.trim()
+    && fields.productType.trim()
+    && fields.model.trim()
+    && fields.paymentAmount.trim()
+    && fields.paymentMethod.trim();
+
+  function saveCompletedReport() {
+    if (!canSave) return;
+
+    onSave(pendingReport.id, {
+      id: crypto.randomUUID(),
+      type: pendingReport.type || "sale",
+      source: pendingReport.source || "shopify_pos",
+      pendingSourceId: pendingReport.id,
+      createdAt: new Date().toISOString(),
+      importedAt: pendingReport.createdAt,
+      servedBy: activeEmployee,
+      signature: activeEmployee,
+      signedAt: new Date().toISOString(),
+      customerPhone: fields.customerPhone.trim(),
+      customerPhoneDigits: digitsOnly(fields.customerPhone),
+      paymentAmount: fields.paymentAmount.trim(),
+      paymentMethod: fields.paymentMethod.trim(),
+      notes: fields.notes.trim(),
+      details: {
+        request: "Shopify POS sale",
+        productType: fields.productType.trim(),
+        model: fields.model.trim(),
+        imei: fields.imei.trim(),
+        shopifyOrderId: imported.shopifyOrderId || "",
+        shopifyOrderName: imported.shopifyOrderName || "",
+        shopifyLocation: imported.locationName || "",
+        shopifyStaff: imported.staffName || "",
+        lineItems: imported.lineItems || [],
+      },
+    });
+  }
+
+  return (
+    <article className={`pending-card ${isClaimedByMe ? "claimed" : ""}`}>
+      <div className="pending-card-head">
+        <div>
+          <p className="eyebrow">{pendingReport.source === "shopify_pos" ? "Shopify POS" : "Pending"}</p>
+          <h3>{imported.shopifyOrderName || pendingReport.title || "Pending sale"}</h3>
+        </div>
+        <span className="badge sale">{pendingReport.type || "sale"}</span>
+      </div>
+
+      <div className="pending-import">
+        <span><strong>Total:</strong> {formatPayment(fields.paymentAmount)}</span>
+        <span><strong>Customer:</strong> {fields.customerPhone || "-"}</span>
+        <span><strong>Items:</strong> {imported.lineItemsText || fields.model || "-"}</span>
+        <span><strong>Imported:</strong> {pendingReport.createdAt ? formatShortDate(pendingReport.createdAt) : "-"}</span>
+      </div>
+
+      <div className="claim-strip">
+        {pendingReport.claimedBy ? (
+          <span>Claimed by <strong>{pendingReport.claimedBy}</strong></span>
+        ) : (
+          <span>Unclaimed</span>
+        )}
+        {!pendingReport.claimedBy ? (
+          <button className="secondary-button" type="button" onClick={() => onClaim(pendingReport.id)}>
+            Claim report
+          </button>
+        ) : null}
+      </div>
+
+      {isClaimedByMe ? (
+        <div className="pending-fields">
+          <label className="field">
+            <span>Customer phone</span>
+            <input value={fields.customerPhone} onChange={(event) => updateField("customerPhone", event.target.value)} />
+          </label>
+          <label className="field">
+            <span>Product type</span>
+            <input value={fields.productType} onChange={(event) => updateField("productType", event.target.value)} />
+          </label>
+          <label className="field">
+            <span>Model / items</span>
+            <input value={fields.model} onChange={(event) => updateField("model", event.target.value)} />
+          </label>
+          <label className="field">
+            <span>IMEI</span>
+            <input value={fields.imei} onChange={(event) => updateField("imei", event.target.value)} />
+          </label>
+          <label className="field">
+            <span>Amount</span>
+            <input value={fields.paymentAmount} onChange={(event) => updateField("paymentAmount", event.target.value)} />
+          </label>
+          <label className="field">
+            <span>Payment method</span>
+            <select value={fields.paymentMethod} onChange={(event) => updateField("paymentMethod", event.target.value)}>
+              {paymentMethods.map((method) => <option key={method}>{method}</option>)}
+            </select>
+          </label>
+          <label className="field full">
+            <span>Notes / missing details</span>
+            <textarea rows="3" value={fields.notes} onChange={(event) => updateField("notes", event.target.value)} />
+          </label>
+          <button className="primary-button" type="button" disabled={!canSave} onClick={saveCompletedReport}>
+            Save report with signature
+          </button>
+        </div>
+      ) : null}
+
+      {claimedBySomeoneElse ? (
+        <p className="muted">Only {pendingReport.claimedBy} can complete this pending report.</p>
+      ) : null}
+    </article>
+  );
+}
+
+function PhoneOrderPage({ activeEmployee, sessionRole, phoneOrders, orderHandlers, onCreate, onDelivered }) {
+  const [now, setNow] = useState(new Date());
+  const [form, setForm] = useState({
+    location: orderHandlers[0]?.location || "",
+    assignedTo: orderHandlers[0]?.name || "",
+    customerName: "",
+    customerPhone: "",
+    contactDetails: "",
+    address: "",
+    model: "",
+    orderTotal: "",
+    paymentStatus: "Paid",
+    paymentMethod: "Cash",
+    notes: "",
+  });
+
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(new Date()), 30000);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  const locations = uniqueValues(orderHandlers.map((handler) => handler.location));
+  const locationHandlers = orderHandlers.filter((handler) => handler.location === form.location);
+  const selectedHandler = orderHandlers.find((handler) => handler.name === form.assignedTo && handler.location === form.location)
+    || locationHandlers[0]
+    || null;
+  const visibleOrders = sessionRole === "admin"
+    ? phoneOrders
+    : phoneOrders.filter((order) => order.assignedTo === activeEmployee);
+  const canCreate = form.location.trim()
+    && form.assignedTo.trim()
+    && form.customerPhone.trim()
+    && form.address.trim()
+    && form.model.trim()
+    && form.orderTotal.trim()
+    && form.paymentStatus.trim();
+
+  function updateField(name, value) {
+    setForm((current) => {
+      const next = { ...current, [name]: value };
+      if (name === "location") {
+        const firstHandler = orderHandlers.find((handler) => handler.location === value);
+        next.assignedTo = firstHandler?.name || "";
+      }
+      return next;
+    });
+  }
+
+  function submitOrder(event) {
+    event.preventDefault();
+    if (!canCreate || !selectedHandler) return;
+
+    onCreate({
+      id: crypto.randomUUID(),
+      type: "phoneOrder",
+      status: "Assigned",
+      createdAt: new Date().toISOString(),
+      createdBy: activeEmployee,
+      location: form.location.trim(),
+      assignedTo: selectedHandler.name,
+      assignedPhone: selectedHandler.phone || "",
+      customerName: form.customerName.trim(),
+      customerPhone: form.customerPhone.trim(),
+      customerPhoneDigits: digitsOnly(form.customerPhone),
+      contactDetails: form.contactDetails.trim(),
+      address: form.address.trim(),
+      model: form.model.trim(),
+      orderTotal: form.orderTotal.trim(),
+      paymentStatus: form.paymentStatus,
+      paymentMethod: form.paymentMethod,
+      notes: form.notes.trim(),
+    });
+  }
+
+  return (
+    <section className="workspace">
+      <div className="workspace-header">
+        <div>
+          <p className="eyebrow">Manual order</p>
+          <h2>Phone order</h2>
+        </div>
+        <div className="clock-pill">{formatDateTime(now)}</div>
+      </div>
+
+      <form className="report-form" onSubmit={submitOrder}>
+        <div className="form-grid">
+          <label className="field">
+            <span>Location</span>
+            <select value={form.location} onChange={(event) => updateField("location", event.target.value)} required>
+              <option value="">Select location</option>
+              {locations.map((location) => <option key={location}>{location}</option>)}
+            </select>
+          </label>
+          <label className="field">
+            <span>Assign to</span>
+            <select value={form.assignedTo} onChange={(event) => updateField("assignedTo", event.target.value)} required>
+              <option value="">Select handler</option>
+              {locationHandlers.map((handler) => <option key={handler.id}>{handler.name}</option>)}
+            </select>
+          </label>
+          <label className="field">
+            <span>Handler phone</span>
+            <input value={selectedHandler?.phone || ""} readOnly disabled />
+          </label>
+          <label className="field">
+            <span>Created by</span>
+            <input value={activeEmployee} readOnly disabled />
+          </label>
+        </div>
+
+        <div className="form-grid">
+          <label className="field">
+            <span>Customer name</span>
+            <input value={form.customerName} onChange={(event) => updateField("customerName", event.target.value)} />
+          </label>
+          <label className="field">
+            <span>Customer phone</span>
+            <input inputMode="tel" value={form.customerPhone} onChange={(event) => updateField("customerPhone", event.target.value)} required />
+          </label>
+          <label className="field">
+            <span>Contact details</span>
+            <input value={form.contactDetails} onChange={(event) => updateField("contactDetails", event.target.value)} placeholder="Email, WhatsApp, alternate phone" />
+          </label>
+          <label className="field">
+            <span>Address</span>
+            <input value={form.address} onChange={(event) => updateField("address", event.target.value)} required />
+          </label>
+        </div>
+
+        <div className="form-grid">
+          <label className="field">
+            <span>Phone / order</span>
+            <input value={form.model} onChange={(event) => updateField("model", event.target.value)} placeholder="iPhone 15, case, charger..." required />
+          </label>
+          <label className="field">
+            <span>Order total</span>
+            <input inputMode="decimal" value={form.orderTotal} onChange={(event) => updateField("orderTotal", event.target.value)} required />
+          </label>
+          <label className="field">
+            <span>Payment status</span>
+            <select value={form.paymentStatus} onChange={(event) => updateField("paymentStatus", event.target.value)}>
+              <option>Paid</option>
+              <option>Collect payment</option>
+            </select>
+          </label>
+          <label className="field">
+            <span>Payment method</span>
+            <select value={form.paymentMethod} onChange={(event) => updateField("paymentMethod", event.target.value)}>
+              {paymentMethods.map((method) => <option key={method}>{method}</option>)}
+            </select>
+          </label>
+        </div>
+
+        <label className="field full">
+          <span>Notes</span>
+          <textarea rows="4" value={form.notes} onChange={(event) => updateField("notes", event.target.value)} />
+        </label>
+
+        <div className="form-actions">
+          <button className="primary-button" type="submit" disabled={!canCreate || !selectedHandler}>Create and notify</button>
+        </div>
+      </form>
+
+      <OpenPhoneOrders
+        orders={visibleOrders}
+        activeEmployee={activeEmployee}
+        sessionRole={sessionRole}
+        onDelivered={onDelivered}
+      />
+    </section>
+  );
+}
+
+function OpenPhoneOrders({ orders, activeEmployee, sessionRole, onDelivered }) {
+  return (
+    <div className="order-board">
+      <div className="history-header">
+        <div>
+          <p className="eyebrow">Assigned orders</p>
+          <h2>Open phone orders</h2>
+        </div>
+        <span className="metric">Open <strong>{orders.length}</strong></span>
+      </div>
+      <div className="pending-grid">
+        {orders.length ? orders.map((order) => {
+          const canDeliver = sessionRole === "admin" || order.assignedTo === activeEmployee;
+          return (
+            <article className="pending-card" key={order.id}>
+              <div className="pending-card-head">
+                <div>
+                  <p className="eyebrow">{order.location}</p>
+                  <h3>{order.model}</h3>
+                </div>
+                <span className="badge phoneOrder">{order.paymentStatus}</span>
+              </div>
+              <div className="pending-import">
+                <span><strong>Customer:</strong> {order.customerName || order.customerPhone}</span>
+                <span><strong>Phone:</strong> {order.customerPhone}</span>
+                <span><strong>Total:</strong> {formatPayment(order.orderTotal)}</span>
+                <span><strong>Assigned:</strong> {order.assignedTo}</span>
+              </div>
+              <div className="details">
+                <span><strong>Address:</strong> {order.address}</span>
+                {order.contactDetails ? <span><strong>Contact:</strong> {order.contactDetails}</span> : null}
+                {order.notes ? <span className="muted">{order.notes}</span> : null}
+              </div>
+              <button className="primary-button" type="button" disabled={!canDeliver} onClick={() => onDelivered(order.id)}>
+                Mark delivered
+              </button>
+            </article>
+          );
+        }) : (
+          <p className="empty-state">No open phone orders.</p>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function AdminPage({
+  employees,
+  reports,
+  notifications,
+  resetRequests,
+  orderHandlers,
+  onMarkResetHandled,
+  onResetPassword,
+  onAddOrderHandler,
+  onRemoveOrderHandler,
+}) {
+  const [handlerForm, setHandlerForm] = useState({ name: "", phone: "", location: "" });
   const activity = useMemo(() => {
     return employees.map((employee) => {
       const employeeReports = reports.filter((report) => report.servedBy === employee);
@@ -1392,7 +2220,7 @@ function AdminPage({ employees, reports, notifications, resetRequests, onMarkRes
           acc[report.type] += 1;
           return acc;
         },
-        { amount: 0, call: 0, sale: 0, repair: 0, sim: 0, rental: 0 },
+        { amount: 0, call: 0, sale: 0, repair: 0, sim: 0, rental: 0, phoneOrder: 0 },
       );
       const lastReport = employeeReports[0];
       return { employee, count: employeeReports.length, totals, lastReport };
@@ -1400,6 +2228,16 @@ function AdminPage({ employees, reports, notifications, resetRequests, onMarkRes
   }, [employees, reports]);
 
   const sortedReports = [...reports].sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+
+  function updateHandlerField(name, value) {
+    setHandlerForm((current) => ({ ...current, [name]: value }));
+  }
+
+  function submitHandler(event) {
+    event.preventDefault();
+    onAddOrderHandler(handlerForm);
+    setHandlerForm({ name: "", phone: "", location: "" });
+  }
 
   return (
     <>
@@ -1437,12 +2275,52 @@ function AdminPage({ employees, reports, notifications, resetRequests, onMarkRes
                 <span>Repairs <strong>{item.totals.repair}</strong></span>
                 <span>SIM <strong>{item.totals.sim}</strong></span>
                 <span>Rentals <strong>{item.totals.rental}</strong></span>
+                <span>Orders <strong>{item.totals.phoneOrder}</strong></span>
               </div>
               <p className="muted">
                 Last activity: {item.lastReport ? `${reportTypes[item.lastReport.type].label} on ${formatShortDate(item.lastReport.createdAt)}` : "No activity yet"}
               </p>
             </article>
           ))}
+        </div>
+      </section>
+
+      <section className="history">
+        <div className="history-header">
+          <div>
+            <p className="eyebrow">Orders</p>
+            <h2>Phone order handlers</h2>
+          </div>
+        </div>
+        <form className="handler-form" onSubmit={submitHandler}>
+          <label className="field">
+            <span>Name</span>
+            <input value={handlerForm.name} onChange={(event) => updateHandlerField("name", event.target.value)} required />
+          </label>
+          <label className="field">
+            <span>SMS phone</span>
+            <input inputMode="tel" value={handlerForm.phone} onChange={(event) => updateHandlerField("phone", event.target.value)} />
+          </label>
+          <label className="field">
+            <span>Location</span>
+            <input value={handlerForm.location} onChange={(event) => updateHandlerField("location", event.target.value)} required />
+          </label>
+          <button className="primary-button align-end" type="submit">Add handler</button>
+        </form>
+        <div className="request-list">
+          {orderHandlers.length ? orderHandlers.map((handler) => (
+            <div className="request-row" key={handler.id}>
+              <div>
+                <strong>{handler.name}</strong>
+                <p className="muted">{handler.location} - {handler.phone || "No SMS phone"}</p>
+              </div>
+              <button className="secondary-button" type="button" onClick={() => onRemoveOrderHandler(handler.id)}>
+                Remove
+              </button>
+            </div>
+          )) : (
+            <p className="empty-state">No phone order handlers yet.</p>
+          )}
         </div>
       </section>
 
@@ -1586,13 +2464,26 @@ function ReportDetails({ report }) {
       ["End", details.endDate],
       ["Return time", details.returnTime],
       ["Return due", details.returnDueDate],
+      ["Reminder", details.returnReminderPreference],
       ["Total days", details.totalDays],
       ["UK/EU/WTS", `${details.ukDays || 0}/${details.euDays || 0}/${details.wtsDays || 0}`],
       ["SMS", details.addSms],
       ["USA number", details.usaNumber],
       ["CLI", details.cli],
       ["US DDI", details.usDdi],
+      ["Sola", details.solaTransactionId],
       ["Total", details.totalPrice ? formatMoney(Number(details.totalPrice)) : ""],
+    ],
+    phoneOrder: [
+      ["Status", details.status],
+      ["Location", details.location],
+      ["Assigned", details.assignedTo],
+      ["Customer", details.customerName],
+      ["Order", details.model],
+      ["Address", details.address],
+      ["Contact", details.contactDetails],
+      ["Payment", details.paymentStatus],
+      ["Delivered", details.deliveredAt ? formatShortDate(details.deliveredAt) : ""],
     ],
   }[report.type];
 
@@ -1730,6 +2621,10 @@ function numberValue(value) {
   return Number.isFinite(parsed) ? parsed : 0;
 }
 
+function uniqueValues(values) {
+  return [...new Set(values.filter(Boolean))];
+}
+
 function calculateInclusiveDays(startDate, endDate) {
   if (!startDate || !endDate) return 0;
   const start = new Date(`${startDate}T00:00:00`);
@@ -1816,6 +2711,10 @@ function calculateReturnDueDate(endDate, returnDays) {
     String(date.getMonth() + 1).padStart(2, "0"),
     String(date.getDate()).padStart(2, "0"),
   ].join("-");
+}
+
+function isSolaPaidStatus(status) {
+  return ["paid", "approved", "captured", "succeeded", "success"].includes(String(status || "").toLowerCase());
 }
 
 createRoot(document.getElementById("root")).render(

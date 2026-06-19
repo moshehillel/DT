@@ -19,7 +19,7 @@ Backend scaffold for Diamant Telecom.
   - Firestore trigger. When a repair report status changes to `Delivered`, it sends or queues a Twilio text/call.
 
 - `shopifyOrderWebhook`
-  - Draft Shopify POS order webhook importer. It writes Shopify POS sales into the `reports` collection.
+  - Draft Shopify POS order webhook importer. It writes Shopify POS sales into the `pendingReports` collection for employees to claim and complete.
 
 - `rcukAddRental`
   - Frontend proxy for the RCUK add-rental endpoint.
@@ -28,6 +28,23 @@ Backend scaffold for Diamant Telecom.
 - `rcukGetRental`
   - Frontend proxy for the RCUK get-rental endpoint.
   - Returns normalized `cli`, `usDdi`, and `pending` fields.
+
+- `solaCreateCharge`
+  - Frontend proxy for a Sola/Cardknox credit-card sale.
+  - Posts to `https://x1.cardknox.com/gatewayjson` by default with `xCommand: cc:sale`.
+  - The frontend sends a hosted-card token/SUT, not raw card numbers.
+  - The app records the returned Sola reference before a CC rental can be saved.
+
+- `sendRentalReturnReminders`
+  - Scheduled function. Sends a text or phone call one day before the rental return due date.
+  - Message: `Hi, this is a friendly reminder from Diamant Telecom to return the phone you rented from us by tomorrow to avoid extra charges.`
+
+- `notifyPhoneOrderAssigned`
+  - Sends a customer SMS when a manual phone order is assigned.
+  - Sends the assigned handler an SMS with customer contact, address, order total, and whether payment was already collected.
+
+- `notifyPhoneOrderDelivered`
+  - Sends the customer an SMS when the assigned handler marks the phone order delivered.
 
 ## Environment variables
 
@@ -41,6 +58,7 @@ firebase functions:secrets:set TWILIO_REQUEST_TOKEN
 firebase functions:secrets:set STORE_PHONE_NUMBER
 firebase functions:secrets:set SHOPIFY_WEBHOOK_SECRET
 firebase functions:secrets:set RCUK_API_KEY
+firebase functions:secrets:set SOLA_API_KEY
 ```
 
 The current source reads `process.env.*`. Before production, wire these as v2 Function secrets or environment params.
@@ -53,6 +71,19 @@ Optional RCUK config:
 RCUK_API_BASE_URL=https://myaccount.rcuk.com/api
 RCUK_ADD_RENTAL_PATH=/rental/add-rental
 RCUK_GET_RENTAL_PATH=/rental/get-rental
+```
+
+Optional Sola config:
+
+```bash
+SOLA_API_BASE_URL=https://x1.cardknox.com
+SOLA_CREATE_CHARGE_PATH=/gatewayjson
+```
+
+Optional reminder config:
+
+```bash
+RENTAL_REMINDER_TIME_ZONE=America/New_York
 ```
 
 ## Firestore collections
@@ -88,6 +119,46 @@ For easier lookup, also store top-level:
 ```json
 {
   "ticketDigits": "202606170001"
+}
+```
+
+Rental reports should include:
+
+```json
+{
+  "type": "rental",
+  "customerPhone": "(555) 123-4567",
+  "paymentAmount": "120",
+  "paymentMethod": "CC",
+  "details": {
+    "rentalId": "RCUK rental id",
+    "returnDueDate": "2026-06-25",
+    "returnReminderPreference": "Text message",
+    "solaStatus": "paid",
+    "solaTransactionId": "Sola/Cardknox xRefNum"
+  }
+}
+```
+
+### `pendingReports`
+
+Shopify POS webhook imports land here before becoming completed store reports:
+
+```json
+{
+  "type": "sale",
+  "source": "shopify_pos",
+  "status": "pending",
+  "shopifyOrderId": "123456789",
+  "shopifyOrderName": "#1045",
+  "paymentAmount": "499.00",
+  "paymentMethod": "Shopify POS",
+  "customerPhone": "(555) 123-4567",
+  "imported": {
+    "lineItemsText": "1x iPhone 13",
+    "staffName": "Shopify staff name",
+    "locationName": "Store"
+  }
 }
 ```
 

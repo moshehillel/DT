@@ -294,6 +294,14 @@ button:active {
   color: #42716b;
 }
 
+.open-repairs-tab {
+  border-color: rgba(255, 200, 155, 0.45);
+}
+
+.pending-tab {
+  border-color: rgba(223, 245, 241, 0.55);
+}
+
 .main {
   display: grid;
   grid-template-rows: auto auto 1fr;
@@ -536,6 +544,27 @@ button:active {
   margin: 4px 0 0;
 }
 
+.payment-panel {
+  display: grid;
+  grid-template-columns: minmax(160px, 1fr) minmax(220px, 1.4fr) auto;
+  align-items: end;
+  gap: 14px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fbfcfd;
+  padding: 14px;
+}
+
+.payment-panel h3,
+.payment-panel p {
+  margin: 0;
+}
+
+.payment-panel .muted,
+.payment-panel .summary-error {
+  grid-column: 1 / -1;
+}
+
 .form-grid {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -749,6 +778,11 @@ tr:last-child td {
   color: #5f3798;
 }
 
+.badge.phoneOrder {
+  background: #e9f7ff;
+  color: #1e5878;
+}
+
 .muted {
   color: var(--muted);
 }
@@ -801,6 +835,90 @@ tr:last-child td {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 14px;
+}
+
+.pending-grid {
+  display: grid;
+  gap: 14px;
+}
+
+.order-board {
+  display: grid;
+  gap: 14px;
+  border-top: 1px solid var(--line);
+  margin-top: 18px;
+  padding-top: 18px;
+}
+
+.pending-card {
+  display: grid;
+  gap: 14px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: linear-gradient(180deg, #fff, #fbfcfd);
+  padding: 16px;
+}
+
+.pending-card.claimed {
+  border-color: #bde8df;
+  box-shadow: inset 3px 0 0 var(--brand);
+}
+
+.pending-card-head,
+.claim-strip {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.pending-card h3 {
+  margin: 0;
+}
+
+.pending-import {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.pending-import span {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+  padding: 9px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.pending-import strong {
+  color: var(--ink);
+}
+
+.claim-strip {
+  min-height: 48px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #f8fafb;
+  padding: 8px 10px;
+}
+
+.pending-fields {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.pending-fields .full,
+.pending-fields button {
+  grid-column: 1 / -1;
+}
+
+.handler-form {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 14px;
+  margin-bottom: 16px;
 }
 
 .employee-card {
@@ -960,6 +1078,12 @@ tr:last-child td {
   .admin-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
+
+  .pending-import,
+  .handler-form,
+  .pending-fields {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
 }
 
 @media (max-width: 640px) {
@@ -1006,8 +1130,18 @@ tr:last-child td {
   .filters,
   .report-tabs,
   .login-mini-grid,
+  .payment-panel,
+  .pending-import,
+  .handler-form,
+  .pending-fields,
   .admin-grid {
     grid-template-columns: 1fr;
+  }
+
+  .pending-card-head,
+  .claim-strip {
+    align-items: stretch;
+    flex-direction: column;
   }
 
   .primary-button,
