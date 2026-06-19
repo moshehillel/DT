@@ -1,5 +1,11 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
+import {
+  replaceAppStateDocument,
+  replaceCollection,
+  watchAppStateDocument,
+  watchCollection,
+} from "./firebaseClient";
 import "./styles.css";
 
 const STORAGE_KEY = "diamant-telecom-reports-v1";
@@ -149,13 +155,13 @@ function generateRepairTicketNumber(reports) {
 
 function App() {
   const [activeType, setActiveType] = useState("sale");
-  const [employees, setEmployees] = useStoredState(EMPLOYEE_KEY, defaultEmployees);
-  const [reports, setReports] = useStoredState(STORAGE_KEY, []);
-  const [pendingReports, setPendingReports] = useStoredState(PENDING_REPORTS_KEY, []);
-  const [phoneOrders, setPhoneOrders] = useStoredState(PHONE_ORDERS_KEY, []);
-  const [orderHandlers, setOrderHandlers] = useStoredState(ORDER_HANDLERS_KEY, defaultOrderHandlers);
-  const [notifications, setNotifications] = useStoredState("diamant-telecom-notifications-v1", []);
-  const [resetRequests, setResetRequests] = useStoredState(RESET_REQUESTS_KEY, []);
+  const [employees, setEmployees] = useCloudDocumentState("employees", EMPLOYEE_KEY, defaultEmployees);
+  const [reports, setReports] = useCloudCollectionState("reports", STORAGE_KEY, []);
+  const [pendingReports, setPendingReports] = useCloudCollectionState("pendingReports", PENDING_REPORTS_KEY, []);
+  const [phoneOrders, setPhoneOrders] = useCloudCollectionState("phoneOrders", PHONE_ORDERS_KEY, []);
+  const [orderHandlers, setOrderHandlers] = useCloudCollectionState("orderHandlers", ORDER_HANDLERS_KEY, defaultOrderHandlers);
+  const [notifications, setNotifications] = useCloudCollectionState("notificationLogs", "diamant-telecom-notifications-v1", []);
+  const [resetRequests, setResetRequests] = useCloudCollectionState("passwordResetRequests", RESET_REQUESTS_KEY, []);
   const [activeEmployee, setActiveEmployee] = useState(
     localStorage.getItem(ACTIVE_EMPLOYEE_KEY) || employees[0] || "",
   );
@@ -728,6 +734,100 @@ function useStoredState(key, fallback) {
   }, [key, value]);
 
   return [value, setValue];
+}
+
+function useCloudCollectionState(collectionName, localKey, fallback) {
+  const [value, setValue] = useState(() => ensureArrayIds(readJson(localKey, fallback)));
+  const valueRef = useRef(value);
+  const cloudReadyRef = useRef(false);
+  const saveQueuedRef = useRef(false);
+
+  useEffect(() => {
+    valueRef.current = value;
+    localStorage.setItem(localKey, JSON.stringify(value));
+  }, [localKey, value]);
+
+  useEffect(() => {
+    return watchCollection(
+      collectionName,
+      (items) => {
+        cloudReadyRef.current = true;
+        if (!items.length && valueRef.current.length && !saveQueuedRef.current) {
+          saveQueuedRef.current = true;
+          replaceCollection(collectionName, valueRef.current).catch(console.error);
+          return;
+        }
+        setValue(sortCloudItems(items));
+      },
+      (error) => {
+        console.error(`Firestore ${collectionName} sync failed`, error);
+      },
+    );
+  }, [collectionName]);
+
+  function updateValue(nextValueOrUpdater) {
+    setValue((current) => {
+      const nextValue = typeof nextValueOrUpdater === "function"
+        ? nextValueOrUpdater(current)
+        : nextValueOrUpdater;
+      const normalized = ensureArrayIds(nextValue);
+
+      if (cloudReadyRef.current) {
+        replaceCollection(collectionName, normalized).catch(console.error);
+      }
+
+      return normalized;
+    });
+  }
+
+  return [value, updateValue];
+}
+
+function useCloudDocumentState(documentId, localKey, fallback) {
+  const [value, setValue] = useState(() => readJson(localKey, fallback));
+  const valueRef = useRef(value);
+  const cloudReadyRef = useRef(false);
+  const saveQueuedRef = useRef(false);
+
+  useEffect(() => {
+    valueRef.current = value;
+    localStorage.setItem(localKey, JSON.stringify(value));
+  }, [localKey, value]);
+
+  useEffect(() => {
+    return watchAppStateDocument(
+      documentId,
+      fallback,
+      (items) => {
+        cloudReadyRef.current = true;
+        if (isSameArray(items, fallback) && !isSameArray(valueRef.current, fallback) && !saveQueuedRef.current) {
+          saveQueuedRef.current = true;
+          replaceAppStateDocument(documentId, valueRef.current).catch(console.error);
+          return;
+        }
+        setValue(items);
+      },
+      (error) => {
+        console.error(`Firestore appState/${documentId} sync failed`, error);
+      },
+    );
+  }, [documentId, fallback]);
+
+  function updateValue(nextValueOrUpdater) {
+    setValue((current) => {
+      const nextValue = typeof nextValueOrUpdater === "function"
+        ? nextValueOrUpdater(current)
+        : nextValueOrUpdater;
+
+      if (cloudReadyRef.current) {
+        replaceAppStateDocument(documentId, nextValue).catch(console.error);
+      }
+
+      return nextValue;
+    });
+  }
+
+  return [value, updateValue];
 }
 
 function Sidebar({
@@ -2623,6 +2723,27 @@ function numberValue(value) {
 
 function uniqueValues(values) {
   return [...new Set(values.filter(Boolean))];
+}
+
+function ensureArrayIds(items) {
+  return Array.isArray(items)
+    ? items.map((item) => {
+        if (!item || typeof item !== "object") return item;
+        return item.id ? item : { ...item, id: crypto.randomUUID() };
+      })
+    : [];
+}
+
+function sortCloudItems(items) {
+  return [...items].sort((a, b) => {
+    const dateDiff = new Date(b.createdAt || b.updatedAt || 0) - new Date(a.createdAt || a.updatedAt || 0);
+    if (dateDiff) return dateDiff;
+    return String(a.name || a.employee || a.id || "").localeCompare(String(b.name || b.employee || b.id || ""));
+  });
+}
+
+function isSameArray(left, right) {
+  return JSON.stringify(left) === JSON.stringify(right);
 }
 
 function calculateInclusiveDays(startDate, endDate) {
