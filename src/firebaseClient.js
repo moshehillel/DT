@@ -10,23 +10,31 @@ import {
   setDoc,
 } from "firebase/firestore";
 
-const firebaseConfig = {
-  apiKey: "AIzaSyCisNj4Pyx7_1wAJO-1ueF6RnY6nAwc9WE",
-  authDomain: "diamant-telecom.firebaseapp.com",
-  projectId: "diamant-telecom",
-  storageBucket: "diamant-telecom.firebasestorage.app",
-  messagingSenderId: "287927197394",
-  appId: "1:287927197394:web:8c7db402503d31fe04570b",
-  measurementId: "G-8CTHDQX1LD",
-};
-
-const app = initializeApp(firebaseConfig);
-const auth = getAuth(app);
-export const db = getFirestore(app);
-
+let firebasePromise;
 let authPromise;
 
-export function ensureFirebaseAuth() {
+async function getFirebase() {
+  if (!firebasePromise) {
+    firebasePromise = fetch("/__/firebase/init.json")
+      .then((response) => {
+        if (!response.ok) throw new Error("Firebase hosting config is not available.");
+        return response.json();
+      })
+      .then((firebaseConfig) => {
+        const app = initializeApp(firebaseConfig);
+        return {
+          auth: getAuth(app),
+          db: getFirestore(app),
+        };
+      });
+  }
+
+  return firebasePromise;
+}
+
+export async function ensureFirebaseAuth() {
+  const { auth } = await getFirebase();
+
   if (!authPromise) {
     authPromise = auth.currentUser
       ? Promise.resolve(auth.currentUser)
@@ -41,7 +49,8 @@ export function watchCollection(collectionName, onItems, onError) {
   let cancelled = false;
 
   ensureFirebaseAuth()
-    .then(() => {
+    .then(() => getFirebase())
+    .then(({ db }) => {
       if (cancelled) return;
       unsubscribe = onSnapshot(
         collection(db, collectionName),
@@ -64,7 +73,8 @@ export function watchAppStateDocument(documentId, fallback, onValue, onError) {
   let cancelled = false;
 
   ensureFirebaseAuth()
-    .then(() => {
+    .then(() => getFirebase())
+    .then(({ db }) => {
       if (cancelled) return;
       unsubscribe = onSnapshot(
         doc(db, "appState", documentId),
@@ -84,6 +94,7 @@ export function watchAppStateDocument(documentId, fallback, onValue, onError) {
 
 export async function replaceCollection(collectionName, items) {
   await ensureFirebaseAuth();
+  const { db } = await getFirebase();
   const collectionRef = collection(db, collectionName);
   const existing = await getDocs(collectionRef);
   const nextIds = new Set(items.map((item) => item.id));
@@ -98,5 +109,6 @@ export async function replaceCollection(collectionName, items) {
 
 export async function replaceAppStateDocument(documentId, items) {
   await ensureFirebaseAuth();
+  const { db } = await getFirebase();
   await setDoc(doc(db, "appState", documentId), { items });
 }
