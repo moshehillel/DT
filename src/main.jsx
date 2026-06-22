@@ -82,7 +82,7 @@ const reportTypes = {
     description: "Carrier setup",
     fields: [
       { name: "carrier", label: "Carrier", placeholder: "US Mobile, H2O, Ultra, Lyca" },
-      { name: "simPhone", label: "SIM phone number", placeholder: "(555) 000-0000" },
+      { name: "simPhone", label: "SIM number", placeholder: "SIM / ICCID number" },
       { name: "plan", label: "Plan / activation notes", placeholder: "Monthly plan, port-in, new number" },
       { name: "accountPin", label: "PIN / account note", placeholder: "Optional" },
     ],
@@ -96,7 +96,7 @@ const reportTypes = {
       { name: "rentalType", label: "Rental type", type: "select", options: ["SIM only", "Phone", "Upgraded phone"] },
       { name: "model", label: "Phone model", placeholder: "iPhone 12, Galaxy A14" },
       { name: "imei", label: "IMEI / device ID", placeholder: "Optional for SIM only" },
-      { name: "simPhone", label: "SIM phone number", placeholder: "(555) 000-0000" },
+      { name: "simNumber", label: "SIM number", placeholder: "SIM / ICCID number" },
       { name: "startDate", label: "Start date", type: "date" },
       { name: "endDate", label: "End date", type: "date" },
       { name: "returnTime", label: "Return time", type: "time" },
@@ -136,6 +136,15 @@ function createEmptyFilters() {
 
 function digitsOnly(value) {
   return String(value || "").replace(/\D/g, "");
+}
+
+function normalizeRcukSimNumber(value) {
+  const digits = digitsOnly(value);
+  if (!digits) return "";
+  if (digits.startsWith("8944100030") || digits.startsWith("894411006")) return digits;
+  if (digits.startsWith("00030")) return `89441${digits}`;
+  if (digits.startsWith("006")) return `894411${digits}`;
+  return digits;
 }
 
 function generateRepairTicketNumber(reports) {
@@ -1152,7 +1161,7 @@ function RentalReportForm({ activeEmployee, onSave }) {
     deviceKind: "SIM only",
     model: "",
     imei: "",
-    simPhone: "",
+    simNumber: "",
     returnDays: "",
     paymentMethod: "Cash",
     returnReminderPreference: "Text message",
@@ -1166,6 +1175,12 @@ function RentalReportForm({ activeEmployee, onSave }) {
     cli: "",
     usDdi: "",
     getNumbersAttempted: false,
+    raw: null,
+  });
+  const [simCheckState, setSimCheckState] = useState({
+    status: "idle",
+    message: "",
+    checkedSimNumber: "",
     raw: null,
   });
   const [solaState, setSolaState] = useState({
@@ -1189,6 +1204,7 @@ function RentalReportForm({ activeEmployee, onSave }) {
   const totalPrice = rentalPricing.totalPrice;
   const isRcukRental = form.rentalRegion === "RCUK";
   const isSimpleRental = !isRcukRental;
+  const normalizedSimNumber = normalizeRcukSimNumber(form.simNumber);
   const zoneDaysValid = totalDays > 0 && zoneDays === totalDays;
   const needsUsNumber = form.usaNumber;
   const hasCli = Boolean(submitState.cli);
@@ -1202,6 +1218,7 @@ function RentalReportForm({ activeEmployee, onSave }) {
     && zoneDaysValid
     && minimumDaysValid
     && totalPrice > 0
+    && normalizedSimNumber
     && isRcukRental;
   const canSave = isSimpleRental
     ? isRentalFormComplete(form) && minimumDaysValid && totalPrice > 0 && solaChargeComplete
@@ -1222,6 +1239,14 @@ function RentalReportForm({ activeEmployee, onSave }) {
     setSubmitState((current) => (
       current.status === "idle" ? current : { ...current, message: "Rental changed. Submit to RCUK again before saving.", status: "idle", rentalId: "", cli: "", usDdi: "", getNumbersAttempted: false, raw: null }
     ));
+    if (name === "simNumber") {
+      setSimCheckState({
+        status: "idle",
+        message: "",
+        checkedSimNumber: "",
+        raw: null,
+      });
+    }
   }
 
   function updateSolaToken(value) {
@@ -1247,7 +1272,7 @@ function RentalReportForm({ activeEmployee, onSave }) {
       device_kind: form.deviceKind,
       model: form.model,
       imei: form.imei,
-      sim_phone: form.simPhone,
+      sim_number: normalizedSimNumber,
       start_date: form.startDate,
       end_date: form.endDate,
       return_days: form.returnDays,
@@ -1395,6 +1420,60 @@ function RentalReportForm({ activeEmployee, onSave }) {
     }
   }
 
+  async function checkSimWithRcuk() {
+    if (!isRcukRental || !normalizedSimNumber) return;
+
+    if (!FUNCTIONS_BASE_URL) {
+      setSimCheckState({
+        status: "error",
+        message: "Set VITE_FUNCTIONS_BASE_URL to your Firebase Functions URL before checking SIMs.",
+        checkedSimNumber: "",
+        raw: null,
+      });
+      return;
+    }
+
+    setSimCheckState({
+      status: "checking",
+      message: "Checking SIM with RCUK...",
+      checkedSimNumber: normalizedSimNumber,
+      raw: null,
+    });
+
+    try {
+      const response = await fetch(`${FUNCTIONS_BASE_URL}/rcukCheckSim`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sim_number: normalizedSimNumber }),
+      });
+      const data = await response.json();
+
+      if (!response.ok || !data.ok) {
+        setSimCheckState({
+          status: "error",
+          message: data.message || "RCUK rejected the SIM check.",
+          checkedSimNumber: data.simNumber || normalizedSimNumber,
+          raw: data.raw || data,
+        });
+        return;
+      }
+
+      setSimCheckState({
+        status: "checked",
+        message: data.message || "SIM check complete.",
+        checkedSimNumber: data.simNumber || normalizedSimNumber,
+        raw: data.raw || data,
+      });
+    } catch (error) {
+      setSimCheckState({
+        status: "error",
+        message: error.message || "Could not check SIM.",
+        checkedSimNumber: normalizedSimNumber,
+        raw: null,
+      });
+    }
+  }
+
   async function getRentalNumbers() {
     if (!FUNCTIONS_BASE_URL || !submitState.rentalId) return;
 
@@ -1462,7 +1541,7 @@ function RentalReportForm({ activeEmployee, onSave }) {
         rentalType: form.deviceKind,
         model: form.model,
         imei: form.imei,
-        simPhone: form.simPhone,
+        simNumber: isRcukRental ? normalizedSimNumber : form.simNumber.trim(),
         startDate: form.startDate,
         endDate: form.endDate,
         returnTime: `${form.returnDays || 0} days`,
@@ -1574,9 +1653,15 @@ function RentalReportForm({ activeEmployee, onSave }) {
               <input value={form.imei} onChange={(event) => updateField("imei", event.target.value)} />
             </label>
             <label className="field">
-              <span>SIM phone number</span>
-              <input inputMode="tel" value={form.simPhone} onChange={(event) => updateField("simPhone", event.target.value)} />
+              <span>SIM number</span>
+              <input inputMode="numeric" value={form.simNumber} onChange={(event) => updateField("simNumber", event.target.value)} />
             </label>
+            {isRcukRental ? (
+              <label className="field">
+                <span>SIM sent to RCUK</span>
+                <input value={normalizedSimNumber} readOnly disabled />
+              </label>
+            ) : null}
           </div>
 
           <div className="form-grid">
@@ -1635,6 +1720,9 @@ function RentalReportForm({ activeEmployee, onSave }) {
                 <button className="primary-button" type="button" onClick={submitRentalToRcuk} disabled={!canSubmitRental || submitState.status === "submitting"}>
                   Submit rental
                 </button>
+                <button className="secondary-button" type="button" onClick={checkSimWithRcuk} disabled={!normalizedSimNumber || simCheckState.status === "checking"}>
+                  Check SIM
+                </button>
                 <button className="secondary-button" type="button" onClick={getRentalNumbers} disabled={!submitState.rentalId || submitState.status === "getting-numbers"}>
                   Get numbers
                 </button>
@@ -1676,6 +1764,11 @@ function RentalReportForm({ activeEmployee, onSave }) {
               <input value={submitState.usDdi} readOnly />
               <span>Get numbers tried</span>
               <input value={submitState.getNumbersAttempted ? "Yes" : "No"} readOnly />
+              <span>SIM check</span>
+              <input value={simCheckState.checkedSimNumber || ""} readOnly />
+              {simCheckState.message ? (
+                <p className={simCheckState.status === "error" ? "summary-error" : "muted"}>{simCheckState.message}</p>
+              ) : null}
               <p className={submitState.status === "error" ? "summary-error" : "muted"}>{submitState.message}</p>
             </div>
           ) : null}
@@ -2549,7 +2642,7 @@ function ReportDetails({ report }) {
     ],
     sim: [
       ["Carrier", details.carrier],
-      ["SIM number", details.simPhone],
+      ["SIM number", details.simNumber || details.simPhone],
       ["Plan", details.plan],
     ],
     rental: [
@@ -2559,7 +2652,7 @@ function ReportDetails({ report }) {
       ["Rental", details.rentalType],
       ["Model", details.model],
       ["IMEI", details.imei],
-      ["SIM number", details.simPhone],
+      ["SIM number", details.simNumber || details.simPhone],
       ["Start", details.startDate],
       ["End", details.endDate],
       ["Return time", details.returnTime],
@@ -2766,6 +2859,7 @@ function isRentalFormComplete(form) {
     form.startDate,
     form.endDate,
     form.deviceKind,
+    form.simNumber,
     form.customerPhone,
     form.returnDays,
     form.paymentMethod,

@@ -23,7 +23,7 @@ The current version stores reports in this browser with `localStorage`, so it do
 - Pending reports queue for Shopify POS imports; every employee can see pending reports, claim one, add missing fields, and save it with their signature
 - Phone call, sale, repair, SIM activation, phone rental, and phone order reports
 - Manual phone orders can be assigned by location, notify the customer and assigned handler, then move into regular reports when delivered
-- Phone rentals track voice/data plan, inclusive day count, UK/EU/WTS days, SMS, USA number, device kind, return deadline, return reminder method, RCUK rental ID, CLI, US DDI, and calculated total
+- Phone rentals track voice/data plan, inclusive day count, UK/EU/WTS days, SMS, USA number, device kind, SIM number, return deadline, return reminder method, RCUK rental ID, CLI, US DDI, and calculated total
 - CC rentals show a Sola charge slot and require an approved Sola transaction before saving
 - Rental submit is disabled until required fields are complete and UK/EU/WTS days match total days
 - RCUK rentals have a 4-day minimum
@@ -61,7 +61,9 @@ When ready, replace the local storage layer in `src/main.jsx` with:
 - Cloud Functions plus an SMS/voice provider for automatic Delivered notifications
 - Firebase Hosting for deployment
 
-Rental reports call Firebase Function proxies for the RCUK API and Sola card charging. Set `VITE_FUNCTIONS_BASE_URL` before using the real rental submit/get-numbers or Sola flow.
+Rental reports call Firebase Function proxies for the RCUK API and Sola card charging. Set `VITE_FUNCTIONS_BASE_URL` before using the real rental submit/get-numbers/check-SIM or Sola flow.
+
+RCUK SIM numbers are normalized before calls: SIMs starting with `00030` are sent with `89441` in front, and SIMs starting with `006` are sent with `894411` in front. The check-SIM proxy uses `RCUK_CHECK_SIM_PATH`, defaulting to `/check-sim`.
 
 ## Twilio flows
 

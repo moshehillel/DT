@@ -19,6 +19,7 @@ const RCUK_API_KEY = process.env.RCUK_API_KEY || "";
 const RCUK_API_BASE_URL = process.env.RCUK_API_BASE_URL || "https://myaccount.rcuk.com/api";
 const RCUK_ADD_RENTAL_PATH = process.env.RCUK_ADD_RENTAL_PATH || "/rental/add-rental";
 const RCUK_GET_RENTAL_PATH = process.env.RCUK_GET_RENTAL_PATH || "/rental/get-rental";
+const RCUK_CHECK_SIM_PATH = process.env.RCUK_CHECK_SIM_PATH || "/check-sim";
 const SOLA_API_KEY = process.env.SOLA_API_KEY || "";
 const SOLA_API_BASE_URL = process.env.SOLA_API_BASE_URL || "https://x1.cardknox.com";
 const SOLA_CREATE_CHARGE_PATH = process.env.SOLA_CREATE_CHARGE_PATH || "/gatewayjson";
@@ -26,6 +27,15 @@ const RENTAL_REMINDER_TIME_ZONE = process.env.RENTAL_REMINDER_TIME_ZONE || "Amer
 
 function digitsOnly(value) {
   return String(value || "").replace(/\D/g, "");
+}
+
+function normalizeRcukSimNumber(value) {
+  const digits = digitsOnly(value);
+  if (!digits) return "";
+  if (digits.startsWith("8944100030") || digits.startsWith("894411006")) return digits;
+  if (digits.startsWith("00030")) return `89441${digits}`;
+  if (digits.startsWith("006")) return `894411${digits}`;
+  return digits;
 }
 
 function getPayload(req) {
@@ -535,6 +545,9 @@ exports.rcukAddRental = onRequest({ region: REGION }, async (req, res) => {
 
   try {
     const payload = getPayload(req);
+    if (payload.sim_number || payload.simNumber) {
+      payload.sim_number = normalizeRcukSimNumber(payload.sim_number || payload.simNumber);
+    }
     const result = await callRcuk(RCUK_ADD_RENTAL_PATH, payload);
     const rentalId = extractRentalId(result.data);
 
@@ -558,6 +571,52 @@ exports.rcukAddRental = onRequest({ region: REGION }, async (req, res) => {
     sendJson(res, 500, {
       ok: false,
       message: error.message || "RCUK add rental failed.",
+    });
+  }
+});
+
+exports.rcukCheckSim = onRequest({ region: REGION }, async (req, res) => {
+  if (handleCors(req, res)) return;
+  if (req.method !== "POST") {
+    sendJson(res, 405, { error: "POST required" });
+    return;
+  }
+
+  try {
+    const payload = getPayload(req);
+    const simNumber = normalizeRcukSimNumber(payload.sim_number || payload.simNumber);
+
+    if (!simNumber) {
+      sendJson(res, 400, {
+        ok: false,
+        message: "sim_number is required.",
+      });
+      return;
+    }
+
+    const result = await callRcuk(RCUK_CHECK_SIM_PATH, { sim_number: simNumber });
+
+    if (!result.ok) {
+      sendJson(res, 400, {
+        ok: false,
+        simNumber,
+        message: result.data.message || "RCUK check SIM failed.",
+        raw: result.data,
+      });
+      return;
+    }
+
+    sendJson(res, 200, {
+      ok: true,
+      simNumber,
+      message: result.data.message || "SIM check complete.",
+      raw: result.data,
+    });
+  } catch (error) {
+    logger.error("rcukCheckSim failed", error);
+    sendJson(res, 500, {
+      ok: false,
+      message: error.message || "RCUK check SIM failed.",
     });
   }
 });
