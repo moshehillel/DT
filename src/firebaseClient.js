@@ -2,12 +2,11 @@ import { initializeApp } from "firebase/app";
 import { getAuth, signInAnonymously } from "firebase/auth";
 import {
   collection,
-  deleteDoc,
   doc,
-  getDocs,
   getFirestore,
   onSnapshot,
   setDoc,
+  writeBatch,
 } from "firebase/firestore";
 
 let firebasePromise;
@@ -92,19 +91,43 @@ export function watchAppStateDocument(documentId, fallback, onValue, onError) {
   };
 }
 
-export async function replaceCollection(collectionName, items) {
+async function commitBatches(db, operations) {
+  const chunkSize = 450;
+  for (let index = 0; index < operations.length; index += chunkSize) {
+    const batch = writeBatch(db);
+    for (const operation of operations.slice(index, index + chunkSize)) {
+      operation(batch);
+    }
+    await batch.commit();
+  }
+}
+
+export async function upsertCollectionItems(collectionName, items) {
   await ensureFirebaseAuth();
   const { db } = await getFirebase();
   const collectionRef = collection(db, collectionName);
-  const existing = await getDocs(collectionRef);
-  const nextIds = new Set(items.map((item) => item.id));
 
-  await Promise.all([
-    ...items.map((item) => setDoc(doc(collectionRef, item.id), item)),
-    ...existing.docs
-      .filter((item) => !nextIds.has(item.id))
-      .map((item) => deleteDoc(item.ref)),
-  ]);
+  await commitBatches(
+    db,
+    items.map((item) => (batch) => batch.set(doc(collectionRef, item.id), item)),
+  );
+}
+
+export async function syncCollectionItems(collectionName, previousItems, nextItems) {
+  await ensureFirebaseAuth();
+  const { db } = await getFirebase();
+  const collectionRef = collection(db, collectionName);
+  const previousIds = new Set(previousItems.map((item) => item.id));
+  const nextIds = new Set(nextItems.map((item) => item.id));
+  const operations = [
+    ...nextItems.map((item) => (batch) => batch.set(doc(collectionRef, item.id), item)),
+    ...[...previousIds]
+      .filter((id) => !nextIds.has(id))
+      .map((id) => (batch) => batch.delete(doc(collectionRef, id))),
+  ];
+
+  if (!operations.length) return;
+  await commitBatches(db, operations);
 }
 
 export async function replaceAppStateDocument(documentId, items) {

@@ -5,38 +5,34 @@ const { onSchedule } = require("firebase-functions/v2/scheduler");
 const logger = require("firebase-functions/logger");
 const admin = require("firebase-admin");
 const twilio = require("twilio");
+const {
+  buildRcukRentalPayload,
+  digitsOnly,
+  normalizeRcukSimNumber,
+} = require("./rcuk");
+const { buildRepairMessage, findRepairByLookup } = require("./repairs");
+const {
+  buildTelebroadPendingReport,
+  shouldImportCall,
+} = require("./telebroad");
 
 admin.initializeApp();
 
 const db = admin.firestore();
 const REGION = "us-central1";
-const STORE_PHONE_NUMBER = process.env.STORE_PHONE_NUMBER || "+15555555555";
 const TWILIO_FROM_NUMBER = process.env.TWILIO_FROM_NUMBER || "";
 const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID || "";
 const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN || "";
 const TWILIO_REQUEST_TOKEN = process.env.TWILIO_REQUEST_TOKEN || "";
 const RCUK_API_KEY = process.env.RCUK_API_KEY || "";
 const RCUK_API_BASE_URL = process.env.RCUK_API_BASE_URL || "https://myaccount.rcuk.com/api";
-const RCUK_ADD_RENTAL_PATH = process.env.RCUK_ADD_RENTAL_PATH || "/rental/add-rental";
-const RCUK_GET_RENTAL_PATH = process.env.RCUK_GET_RENTAL_PATH || "/rental/get-rental";
+const RCUK_ADD_RENTAL_PATH = process.env.RCUK_ADD_RENTAL_PATH || "/add-rental";
+const RCUK_GET_RENTAL_PATH = process.env.RCUK_GET_RENTAL_PATH || "/get-rental";
 const RCUK_CHECK_SIM_PATH = process.env.RCUK_CHECK_SIM_PATH || "/check-sim";
 const SOLA_API_KEY = process.env.SOLA_API_KEY || "";
 const SOLA_API_BASE_URL = process.env.SOLA_API_BASE_URL || "https://x1.cardknox.com";
 const SOLA_CREATE_CHARGE_PATH = process.env.SOLA_CREATE_CHARGE_PATH || "/gatewayjson";
 const RENTAL_REMINDER_TIME_ZONE = process.env.RENTAL_REMINDER_TIME_ZONE || "America/New_York";
-
-function digitsOnly(value) {
-  return String(value || "").replace(/\D/g, "");
-}
-
-function normalizeRcukSimNumber(value) {
-  const digits = digitsOnly(value);
-  if (!digits) return "";
-  if (digits.startsWith("8944100030") || digits.startsWith("894411006")) return digits;
-  if (digits.startsWith("00030")) return `89441${digits}`;
-  if (digits.startsWith("006")) return `894411${digits}`;
-  return digits;
-}
 
 function getPayload(req) {
   return {
@@ -60,7 +56,7 @@ function handleCors(req, res) {
   return false;
 }
 
-async function callRcuk(path, payload) {
+async function callRcuk(path, payload, method = "POST") {
   if (!RCUK_API_KEY) {
     return {
       ok: false,
@@ -72,13 +68,27 @@ async function callRcuk(path, payload) {
     };
   }
 
-  const response = await fetch(`${RCUK_API_BASE_URL}${path}`, {
-    method: "POST",
+  const isGet = method.toUpperCase() === "GET";
+  let url = `${RCUK_API_BASE_URL}${path}`;
+
+  if (isGet && payload && Object.keys(payload).length) {
+    const params = new URLSearchParams();
+    for (const [key, value] of Object.entries(payload)) {
+      if (value !== undefined && value !== null && value !== "") {
+        params.append(key, String(value));
+      }
+    }
+    const query = params.toString();
+    if (query) url += `?${query}`;
+  }
+
+  const response = await fetch(url, {
+    method,
     headers: {
       "Content-Type": "application/json",
       "api-key": RCUK_API_KEY,
     },
-    body: JSON.stringify(payload),
+    ...(isGet ? {} : { body: JSON.stringify(payload) }),
   });
 
   const text = await response.text();
@@ -122,58 +132,6 @@ function assertTwilioRequest(req, res) {
   return false;
 }
 
-function normalizeReportDoc(snapshot) {
-  const data = snapshot.data() || {};
-  return {
-    id: snapshot.id,
-    ...data,
-    details: data.details || {},
-  };
-}
-
-function toMillis(value) {
-  if (!value) return 0;
-  if (typeof value.toMillis === "function") return value.toMillis();
-  const time = new Date(value).getTime();
-  return Number.isFinite(time) ? time : 0;
-}
-
-function sortNewestFirst(items) {
-  return items.sort((a, b) => toMillis(b.createdAt) - toMillis(a.createdAt));
-}
-
-function buildRepairMessage(report) {
-  const status = report.details.status || "Received";
-  const paymentStatus = report.details.paymentStatus || "Not paid";
-  const dueDate = report.details.dueDate ? ` Expected ready date is ${report.details.dueDate}.` : "";
-  const paidMessage = paymentStatus === "Paid"
-    ? "Payment is marked paid."
-    : "Payment is not marked paid yet.";
-
-  return `${paidMessage}${dueDate}`;
-}
-
-async function findRepairByLookup(lookupValue) {
-  const lookupDigits = digitsOnly(lookupValue);
-  if (!lookupDigits) return null;
-
-  const repairSnapshot = await db
-    .collection("reports")
-    .where("type", "==", "repair")
-    .limit(250)
-    .get();
-
-  const matches = repairSnapshot.docs
-    .map(normalizeReportDoc)
-    .filter((report) => {
-      const phoneDigits = report.customerPhoneDigits || digitsOnly(report.customerPhone);
-      const ticketDigits = report.ticketDigits || digitsOnly(report.details.ticketNumber);
-      return phoneDigits === lookupDigits || ticketDigits === lookupDigits;
-    });
-
-  return sortNewestFirst(matches)[0] || null;
-}
-
 exports.repairStatus = onRequest({ region: REGION }, async (req, res) => {
   if (req.method !== "POST") {
     sendJson(res, 405, { error: "POST required" });
@@ -185,7 +143,7 @@ exports.repairStatus = onRequest({ region: REGION }, async (req, res) => {
   try {
     const payload = getPayload(req);
     const lookup = payload.ticketLookup || payload.phone || payload.lookup || payload.Digits || "";
-    const repair = await findRepairByLookup(lookup);
+    const repair = await findRepairByLookup(db, lookup);
 
     if (!repair) {
       sendJson(res, 200, {
@@ -242,6 +200,11 @@ async function getAvailablePhones() {
 }
 
 exports.phoneInventoryList = onRequest({ region: REGION }, async (req, res) => {
+  if (req.method !== "POST") {
+    sendJson(res, 405, { error: "POST required" });
+    return;
+  }
+
   if (!assertTwilioRequest(req, res)) return;
 
   try {
@@ -386,38 +349,12 @@ exports.notifyRepairDelivered = onDocumentUpdated(
       return;
     }
 
-    const client = getTwilioClient();
-    if (!client) {
-      await logNotification(
-        event.params.reportId,
-        after,
-        "Queued",
-        "Twilio credentials are not configured",
-      );
-      return;
-    }
-
     const body = `Diamant Telecom: repair ticket ${after.details?.ticketNumber || ""} for ${after.details?.model || "your phone"} is marked delivered.`;
     const method = after.details?.notificationPreference || "Text message";
 
     try {
-      if (method === "Phone call") {
-        const twiml = `<Response><Say>${escapeXml(body)}</Say></Response>`;
-        const call = await client.calls.create({
-          to,
-          from: TWILIO_FROM_NUMBER,
-          twiml,
-        });
-        await logNotification(event.params.reportId, after, "Sent", `Call ${call.sid}`);
-        return;
-      }
-
-      const message = await client.messages.create({
-        to,
-        from: TWILIO_FROM_NUMBER,
-        body,
-      });
-      await logNotification(event.params.reportId, after, "Sent", `SMS ${message.sid}`);
+      const result = await sendCustomerNotification({ to, method, body });
+      await logNotification(event.params.reportId, after, result.status, result.detail);
     } catch (error) {
       logger.error("notifyRepairDelivered failed", error);
       await logNotification(event.params.reportId, after, "Failed", error.message);
@@ -450,7 +387,12 @@ exports.shopifyOrderWebhook = onRequest({ region: REGION }, async (req, res) => 
       .update(rawBody)
       .digest("base64");
 
-    if (!crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(hmac))) {
+    const digestBuffer = Buffer.from(digest);
+    const hmacBuffer = Buffer.from(hmac, "base64");
+    if (
+      digestBuffer.length !== hmacBuffer.length
+      || !crypto.timingSafeEqual(digestBuffer, hmacBuffer)
+    ) {
       sendJson(res, 403, { error: "Invalid Shopify signature" });
       return;
     }
@@ -511,14 +453,66 @@ exports.shopifyOrderWebhook = onRequest({ region: REGION }, async (req, res) => 
   sendJson(res, 200, { ok: true });
 });
 
+exports.telebroadCallWebhook = onRequest({ region: REGION }, async (req, res) => {
+  if (req.method !== "POST") {
+    sendJson(res, 405, { error: "POST required" });
+    return;
+  }
+
+  try {
+    const payload = getPayload(req);
+
+    if (!shouldImportCall(payload)) {
+      sendJson(res, 200, {
+        ok: true,
+        imported: false,
+        reason: "ignored",
+      });
+      return;
+    }
+
+    const pendingReport = buildTelebroadPendingReport(payload);
+    const pendingRef = db.collection("pendingReports").doc(pendingReport.id);
+    const existing = await pendingRef.get();
+
+    if (existing.exists) {
+      sendJson(res, 200, {
+        ok: true,
+        imported: false,
+        reason: "already_imported",
+        pendingReportId: pendingReport.id,
+      });
+      return;
+    }
+
+    await pendingRef.set({
+      ...pendingReport,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    sendJson(res, 200, {
+      ok: true,
+      imported: true,
+      pendingReportId: pendingReport.id,
+    });
+  } catch (error) {
+    logger.error("telebroadCallWebhook failed", error);
+    sendJson(res, 500, { error: "Telebroad call import failed" });
+  }
+});
+
 function extractRentalId(data) {
   return data.rental_id
     || data.rentalId
+    || data.reactivated_rental_id
     || data.id
+    || data.ID
     || data.data?.rental_id
     || data.data?.rentalId
+    || data.data?.ID
     || data.rental_data?.rental_id
     || data.rental_data?.id
+    || data.rental_data?.ID
     || "";
 }
 
@@ -526,11 +520,15 @@ function normalizeRentalLookup(data) {
   const rentalData = data.rental_data || data.data || data;
   const cli = rentalData.cli || rentalData.CLI || rentalData.phone_number || "";
   const usDdi = rentalData.us_ddi || rentalData.usDDI || rentalData.usa_number || rentalData.us_number || "";
+  const ilDdi = rentalData.il_ddi || rentalData.ilDDI || rentalData.israel_number || "";
+  const status = rentalData.status || rentalData.Status || "";
 
   return {
     rentalId: extractRentalId(data),
     cli,
     usDdi,
+    ilDdi,
+    status,
     pending: !cli && !usDdi,
     raw: data,
   };
@@ -545,10 +543,17 @@ exports.rcukAddRental = onRequest({ region: REGION }, async (req, res) => {
 
   try {
     const payload = getPayload(req);
-    if (payload.sim_number || payload.simNumber) {
-      payload.sim_number = normalizeRcukSimNumber(payload.sim_number || payload.simNumber);
+    const rcukPayload = buildRcukRentalPayload(payload);
+
+    if (!rcukPayload.sim_number) {
+      sendJson(res, 400, {
+        ok: false,
+        message: "sim_number is required.",
+      });
+      return;
     }
-    const result = await callRcuk(RCUK_ADD_RENTAL_PATH, payload);
+
+    const result = await callRcuk(RCUK_ADD_RENTAL_PATH, rcukPayload);
     const rentalId = extractRentalId(result.data);
 
     if (!result.ok) {
@@ -640,7 +645,7 @@ exports.rcukGetRental = onRequest({ region: REGION }, async (req, res) => {
       return;
     }
 
-    const result = await callRcuk(RCUK_GET_RENTAL_PATH, { rental_id: rentalId });
+    const result = await callRcuk(RCUK_GET_RENTAL_PATH, { rental_id: rentalId }, "GET");
     const normalized = normalizeRentalLookup(result.data);
 
     if (!result.ok) {

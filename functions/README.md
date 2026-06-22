@@ -21,6 +21,14 @@ Backend scaffold for Diamant Telecom.
 - `shopifyOrderWebhook`
   - Draft Shopify POS order webhook importer. It writes Shopify POS sales into the `pendingReports` collection for employees to claim and complete.
 
+- `telebroadCallWebhook`
+  - Telebroad **Account real time calls** webhook importer. Answered inbound/outbound calls are written into `pendingReports` as `type: "call"` for employees to claim and complete.
+  - Also accepts **User end call** webhooks when `talkDuration` is greater than zero.
+  - Configure in Telebroad Admin Center under **App Integrations > Webhooks**. Use:
+    `https://REGION-PROJECT_ID.cloudfunctions.net/telebroadCallWebhook/Account-real-time-calls`
+  - Optional second webhook for richer talk duration on hang-up:
+    `https://REGION-PROJECT_ID.cloudfunctions.net/telebroadCallWebhook/User-end-call`
+
 - `rcukAddRental`
   - Frontend proxy for the RCUK add-rental endpoint.
   - Keeps the RCUK `api-key` on the backend.
@@ -55,7 +63,6 @@ firebase functions:secrets:set TWILIO_ACCOUNT_SID
 firebase functions:secrets:set TWILIO_AUTH_TOKEN
 firebase functions:secrets:set TWILIO_FROM_NUMBER
 firebase functions:secrets:set TWILIO_REQUEST_TOKEN
-firebase functions:secrets:set STORE_PHONE_NUMBER
 firebase functions:secrets:set SHOPIFY_WEBHOOK_SECRET
 firebase functions:secrets:set RCUK_API_KEY
 firebase functions:secrets:set SOLA_API_KEY
@@ -69,9 +76,24 @@ Optional RCUK config:
 
 ```bash
 RCUK_API_BASE_URL=https://myaccount.rcuk.com/api
-RCUK_ADD_RENTAL_PATH=/rental/add-rental
-RCUK_GET_RENTAL_PATH=/rental/get-rental
+RCUK_ADD_RENTAL_PATH=/add-rental
+RCUK_GET_RENTAL_PATH=/get-rental
+RCUK_CHECK_SIM_PATH=/check-sim
 ```
+
+Per the [RCUK API docs](https://myaccount.rcuk.com/api-documentation): `add-rental`
+and `check-sim` are `POST`; `get-rental` is a `GET` with a `rental_id` query
+parameter. The `rcukAddRental` proxy maps the rental form fields to the required
+RCUK params:
+
+- `sim_number` — normalized SIM/ICCID.
+- `country` — always `"UK"`.
+- `rental_type` — `"daily"` (or `"monthly"` when `no_of_months` is supplied).
+- `rental_package` — `"voice"`, `"data"`, or `"v&d"` (from the Service selector).
+- `start_date`, and `end_date` (daily) or `no_of_months` (monthly).
+- `uk_days`, `eu_days`, `wts_days` — ints. `tp_days` is always `0`.
+- `il_ddi`, `us_ddi`, `sms` — int flags (`0` or `1`).
+- `Notes` — set to the customer phone number.
 
 Optional Sola config:
 
@@ -142,7 +164,9 @@ Rental reports should include:
 
 ### `pendingReports`
 
-Shopify POS webhook imports land here before becoming completed store reports:
+Shopify POS and Telebroad call webhook imports land here before becoming completed store reports.
+
+Shopify POS example:
 
 ```json
 {
@@ -158,6 +182,34 @@ Shopify POS webhook imports land here before becoming completed store reports:
     "lineItemsText": "1x iPhone 13",
     "staffName": "Shopify staff name",
     "locationName": "Store"
+  }
+}
+```
+
+Telebroad answered call example:
+
+```json
+{
+  "id": "telebroad-1743731655_796929",
+  "type": "call",
+  "source": "telebroad",
+  "status": "pending",
+  "title": "Inbound call John Customer (17329942081)",
+  "customerPhone": "17329942081",
+  "customerPhoneDigits": "17329942081",
+  "imported": {
+    "callId": "1743731655.796929",
+    "direction": "Incoming",
+    "status": "ended",
+    "employeeName": "Sally Edwards",
+    "talkDuration": 42
+  },
+  "details": {
+    "callerName": "John Customer",
+    "reason": "",
+    "outcome": "Answered",
+    "handledBy": "Sally Edwards",
+    "telebroadCallId": "1743731655.796929"
   }
 }
 ```

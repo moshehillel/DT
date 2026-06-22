@@ -8,6 +8,7 @@
   },
   "scripts": {
     "lint": "node --check src/index.js",
+    "test": "node --test test/*.test.js",
     "serve": "firebase emulators:start --only functions,firestore",
     "deploy": "firebase deploy --only functions,firestore:rules,firestore:indexes"
   },

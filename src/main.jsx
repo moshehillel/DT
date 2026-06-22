@@ -1,169 +1,48 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
-  replaceAppStateDocument,
-  replaceCollection,
-  watchAppStateDocument,
-  watchCollection,
-} from "./firebaseClient";
+  ACTIVE_EMPLOYEE_KEY,
+  ADMIN_PIN,
+  defaultEmployees,
+  defaultManualReportType,
+  defaultOrderHandlers,
+  EMPLOYEE_KEY,
+  FUNCTIONS_BASE_URL,
+  manualReportTypeKeys,
+  ORDER_HANDLERS_KEY,
+  paymentMethods,
+  PENDING_REPORTS_KEY,
+  PHONE_ORDERS_KEY,
+  reportTypes,
+  RESET_REQUESTS_KEY,
+  SESSION_KEY,
+  STORAGE_KEY,
+} from "./constants";
+import { useCloudCollectionState, useCloudDocumentState } from "./hooks/useCloudState";
+import {
+  buildAppNotifications,
+  calculateInclusiveDays,
+  calculateRentalPrice,
+  calculateReturnDueDate,
+  createEmptyFilters,
+  digitsOnly,
+  exportCsv,
+  formatDateTime,
+  formatMoney,
+  formatPayment,
+  formatShortDate,
+  generateRepairTicketNumber,
+  getMinimumRentalDays,
+  isRentalFormComplete,
+  isSolaPaidStatus,
+  normalizeRcukSimNumber,
+  numberValue,
+  uniqueValues,
+} from "./utils";
 import "./styles.css";
 
-const STORAGE_KEY = "diamant-telecom-reports-v1";
-const PENDING_REPORTS_KEY = "diamant-telecom-pending-reports-v1";
-const PHONE_ORDERS_KEY = "diamant-telecom-phone-orders-v1";
-const ORDER_HANDLERS_KEY = "diamant-telecom-order-handlers-v1";
-const EMPLOYEE_KEY = "diamant-telecom-employees-v1";
-const ACTIVE_EMPLOYEE_KEY = "diamant-telecom-active-employee-v1";
-const SESSION_KEY = "diamant-telecom-session-v1";
-const RESET_REQUESTS_KEY = "diamant-telecom-reset-requests-v1";
-const ADMIN_PIN = "admin123";
-const FUNCTIONS_BASE_URL = import.meta.env.VITE_FUNCTIONS_BASE_URL || "";
-
-const defaultEmployees = ["Moshe", "Employee 1"];
-const defaultOrderHandlers = [
-  { id: "handler-default", name: "Moshe", phone: "", location: "Main store" },
-];
-const paymentMethods = ["Cash", "CC", "Check", "Card", "Zelle", "Cash App", "Apple Pay", "Other"];
-const repairStatuses = [
-  "Received",
-  "Diagnosing",
-  "Waiting for parts",
-  "In repair",
-  "Ready",
-  "Picked up",
-  "Delivered",
-  "Completed",
-  "Cancelled",
-];
-
-const reportTypes = {
-  call: {
-    title: "Phone call report",
-    label: "Phone call",
-    mark: "C",
-    description: "Inbound requests",
-    fields: [
-      { name: "callerName", label: "Caller name", placeholder: "Customer name" },
-      { name: "reason", label: "What does the caller want?", placeholder: "Price check, repair update, sale question" },
-      { name: "outcome", label: "Call outcome", placeholder: "Answered, needs follow-up, came in store" },
-      { name: "followUpDate", label: "Follow-up date", type: "date" },
-    ],
-  },
-  sale: {
-    title: "Sale report",
-    label: "Sale",
-    mark: "S",
-    description: "Phones and products",
-    fields: [
-      { name: "request", label: "What does the customer want?", placeholder: "Phone, charger, accessory, plan" },
-      { name: "productType", label: "Product type", placeholder: "Phone" },
-      { name: "model", label: "Phone model", placeholder: "iPhone 14 Pro" },
-      { name: "imei", label: "IMEI", placeholder: "15 digit IMEI" },
-    ],
-  },
-  repair: {
-    title: "Repair report",
-    label: "Repair",
-    mark: "R",
-    description: "Device service",
-    fields: [
-      { name: "model", label: "Phone model", placeholder: "Samsung Galaxy S23" },
-      { name: "damage", label: "What is damaged?", placeholder: "Screen, charging port, battery" },
-      { name: "status", label: "Repair status", type: "select", options: repairStatuses },
-      { name: "paymentStatus", label: "Repair paid?", type: "select", options: ["Not paid", "Paid"] },
-      { name: "notificationPreference", label: "When delivered notify by", type: "select", options: ["Text message", "Phone call"] },
-      { name: "dueDate", label: "Expected ready date", type: "date" },
-    ],
-  },
-  sim: {
-    title: "SIM activation report",
-    label: "SIM activation",
-    mark: "A",
-    description: "Carrier setup",
-    fields: [
-      { name: "carrier", label: "Carrier", placeholder: "US Mobile, H2O, Ultra, Lyca" },
-      { name: "simPhone", label: "SIM number", placeholder: "SIM / ICCID number" },
-      { name: "plan", label: "Plan / activation notes", placeholder: "Monthly plan, port-in, new number" },
-      { name: "accountPin", label: "PIN / account note", placeholder: "Optional" },
-    ],
-  },
-  rental: {
-    title: "Phone rental report",
-    label: "Phone rental",
-    mark: "P",
-    description: "Temporary devices",
-    fields: [
-      { name: "rentalType", label: "Rental type", type: "select", options: ["SIM only", "Phone", "Upgraded phone"] },
-      { name: "model", label: "Phone model", placeholder: "iPhone 12, Galaxy A14" },
-      { name: "imei", label: "IMEI / device ID", placeholder: "Optional for SIM only" },
-      { name: "simNumber", label: "SIM number", placeholder: "SIM / ICCID number" },
-      { name: "startDate", label: "Start date", type: "date" },
-      { name: "endDate", label: "End date", type: "date" },
-      { name: "returnTime", label: "Return time", type: "time" },
-      { name: "deposit", label: "Deposit", placeholder: "0.00" },
-    ],
-  },
-  phoneOrder: {
-    title: "Phone order",
-    label: "Phone order",
-    mark: "O",
-    description: "Manual deliveries",
-    fields: [],
-  },
-};
-
-function readJson(key, fallback) {
-  try {
-    return JSON.parse(localStorage.getItem(key)) || fallback;
-  } catch {
-    return fallback;
-  }
-}
-
-function createEmptyFilters() {
-  return {
-    query: "",
-    type: "all",
-    employee: "all",
-    status: "all",
-    paymentMethod: "all",
-    dateFrom: "",
-    dateTo: "",
-    amountMin: "",
-    amountMax: "",
-  };
-}
-
-function digitsOnly(value) {
-  return String(value || "").replace(/\D/g, "");
-}
-
-function normalizeRcukSimNumber(value) {
-  const digits = digitsOnly(value);
-  if (!digits) return "";
-  if (digits.startsWith("8944100030") || digits.startsWith("894411006")) return digits;
-  if (digits.startsWith("00030")) return `89441${digits}`;
-  if (digits.startsWith("006")) return `894411${digits}`;
-  return digits;
-}
-
-function generateRepairTicketNumber(reports) {
-  const today = new Date();
-  const datePart = [
-    today.getFullYear(),
-    String(today.getMonth() + 1).padStart(2, "0"),
-    String(today.getDate()).padStart(2, "0"),
-  ].join("");
-  const prefix = `DR-${datePart}`;
-  const todaysRepairCount = reports.filter((report) =>
-    report.type === "repair" && report.details?.ticketNumber?.startsWith(prefix),
-  ).length;
-
-  return `${prefix}-${String(todaysRepairCount + 1).padStart(4, "0")}`;
-}
-
 function App() {
-  const [activeType, setActiveType] = useState("sale");
+  const [activeType, setActiveType] = useState(defaultManualReportType);
   const [employees, setEmployees] = useCloudDocumentState("employees", EMPLOYEE_KEY, defaultEmployees);
   const [reports, setReports] = useCloudCollectionState("reports", STORAGE_KEY, []);
   const [pendingReports, setPendingReports] = useCloudCollectionState("pendingReports", PENDING_REPORTS_KEY, []);
@@ -349,7 +228,7 @@ function App() {
       ),
     );
 
-    if (status === "Delivered" && oldStatus !== "Delivered" && report?.customerPhone) {
+    if (status === "Delivered" && oldStatus !== "Delivered" && report?.customerPhone && !FUNCTIONS_BASE_URL) {
       queueDeliveryNotification(report);
     }
   }
@@ -735,110 +614,6 @@ function LoginPage({ employees, defaultEmployee, onLogin, onResetPassword }) {
   );
 }
 
-function useStoredState(key, fallback) {
-  const [value, setValue] = useState(() => readJson(key, fallback));
-
-  useEffect(() => {
-    localStorage.setItem(key, JSON.stringify(value));
-  }, [key, value]);
-
-  return [value, setValue];
-}
-
-function useCloudCollectionState(collectionName, localKey, fallback) {
-  const [value, setValue] = useState(() => ensureArrayIds(readJson(localKey, fallback)));
-  const valueRef = useRef(value);
-  const cloudReadyRef = useRef(false);
-  const saveQueuedRef = useRef(false);
-
-  useEffect(() => {
-    valueRef.current = value;
-    localStorage.setItem(localKey, JSON.stringify(value));
-  }, [localKey, value]);
-
-  useEffect(() => {
-    return watchCollection(
-      collectionName,
-      (items) => {
-        cloudReadyRef.current = true;
-        if (!items.length && valueRef.current.length && !saveQueuedRef.current) {
-          saveQueuedRef.current = true;
-          replaceCollection(collectionName, valueRef.current).catch(console.error);
-          return;
-        }
-        setValue(sortCloudItems(items));
-      },
-      (error) => {
-        console.error(`Firestore ${collectionName} sync failed`, error);
-      },
-    );
-  }, [collectionName]);
-
-  function updateValue(nextValueOrUpdater) {
-    setValue((current) => {
-      const nextValue = typeof nextValueOrUpdater === "function"
-        ? nextValueOrUpdater(current)
-        : nextValueOrUpdater;
-      const normalized = ensureArrayIds(nextValue);
-
-      if (cloudReadyRef.current) {
-        replaceCollection(collectionName, normalized).catch(console.error);
-      }
-
-      return normalized;
-    });
-  }
-
-  return [value, updateValue];
-}
-
-function useCloudDocumentState(documentId, localKey, fallback) {
-  const [value, setValue] = useState(() => readJson(localKey, fallback));
-  const valueRef = useRef(value);
-  const cloudReadyRef = useRef(false);
-  const saveQueuedRef = useRef(false);
-
-  useEffect(() => {
-    valueRef.current = value;
-    localStorage.setItem(localKey, JSON.stringify(value));
-  }, [localKey, value]);
-
-  useEffect(() => {
-    return watchAppStateDocument(
-      documentId,
-      fallback,
-      (items) => {
-        cloudReadyRef.current = true;
-        if (isSameArray(items, fallback) && !isSameArray(valueRef.current, fallback) && !saveQueuedRef.current) {
-          saveQueuedRef.current = true;
-          replaceAppStateDocument(documentId, valueRef.current).catch(console.error);
-          return;
-        }
-        setValue(items);
-      },
-      (error) => {
-        console.error(`Firestore appState/${documentId} sync failed`, error);
-      },
-    );
-  }, [documentId, fallback]);
-
-  function updateValue(nextValueOrUpdater) {
-    setValue((current) => {
-      const nextValue = typeof nextValueOrUpdater === "function"
-        ? nextValueOrUpdater(current)
-        : nextValueOrUpdater;
-
-      if (cloudReadyRef.current) {
-        replaceAppStateDocument(documentId, nextValue).catch(console.error);
-      }
-
-      return nextValue;
-    });
-  }
-
-  return [value, updateValue];
-}
-
 function Sidebar({
   activeType,
   activeView,
@@ -902,7 +677,7 @@ function Sidebar({
             <span className="tab-mark">P</span>
             <span>
               <strong>Pending reports</strong>
-              <small>Claim POS imports</small>
+              <small>Claim Shopify & call imports</small>
             </span>
           </button>
           <button
@@ -916,7 +691,9 @@ function Sidebar({
               <small>Active tickets</small>
             </span>
           </button>
-          {Object.entries(reportTypes).map(([type, config]) => (
+          {manualReportTypeKeys.map((type) => {
+            const config = reportTypes[type];
+            return (
             <button
               className={`tab ${activeType === type ? "active" : ""}`}
               type="button"
@@ -929,7 +706,8 @@ function Sidebar({
                 <small>{config.description}</small>
               </span>
             </button>
-          ))}
+            );
+          })}
         </nav>
       ) : null}
       {activeView === "openRepairs" ? (
@@ -956,7 +734,7 @@ function Sidebar({
             <span className="tab-mark">P</span>
             <span>
               <strong>Pending reports</strong>
-              <small>Claim POS imports</small>
+              <small>Claim Shopify & call imports</small>
             </span>
           </button>
           <button className="tab" type="button" onClick={() => onViewChange("reports")}>
@@ -1117,33 +895,6 @@ function NotificationCenter({ notifications }) {
       </div>
     </section>
   );
-}
-
-function buildAppNotifications(reports) {
-  const today = startOfDay(new Date());
-
-  return reports
-    .filter((report) => report.type === "rental")
-    .map((report) => {
-      const dueDate = report.details?.returnDueDate || calculateReturnDueDate(report.details?.endDate, report.details?.returnTime);
-      if (!dueDate) return null;
-      const due = startOfDay(new Date(`${dueDate}T00:00:00`));
-      if (due >= today) return null;
-
-      return {
-        id: `rental-overdue-${report.id}`,
-        severity: "urgent",
-        title: "Rental past due",
-        message: `${report.customerPhone || "Customer"} should have returned ${report.details?.model || report.details?.rentalType || "rental"} by ${dueDate}.`,
-      };
-    })
-    .filter(Boolean);
-}
-
-function startOfDay(date) {
-  const copy = new Date(date);
-  copy.setHours(0, 0, 0, 0);
-  return copy;
 }
 
 function RentalReportForm({ activeEmployee, onSave }) {
@@ -2043,31 +1794,67 @@ function PendingReportsPage({ pendingReports, activeEmployee, onClaim, onSave })
 
 function PendingReportCard({ pendingReport, activeEmployee, onClaim, onSave }) {
   const imported = pendingReport.imported || {};
+  const isCallReport = pendingReport.type === "call" || pendingReport.source === "telebroad";
+  const isShopifySale = pendingReport.source === "shopify_pos";
   const claimedBySomeoneElse = pendingReport.claimedBy && pendingReport.claimedBy !== activeEmployee;
   const isClaimedByMe = pendingReport.claimedBy === activeEmployee;
-  const [fields, setFields] = useState({
-    customerPhone: pendingReport.customerPhone || imported.customerPhone || "",
+  const [fields, setFields] = useState(() => ({
+    customerPhone: pendingReport.customerPhone || imported.customerPhone || imported.callerIdExternal || "",
+    callerName: pendingReport.details?.callerName || imported.callerNameExternal || "",
+    reason: pendingReport.details?.reason || "",
+    outcome: pendingReport.details?.outcome || "Answered",
+    followUpDate: pendingReport.details?.followUpDate || "",
     productType: pendingReport.details?.productType || "Phone",
     model: pendingReport.details?.model || imported.lineItemsText || "",
     imei: pendingReport.details?.imei || "",
     notes: pendingReport.notes || "",
     paymentAmount: pendingReport.paymentAmount || imported.totalPrice || "",
-    paymentMethod: pendingReport.paymentMethod || "Shopify POS",
-  });
+    paymentMethod: pendingReport.paymentMethod || (isShopifySale ? "Shopify POS" : "Cash"),
+  }));
 
   function updateField(name, value) {
     setFields((current) => ({ ...current, [name]: value }));
   }
 
-  const canSave = isClaimedByMe
-    && fields.customerPhone.trim()
-    && fields.productType.trim()
-    && fields.model.trim()
-    && fields.paymentAmount.trim()
-    && fields.paymentMethod.trim();
+  const canSave = isClaimedByMe && fields.customerPhone.trim() && (
+    isCallReport
+      ? fields.reason.trim() && fields.outcome.trim()
+      : fields.productType.trim() && fields.model.trim() && fields.paymentAmount.trim() && fields.paymentMethod.trim()
+  );
 
   function saveCompletedReport() {
     if (!canSave) return;
+
+    if (isCallReport) {
+      onSave(pendingReport.id, {
+        id: crypto.randomUUID(),
+        type: "call",
+        source: pendingReport.source || "telebroad",
+        pendingSourceId: pendingReport.id,
+        createdAt: new Date().toISOString(),
+        importedAt: pendingReport.createdAt,
+        servedBy: activeEmployee,
+        signature: activeEmployee,
+        signedAt: new Date().toISOString(),
+        customerPhone: fields.customerPhone.trim(),
+        customerPhoneDigits: digitsOnly(fields.customerPhone),
+        paymentAmount: fields.paymentAmount.trim(),
+        paymentMethod: fields.paymentMethod.trim(),
+        notes: fields.notes.trim(),
+        details: {
+          callerName: fields.callerName.trim(),
+          reason: fields.reason.trim(),
+          outcome: fields.outcome.trim(),
+          followUpDate: fields.followUpDate.trim(),
+          direction: imported.direction || pendingReport.details?.direction || "",
+          handledBy: imported.employeeName || pendingReport.details?.handledBy || "",
+          telebroadCallId: imported.callId || pendingReport.details?.telebroadCallId || "",
+          callDuration: imported.callDuration ?? pendingReport.details?.callDuration ?? "",
+          talkDuration: imported.talkDuration ?? pendingReport.details?.talkDuration ?? "",
+        },
+      });
+      return;
+    }
 
     onSave(pendingReport.id, {
       id: crypto.randomUUID(),
@@ -2098,21 +1885,42 @@ function PendingReportCard({ pendingReport, activeEmployee, onClaim, onSave }) {
     });
   }
 
+  const sourceLabel = isCallReport
+    ? "Telebroad call"
+    : isShopifySale
+      ? "Shopify POS"
+      : "Pending";
+  const cardTitle = pendingReport.title
+    || imported.shopifyOrderName
+    || (isCallReport ? "Pending call report" : "Pending sale");
+
   return (
     <article className={`pending-card ${isClaimedByMe ? "claimed" : ""}`}>
       <div className="pending-card-head">
         <div>
-          <p className="eyebrow">{pendingReport.source === "shopify_pos" ? "Shopify POS" : "Pending"}</p>
-          <h3>{imported.shopifyOrderName || pendingReport.title || "Pending sale"}</h3>
+          <p className="eyebrow">{sourceLabel}</p>
+          <h3>{cardTitle}</h3>
         </div>
-        <span className="badge sale">{pendingReport.type || "sale"}</span>
+        <span className={`badge ${isCallReport ? "call" : "sale"}`}>{pendingReport.type || "sale"}</span>
       </div>
 
       <div className="pending-import">
-        <span><strong>Total:</strong> {formatPayment(fields.paymentAmount)}</span>
-        <span><strong>Customer:</strong> {fields.customerPhone || "-"}</span>
-        <span><strong>Items:</strong> {imported.lineItemsText || fields.model || "-"}</span>
-        <span><strong>Imported:</strong> {pendingReport.createdAt ? formatShortDate(pendingReport.createdAt) : "-"}</span>
+        {isCallReport ? (
+          <>
+            <span><strong>Direction:</strong> {imported.direction || pendingReport.details?.direction || "-"}</span>
+            <span><strong>Customer:</strong> {fields.customerPhone || "-"}</span>
+            <span><strong>Handled by:</strong> {imported.employeeName || pendingReport.details?.handledBy || "-"}</span>
+            <span><strong>Talk time:</strong> {imported.talkDuration !== "" && imported.talkDuration !== undefined ? `${imported.talkDuration}s` : "-"}</span>
+            <span><strong>Imported:</strong> {pendingReport.createdAt ? formatShortDate(pendingReport.createdAt) : "-"}</span>
+          </>
+        ) : (
+          <>
+            <span><strong>Total:</strong> {formatPayment(fields.paymentAmount)}</span>
+            <span><strong>Customer:</strong> {fields.customerPhone || "-"}</span>
+            <span><strong>Items:</strong> {imported.lineItemsText || fields.model || "-"}</span>
+            <span><strong>Imported:</strong> {pendingReport.createdAt ? formatShortDate(pendingReport.createdAt) : "-"}</span>
+          </>
+        )}
       </div>
 
       <div className="claim-strip">
@@ -2134,28 +1942,51 @@ function PendingReportCard({ pendingReport, activeEmployee, onClaim, onSave }) {
             <span>Customer phone</span>
             <input value={fields.customerPhone} onChange={(event) => updateField("customerPhone", event.target.value)} />
           </label>
-          <label className="field">
-            <span>Product type</span>
-            <input value={fields.productType} onChange={(event) => updateField("productType", event.target.value)} />
-          </label>
-          <label className="field">
-            <span>Model / items</span>
-            <input value={fields.model} onChange={(event) => updateField("model", event.target.value)} />
-          </label>
-          <label className="field">
-            <span>IMEI</span>
-            <input value={fields.imei} onChange={(event) => updateField("imei", event.target.value)} />
-          </label>
-          <label className="field">
-            <span>Amount</span>
-            <input value={fields.paymentAmount} onChange={(event) => updateField("paymentAmount", event.target.value)} />
-          </label>
-          <label className="field">
-            <span>Payment method</span>
-            <select value={fields.paymentMethod} onChange={(event) => updateField("paymentMethod", event.target.value)}>
-              {paymentMethods.map((method) => <option key={method}>{method}</option>)}
-            </select>
-          </label>
+          {isCallReport ? (
+            <>
+              <label className="field">
+                <span>Caller name</span>
+                <input value={fields.callerName} onChange={(event) => updateField("callerName", event.target.value)} />
+              </label>
+              <label className="field">
+                <span>What does the caller want?</span>
+                <input value={fields.reason} onChange={(event) => updateField("reason", event.target.value)} required />
+              </label>
+              <label className="field">
+                <span>Call outcome</span>
+                <input value={fields.outcome} onChange={(event) => updateField("outcome", event.target.value)} required />
+              </label>
+              <label className="field">
+                <span>Follow-up date</span>
+                <input type="date" value={fields.followUpDate} onChange={(event) => updateField("followUpDate", event.target.value)} />
+              </label>
+            </>
+          ) : (
+            <>
+              <label className="field">
+                <span>Product type</span>
+                <input value={fields.productType} onChange={(event) => updateField("productType", event.target.value)} />
+              </label>
+              <label className="field">
+                <span>Model / items</span>
+                <input value={fields.model} onChange={(event) => updateField("model", event.target.value)} />
+              </label>
+              <label className="field">
+                <span>IMEI</span>
+                <input value={fields.imei} onChange={(event) => updateField("imei", event.target.value)} />
+              </label>
+              <label className="field">
+                <span>Amount</span>
+                <input value={fields.paymentAmount} onChange={(event) => updateField("paymentAmount", event.target.value)} />
+              </label>
+              <label className="field">
+                <span>Payment method</span>
+                <select value={fields.paymentMethod} onChange={(event) => updateField("paymentMethod", event.target.value)}>
+                  {paymentMethods.map((method) => <option key={method}>{method}</option>)}
+                </select>
+              </label>
+            </>
+          )}
           <label className="field full">
             <span>Notes / missing details</span>
             <textarea rows="3" value={fields.notes} onChange={(event) => updateField("notes", event.target.value)} />
@@ -2730,206 +2561,6 @@ function EmployeeDialog({ employees, onAdd, onRemove, onClose }) {
       </div>
     </div>
   );
-}
-
-function exportCsv(reports) {
-  const headers = [
-    "date",
-    "type",
-    "ticketNumber",
-    "customerPhone",
-    "servedBy",
-    "paymentAmount",
-    "paymentMethod",
-    "status",
-    "details",
-    "notes",
-  ];
-  const csv = [
-    headers.join(","),
-    ...reports.map((report) =>
-      [
-        report.createdAt,
-        reportTypes[report.type].label,
-        report.details?.ticketNumber || "",
-        report.customerPhone,
-        report.servedBy,
-        report.paymentAmount,
-        report.paymentMethod,
-        report.details?.status || "",
-        Object.entries(report.details || {})
-          .map(([key, value]) => `${key}: ${value}`)
-          .join(" | "),
-        report.notes,
-      ]
-        .map(csvCell)
-        .join(","),
-    ),
-  ].join("\n");
-
-  const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
-  const url = URL.createObjectURL(blob);
-  const link = document.createElement("a");
-  link.href = url;
-  link.download = `diamant-reports-${new Date().toISOString().slice(0, 10)}.csv`;
-  link.click();
-  URL.revokeObjectURL(url);
-}
-
-function csvCell(value) {
-  return `"${String(value || "").replaceAll('"', '""')}"`;
-}
-
-function formatDateTime(date) {
-  return new Intl.DateTimeFormat("en-US", {
-    weekday: "short",
-    month: "short",
-    day: "numeric",
-    hour: "numeric",
-    minute: "2-digit",
-  }).format(date);
-}
-
-function formatShortDate(value) {
-  return new Intl.DateTimeFormat("en-US", {
-    month: "short",
-    day: "numeric",
-    hour: "numeric",
-    minute: "2-digit",
-  }).format(new Date(value));
-}
-
-function formatPayment(value) {
-  const amount = Number.parseFloat(value || "0");
-  if (!Number.isFinite(amount) || !value) return "-";
-  return formatMoney(amount);
-}
-
-function formatMoney(value) {
-  return new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" }).format(value);
-}
-
-function numberValue(value) {
-  const parsed = Number.parseInt(value || "0", 10);
-  return Number.isFinite(parsed) ? parsed : 0;
-}
-
-function uniqueValues(values) {
-  return [...new Set(values.filter(Boolean))];
-}
-
-function ensureArrayIds(items) {
-  return Array.isArray(items)
-    ? items.map((item) => {
-        if (!item || typeof item !== "object") return item;
-        return item.id ? item : { ...item, id: crypto.randomUUID() };
-      })
-    : [];
-}
-
-function sortCloudItems(items) {
-  return [...items].sort((a, b) => {
-    const dateDiff = new Date(b.createdAt || b.updatedAt || 0) - new Date(a.createdAt || a.updatedAt || 0);
-    if (dateDiff) return dateDiff;
-    return String(a.name || a.employee || a.id || "").localeCompare(String(b.name || b.employee || b.id || ""));
-  });
-}
-
-function isSameArray(left, right) {
-  return JSON.stringify(left) === JSON.stringify(right);
-}
-
-function calculateInclusiveDays(startDate, endDate) {
-  if (!startDate || !endDate) return 0;
-  const start = new Date(`${startDate}T00:00:00`);
-  const end = new Date(`${endDate}T00:00:00`);
-  const diff = Math.round((end - start) / 86400000);
-  return diff >= 0 ? diff + 1 : 0;
-}
-
-function calculateRentalDailyRate(serviceType, addSms) {
-  const base = serviceType === "Voice and data" ? 20 : 15;
-  return base + (addSms ? 2 : 0);
-}
-
-function isRentalFormComplete(form) {
-  const required = [
-    form.rentalRegion,
-    form.serviceType,
-    form.startDate,
-    form.endDate,
-    form.deviceKind,
-    form.simNumber,
-    form.customerPhone,
-    form.returnDays,
-    form.paymentMethod,
-  ];
-
-  if (form.rentalRegion === "RCUK") {
-    required.push(form.ukDays, form.euDays, form.wtsDays);
-  }
-
-  if (form.deviceKind !== "SIM only") {
-    required.push(form.model, form.imei);
-  }
-
-  return required.every((value) => String(value ?? "").trim() !== "");
-}
-
-function getMinimumRentalDays(region) {
-  if (region === "Israel") return 7;
-  return 4;
-}
-
-function calculateRentalPrice(form, totalDays) {
-  if (!totalDays) {
-    return { dailyRate: 0, totalPrice: 0, label: "-" };
-  }
-
-  if (form.rentalRegion === "Israel") {
-    return {
-      dailyRate: 5,
-      totalPrice: totalDays * 5,
-      label: "$5/day",
-    };
-  }
-
-  if (form.rentalRegion === "Canada") {
-    const weekCount = Math.floor(totalDays / 7);
-    const remainingDays = totalDays % 7;
-    const weekendCount = Math.ceil(remainingDays / 2);
-    const totalPrice = (weekCount * 45) + (weekendCount * 30);
-
-    return {
-      dailyRate: totalDays ? totalPrice / totalDays : 0,
-      totalPrice,
-      label: "$45/week, $30/weekend",
-    };
-  }
-
-  const dailyRate = calculateRentalDailyRate(form.serviceType, form.addSms);
-  return {
-    dailyRate,
-    totalPrice: totalDays * dailyRate,
-    label: `${formatMoney(dailyRate)}/day`,
-  };
-}
-
-function calculateReturnDueDate(endDate, returnDays) {
-  if (!endDate) return "";
-  const numericDays = numberValue(String(returnDays || "").replace("days", ""));
-  const date = new Date(`${endDate}T00:00:00`);
-  if (Number.isNaN(date.getTime())) return "";
-  date.setDate(date.getDate() + numericDays);
-  return [
-    date.getFullYear(),
-    String(date.getMonth() + 1).padStart(2, "0"),
-    String(date.getDate()).padStart(2, "0"),
-  ].join("-");
-}
-
-function isSolaPaidStatus(status) {
-  return ["paid", "approved", "captured", "succeeded", "success"].includes(String(status || "").toLowerCase());
 }
 
 createRoot(document.getElementById("root")).render(
