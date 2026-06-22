@@ -20,6 +20,7 @@ admin.initializeApp();
 
 const db = admin.firestore();
 const REGION = "us-central1";
+const HTTP_OPTIONS = { region: REGION, invoker: "public" };
 const TWILIO_FROM_NUMBER = process.env.TWILIO_FROM_NUMBER || "";
 const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID || "";
 const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN || "";
@@ -132,7 +133,7 @@ function assertTwilioRequest(req, res) {
   return false;
 }
 
-exports.repairStatus = onRequest({ region: REGION }, async (req, res) => {
+exports.repairStatus = onRequest(HTTP_OPTIONS, async (req, res) => {
   if (req.method !== "POST") {
     sendJson(res, 405, { error: "POST required" });
     return;
@@ -199,7 +200,7 @@ async function getAvailablePhones() {
   }));
 }
 
-exports.phoneInventoryList = onRequest({ region: REGION }, async (req, res) => {
+exports.phoneInventoryList = onRequest(HTTP_OPTIONS, async (req, res) => {
   if (req.method !== "POST") {
     sendJson(res, 405, { error: "POST required" });
     return;
@@ -233,7 +234,7 @@ exports.phoneInventoryList = onRequest({ region: REGION }, async (req, res) => {
   }
 });
 
-exports.phoneInventoryDetails = onRequest({ region: REGION }, async (req, res) => {
+exports.phoneInventoryDetails = onRequest(HTTP_OPTIONS, async (req, res) => {
   if (req.method !== "POST") {
     sendJson(res, 405, { error: "POST required" });
     return;
@@ -371,7 +372,7 @@ function escapeXml(value) {
     .replaceAll("'", "&apos;");
 }
 
-exports.shopifyOrderWebhook = onRequest({ region: REGION }, async (req, res) => {
+exports.shopifyOrderWebhook = onRequest(HTTP_OPTIONS, async (req, res) => {
   if (req.method !== "POST") {
     sendJson(res, 405, { error: "POST required" });
     return;
@@ -453,7 +454,7 @@ exports.shopifyOrderWebhook = onRequest({ region: REGION }, async (req, res) => 
   sendJson(res, 200, { ok: true });
 });
 
-exports.telebroadCallWebhook = onRequest({ region: REGION }, async (req, res) => {
+exports.telebroadCallWebhook = onRequest(HTTP_OPTIONS, async (req, res) => {
   if (req.method !== "POST") {
     sendJson(res, 405, { error: "POST required" });
     return;
@@ -534,7 +535,7 @@ function normalizeRentalLookup(data) {
   };
 }
 
-exports.rcukAddRental = onRequest({ region: REGION }, async (req, res) => {
+exports.rcukAddRental = onRequest(HTTP_OPTIONS, async (req, res) => {
   if (handleCors(req, res)) return;
   if (req.method !== "POST") {
     sendJson(res, 405, { error: "POST required" });
@@ -580,7 +581,7 @@ exports.rcukAddRental = onRequest({ region: REGION }, async (req, res) => {
   }
 });
 
-exports.rcukCheckSim = onRequest({ region: REGION }, async (req, res) => {
+exports.rcukCheckSim = onRequest(HTTP_OPTIONS, async (req, res) => {
   if (handleCors(req, res)) return;
   if (req.method !== "POST") {
     sendJson(res, 405, { error: "POST required" });
@@ -626,7 +627,7 @@ exports.rcukCheckSim = onRequest({ region: REGION }, async (req, res) => {
   }
 });
 
-exports.rcukGetRental = onRequest({ region: REGION }, async (req, res) => {
+exports.rcukGetRental = onRequest(HTTP_OPTIONS, async (req, res) => {
   if (handleCors(req, res)) return;
   if (req.method !== "POST") {
     sendJson(res, 405, { error: "POST required" });
@@ -694,7 +695,7 @@ function normalizeSolaCharge(data) {
   };
 }
 
-exports.solaCreateCharge = onRequest({ region: REGION }, async (req, res) => {
+exports.solaCreateCharge = onRequest(HTTP_OPTIONS, async (req, res) => {
   if (handleCors(req, res)) return;
   if (req.method !== "POST") {
     sendJson(res, 405, { error: "POST required" });
@@ -853,7 +854,7 @@ function buildPhoneOrderHandlerMessage(order) {
   ].filter(Boolean).join(" ");
 }
 
-exports.notifyPhoneOrderAssigned = onRequest({ region: REGION }, async (req, res) => {
+exports.notifyPhoneOrderAssigned = onRequest(HTTP_OPTIONS, async (req, res) => {
   if (handleCors(req, res)) return;
   if (req.method !== "POST") {
     sendJson(res, 405, { error: "POST required" });
@@ -897,7 +898,7 @@ exports.notifyPhoneOrderAssigned = onRequest({ region: REGION }, async (req, res
   }
 });
 
-exports.notifyPhoneOrderDelivered = onRequest({ region: REGION }, async (req, res) => {
+exports.notifyPhoneOrderDelivered = onRequest(HTTP_OPTIONS, async (req, res) => {
   if (handleCors(req, res)) return;
   if (req.method !== "POST") {
     sendJson(res, 405, { error: "POST required" });
