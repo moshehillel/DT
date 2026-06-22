@@ -13,6 +13,7 @@ import {
   paymentMethods,
   PENDING_REPORTS_KEY,
   PHONE_ORDERS_KEY,
+  repairStatuses,
   reportTypes,
   RESET_REQUESTS_KEY,
   SESSION_KEY,
