@@ -13,7 +13,7 @@ export const defaultEmployees = ["Moshe", "Employee 1"];
 export const defaultOrderHandlers = [
   { id: "handler-default", name: "Moshe", phone: "", location: "Main store" },
 ];
-export const paymentMethods = ["Cash", "CC", "Check", "Card", "Zelle", "Cash App", "Apple Pay", "Other"];
+export const paymentMethods = ["Cash", "CC", "Card", "Check", "Zelle", "Cash App", "Apple Pay", "Shopify POS", "Other"];
 export const repairStatuses = [
   "Received",
   "Diagnosing",

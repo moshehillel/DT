@@ -16,16 +16,11 @@ service cloud.firestore {
     }
 
     match /appState/{stateId} {
-      allow read, write: if isAdmin();
+      allow read, write: if signedIn();
     }
 
     match /reports/{reportId} {
-      allow create: if signedIn()
-        && request.resource.data.servedByEmployeeId == request.auth.uid;
-      allow read: if isAdmin()
-        || resource.data.servedByEmployeeId == request.auth.uid;
-      allow update: if isAdmin()
-        || resource.data.servedByEmployeeId == request.auth.uid;
+      allow read, create, update: if signedIn();
       allow delete: if isAdmin();
     }
 
@@ -37,21 +32,18 @@ service cloud.firestore {
         || !("claimedBy" in resource.data)
         || resource.data.claimedBy == ""
       );
-      allow delete: if signedIn();
+      allow delete: if signedIn() && (
+        isAdmin()
+        || ("claimedBy" in resource.data && resource.data.claimedBy != "")
+      );
     }
 
     match /phoneOrders/{orderId} {
-      allow create: if signedIn();
-      allow read: if isAdmin()
-        || resource.data.assignedEmployeeId == request.auth.uid;
-      allow update: if isAdmin()
-        || resource.data.assignedEmployeeId == request.auth.uid;
-      allow delete: if isAdmin();
+      allow read, create, update, delete: if signedIn();
     }
 
     match /orderHandlers/{handlerId} {
-      allow read: if signedIn();
-      allow create, update, delete: if isAdmin();
+      allow read, create, update, delete: if signedIn();
     }
 
     match /inventoryPhones/{phoneId} {
@@ -60,9 +52,8 @@ service cloud.firestore {
     }
 
     match /notificationLogs/{logId} {
-      allow read: if isAdmin()
-        || resource.data.servedByEmployeeId == request.auth.uid;
-      allow create, update, delete: if isAdmin();
+      allow read, create: if signedIn();
+      allow update, delete: if isAdmin();
     }
 
     match /passwordResetRequests/{requestId} {

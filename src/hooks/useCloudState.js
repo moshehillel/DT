@@ -28,6 +28,7 @@ export function useCloudCollectionState(collectionName, localKey, fallback) {
   const valueRef = useRef(value);
   const cloudReadyRef = useRef(false);
   const saveQueuedRef = useRef(false);
+  const pendingWritesRef = useRef(0);
 
   useEffect(() => {
     valueRef.current = value;
@@ -41,9 +42,14 @@ export function useCloudCollectionState(collectionName, localKey, fallback) {
         cloudReadyRef.current = true;
         if (!items.length && valueRef.current.length && !saveQueuedRef.current) {
           saveQueuedRef.current = true;
-          upsertCollectionItems(collectionName, valueRef.current).catch(console.error);
+          upsertCollectionItems(collectionName, valueRef.current)
+            .catch((error) => {
+              saveQueuedRef.current = false;
+              console.error(`Firestore ${collectionName} bootstrap failed`, error);
+            });
           return;
         }
+        if (pendingWritesRef.current > 0) return;
         setValue(sortCloudItems(items));
       },
       (error) => {
@@ -52,15 +58,22 @@ export function useCloudCollectionState(collectionName, localKey, fallback) {
     );
   }, [collectionName]);
 
-  function updateValue(nextValueOrUpdater) {
+  function updateValue(nextValueOrUpdater, options = {}) {
     setValue((current) => {
       const nextValue = typeof nextValueOrUpdater === "function"
         ? nextValueOrUpdater(current)
         : nextValueOrUpdater;
       const normalized = ensureArrayIds(nextValue);
 
-      if (cloudReadyRef.current) {
-        syncCollectionItems(collectionName, current, normalized).catch(console.error);
+      if (cloudReadyRef.current && !options.localOnly) {
+        pendingWritesRef.current += 1;
+        syncCollectionItems(collectionName, current, normalized)
+          .catch((error) => {
+            console.error(`Firestore ${collectionName} sync failed`, error);
+          })
+          .finally(() => {
+            pendingWritesRef.current = Math.max(0, pendingWritesRef.current - 1);
+          });
       }
 
       return normalized;
@@ -89,7 +102,11 @@ export function useCloudDocumentState(documentId, localKey, fallback) {
         cloudReadyRef.current = true;
         if (isSameArray(items, fallback) && !isSameArray(valueRef.current, fallback) && !saveQueuedRef.current) {
           saveQueuedRef.current = true;
-          replaceAppStateDocument(documentId, valueRef.current).catch(console.error);
+          replaceAppStateDocument(documentId, valueRef.current)
+            .catch((error) => {
+              saveQueuedRef.current = false;
+              console.error(`Firestore appState/${documentId} sync failed`, error);
+            });
           return;
         }
         setValue(items);

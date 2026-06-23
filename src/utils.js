@@ -22,6 +22,39 @@ export function createEmptyFilters() {
   };
 }
 
+export function toJsDate(value) {
+  if (!value) return null;
+  if (value instanceof Date) return value;
+  if (typeof value.toDate === "function") return value.toDate();
+  if (typeof value === "object" && typeof value.seconds === "number") {
+    return new Date(value.seconds * 1000);
+  }
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
+}
+
+export function normalizeFirestoreValue(value) {
+  if (value && typeof value.toDate === "function") {
+    return value.toDate().toISOString();
+  }
+  if (value && typeof value === "object" && typeof value.seconds === "number") {
+    return new Date(value.seconds * 1000).toISOString();
+  }
+  if (Array.isArray(value)) {
+    return value.map((item) => normalizeFirestoreValue(item));
+  }
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, item]) => [key, normalizeFirestoreValue(item)]),
+    );
+  }
+  return value;
+}
+
+export function normalizeFirestoreDoc(id, data) {
+  return normalizeFirestoreValue({ id, ...data });
+}
+
 export function digitsOnly(value) {
   return String(value || "").replace(/\D/g, "");
 }
@@ -68,7 +101,7 @@ export function exportCsv(reports) {
     ...reports.map((report) =>
       [
         report.createdAt,
-        reportTypes[report.type].label,
+        reportTypes[report.type]?.label ?? report.type,
         report.details?.ticketNumber || "",
         report.customerPhone,
         report.servedBy,
@@ -109,12 +142,14 @@ export function formatDateTime(date) {
 }
 
 export function formatShortDate(value) {
+  const date = toJsDate(value);
+  if (!date) return "-";
   return new Intl.DateTimeFormat("en-US", {
     month: "short",
     day: "numeric",
     hour: "numeric",
     minute: "2-digit",
-  }).format(new Date(value));
+  }).format(date);
 }
 
 export function formatPayment(value) {
@@ -147,7 +182,9 @@ export function ensureArrayIds(items) {
 
 export function sortCloudItems(items) {
   return [...items].sort((a, b) => {
-    const dateDiff = new Date(b.createdAt || b.updatedAt || 0) - new Date(a.createdAt || a.updatedAt || 0);
+    const leftDate = toJsDate(b.createdAt || b.updatedAt || b.claimedAt);
+    const rightDate = toJsDate(a.createdAt || a.updatedAt || a.claimedAt);
+    const dateDiff = (leftDate?.getTime() || 0) - (rightDate?.getTime() || 0);
     if (dateDiff) return dateDiff;
     return String(a.name || a.employee || a.id || "").localeCompare(String(b.name || b.employee || b.id || ""));
   });

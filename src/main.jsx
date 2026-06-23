@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
   ACTIVE_EMPLOYEE_KEY,
@@ -20,7 +20,7 @@ import {
   STORAGE_KEY,
 } from "./constants";
 import { useCloudCollectionState, useCloudDocumentState } from "./hooks/useCloudState";
-import { ensureFirebaseAuth } from "./firebaseClient";
+import { attachAuthMetadata, ensureFirebaseAuth } from "./firebaseClient";
 import {
   buildAppNotifications,
   calculateInclusiveDays,
@@ -39,6 +39,7 @@ import {
   isSolaPaidStatus,
   normalizeRcukSimNumber,
   numberValue,
+  toJsDate,
   uniqueValues,
 } from "./utils";
 import "./styles.css";
@@ -86,7 +87,7 @@ function App() {
       : reports.filter((report) => report.servedBy === activeEmployee);
 
     return availableReports.filter((report) => {
-      const reportDate = new Date(report.createdAt);
+      const reportDate = toJsDate(report.createdAt);
       const reportAmount = Number.parseFloat(report.paymentAmount || "0") || 0;
       const searchable = [
         report.type,
@@ -107,8 +108,8 @@ function App() {
         (sessionRole !== "admin" || filters.employee === "all" || report.servedBy === filters.employee) &&
         (filters.paymentMethod === "all" || report.paymentMethod === filters.paymentMethod) &&
         (filters.status === "all" || report.details?.status === filters.status) &&
-        (!dateFrom || reportDate >= dateFrom) &&
-        (!dateTo || reportDate <= dateTo) &&
+        (!dateFrom || (reportDate && reportDate >= dateFrom)) &&
+        (!dateTo || (reportDate && reportDate <= dateTo)) &&
         (!Number.isFinite(amountMin) || reportAmount >= amountMin) &&
         (!Number.isFinite(amountMax) || reportAmount <= amountMax) &&
         (!query || searchable.includes(query) || (phoneQuery && searchableDigits.includes(phoneQuery)))
@@ -131,8 +132,9 @@ function App() {
     return buildAppNotifications(availableReports);
   }, [activeEmployee, reports, sessionRole]);
 
-  function saveReport(report) {
-    setReports((current) => [report, ...current]);
+  async function saveReport(report) {
+    const enriched = await attachAuthMetadata(report);
+    setReports((current) => [enriched, ...current]);
     setFormNonce((value) => value + 1);
   }
 
@@ -155,8 +157,12 @@ function App() {
       // Local-only mode still records the employee name on the pending report.
     }
 
-    setPendingReports((current) =>
-      current.map((report) =>
+    setPendingReports((current) => {
+      const target = current.find((report) => report.id === pendingReportId);
+      if (!target) return current;
+      if (target.claimedBy && target.claimedBy !== activeEmployee) return current;
+
+      return current.map((report) =>
         report.id === pendingReportId
           ? {
               ...report,
@@ -166,28 +172,42 @@ function App() {
               status: "claimed",
             }
           : report,
-      ),
-    );
+      );
+    });
   }
 
-  function savePendingReport(pendingReportId, completedReport) {
-    setReports((current) => [completedReport, ...current]);
+  async function savePendingReport(pendingReportId, completedReport) {
+    const enriched = await attachAuthMetadata(completedReport);
+    setReports((current) => [enriched, ...current]);
     setPendingReports((current) => current.filter((report) => report.id !== pendingReportId));
   }
 
-  function createPhoneOrder(order) {
-    setPhoneOrders((current) => [order, ...current]);
-    queuePhoneOrderAssignedNotifications(order);
+  async function createPhoneOrder(order) {
+    let assignedEmployeeId = "";
+    try {
+      const user = await ensureFirebaseAuth();
+      assignedEmployeeId = user?.uid || "";
+    } catch {
+      // Local-only mode still records the handler name on the order.
+    }
+
+    const enrichedOrder = {
+      ...order,
+      assignedEmployeeId,
+      createdByEmployeeId: assignedEmployeeId,
+    };
+    setPhoneOrders((current) => [enrichedOrder, ...current]);
+    queuePhoneOrderAssignedNotifications(enrichedOrder);
     setFormNonce((value) => value + 1);
   }
 
-  function completePhoneOrder(orderId) {
+  async function completePhoneOrder(orderId) {
     const order = phoneOrders.find((item) => item.id === orderId);
     if (!order) return;
 
     const deliveredAt = new Date().toISOString();
-    const completedReport = {
-      id: crypto.randomUUID(),
+    const completedReport = await attachAuthMetadata({
+      id: order.id,
       type: "phoneOrder",
       createdAt: deliveredAt,
       servedBy: order.assignedTo || activeEmployee,
@@ -211,7 +231,7 @@ function App() {
         orderedAt: order.createdAt,
         deliveredAt,
       },
-    };
+    });
 
     setReports((current) => [completedReport, ...current]);
     setPhoneOrders((current) => current.filter((item) => item.id !== orderId));
@@ -274,20 +294,29 @@ function App() {
   }
 
   async function sendPhoneOrderNotification(endpoint, payload) {
-    if (!FUNCTIONS_BASE_URL) return;
+    if (!FUNCTIONS_BASE_URL) return false;
 
     try {
-      await fetch(`${FUNCTIONS_BASE_URL}/${endpoint}`, {
+      const response = await fetch(`${FUNCTIONS_BASE_URL}/${endpoint}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
       });
+      return response.ok;
     } catch {
-      // Local queue still records the notification; live delivery depends on deployed functions.
+      return false;
     }
   }
 
-  function queuePhoneOrderAssignedNotifications(order) {
+  async function queuePhoneOrderAssignedNotifications(order) {
+    if (FUNCTIONS_BASE_URL) {
+      const sent = await sendPhoneOrderNotification("notifyPhoneOrderAssigned", order);
+      if (!sent) {
+        window.alert("Phone order was saved, but SMS notifications could not be sent.");
+      }
+      return;
+    }
+
     const handlerMessage = `Phone order assigned: ${order.model}. Customer: ${order.customerName || "-"} ${order.customerPhone || ""}. Address: ${order.address || "-"}. Total: ${formatMoney(Number(order.orderTotal || 0))}. Payment: ${order.paymentStatus}. ${order.notes || ""}`;
     const customerMessage = `Diamant Telecom: your phone order for ${order.model || "your phone"} was assigned to ${order.assignedTo}. We will contact you with updates.`;
     const queued = [
@@ -312,10 +341,17 @@ function App() {
     ];
 
     setNotifications((current) => [...queued, ...current]);
-    sendPhoneOrderNotification("notifyPhoneOrderAssigned", order);
   }
 
-  function queuePhoneOrderDeliveredNotification(order) {
+  async function queuePhoneOrderDeliveredNotification(order) {
+    if (FUNCTIONS_BASE_URL) {
+      const sent = await sendPhoneOrderNotification("notifyPhoneOrderDelivered", order);
+      if (!sent) {
+        window.alert("Order was marked delivered, but the customer SMS could not be sent.");
+      }
+      return;
+    }
+
     const notification = {
       id: crypto.randomUUID(),
       reportId: order.id,
@@ -327,7 +363,6 @@ function App() {
     };
 
     setNotifications((current) => [notification, ...current]);
-    sendPhoneOrderNotification("notifyPhoneOrderDelivered", order);
   }
 
   function addEmployee(name) {
@@ -346,7 +381,13 @@ function App() {
   }
 
   function clearReports() {
-    const confirmed = window.confirm("Clear all reports in this browser? This only affects local data.");
+    if (sessionRole !== "admin") {
+      window.alert("Only admin can clear all reports.");
+      return;
+    }
+    const confirmed = window.confirm(
+      "Delete ALL reports from the shared store? This removes them for every employee and cannot be undone.",
+    );
     if (!confirmed) return;
     setReports([]);
   }
@@ -812,11 +853,11 @@ function ReportForm({ activeType, activeEmployee, reports, onSave }) {
       savedReport.ticketDigits = details.ticketDigits;
     }
 
-    onSave(savedReport);
-
-    if (activeType === "repair") {
-      window.alert(`Repair ticket created: ${details.ticketNumber}`);
-    }
+    Promise.resolve(onSave(savedReport)).then(() => {
+      if (activeType === "repair") {
+        window.alert(`Repair ticket created: ${details.ticketNumber}`);
+      }
+    });
   }
 
   return (
@@ -964,6 +1005,7 @@ function RentalReportForm({ activeEmployee, onSave }) {
     paymentUrl: "",
     raw: null,
   });
+  const solaTokenRef = useRef("");
 
   useEffect(() => {
     const timer = window.setInterval(() => setNow(new Date()), 30000);
@@ -985,7 +1027,7 @@ function RentalReportForm({ activeEmployee, onSave }) {
   const numbersReady = hasCli && (!needsUsNumber || hasUsDdi);
   const rentalSubmitted = submitState.status === "submitted" || submitState.status === "numbers-ready";
   const minimumDaysValid = getMinimumRentalDays(form.rentalRegion) <= totalDays;
-  const requiresSolaCharge = form.paymentMethod === "CC";
+  const requiresSolaCharge = ["CC", "Card"].includes(form.paymentMethod);
   const solaChargeComplete = !requiresSolaCharge || solaState.status === "paid";
   const canSubmitRental = isRentalFormComplete(form)
     && zoneDaysValid
@@ -995,7 +1037,7 @@ function RentalReportForm({ activeEmployee, onSave }) {
     && isRcukRental;
   const canSave = isSimpleRental
     ? isRentalFormComplete(form) && minimumDaysValid && totalPrice > 0 && solaChargeComplete
-    : rentalSubmitted && submitState.getNumbersAttempted && solaChargeComplete;
+    : rentalSubmitted && submitState.getNumbersAttempted && numbersReady && solaChargeComplete;
 
   function updateField(name, value) {
     setForm((current) => ({ ...current, [name]: value }));
@@ -1023,6 +1065,7 @@ function RentalReportForm({ activeEmployee, onSave }) {
   }
 
   function updateSolaToken(value) {
+    solaTokenRef.current = value;
     setSolaState((current) => ({
       ...current,
       paymentToken: value,
@@ -1070,6 +1113,7 @@ function RentalReportForm({ activeEmployee, onSave }) {
     }
 
     setSolaState((current) => ({ ...current, status: "charging", message: "Opening Sola charge..." }));
+    const paymentToken = solaTokenRef.current.trim();
 
     try {
       const response = await fetch(`${FUNCTIONS_BASE_URL}/solaCreateCharge`, {
@@ -1080,7 +1124,7 @@ function RentalReportForm({ activeEmployee, onSave }) {
           currency: "USD",
           customerPhone: form.customerPhone,
           rentalId: submitState.rentalId,
-          paymentToken: solaState.paymentToken,
+          paymentToken,
           description: `${form.rentalRegion} ${form.deviceKind} rental`,
         }),
       });
@@ -1091,7 +1135,7 @@ function RentalReportForm({ activeEmployee, onSave }) {
         setSolaState({
           status: "error",
           message: data.message || "Sola charge could not be started.",
-          paymentToken: solaState.paymentToken,
+          paymentToken,
           transactionId: data.transactionId || "",
           paymentUrl: data.paymentUrl || "",
           raw: data.raw || data,
@@ -1108,7 +1152,7 @@ function RentalReportForm({ activeEmployee, onSave }) {
         message: status === "paid"
           ? "Sola payment approved."
           : "Sola payment started, but approval was not returned yet.",
-        paymentToken: solaState.paymentToken,
+        paymentToken,
         transactionId: data.transactionId || data.paymentId || "",
         paymentUrl: data.paymentUrl || "",
         raw: data.raw || data,
@@ -1117,7 +1161,7 @@ function RentalReportForm({ activeEmployee, onSave }) {
       setSolaState({
         status: "error",
         message: error.message || "Could not connect to Sola.",
-        paymentToken: solaState.paymentToken,
+        paymentToken,
         transactionId: "",
         paymentUrl: "",
         raw: null,
@@ -1261,13 +1305,13 @@ function RentalReportForm({ activeEmployee, onSave }) {
       const data = await response.json();
 
       if (!response.ok || !data.ok) {
-      setSubmitState((current) => ({
-        ...current,
-        status: "submitted",
-        message: data.message || "Numbers are not ready yet.",
-        getNumbersAttempted: true,
-        raw: data.raw || data,
-      }));
+        setSubmitState((current) => ({
+          ...current,
+          status: "submitted",
+          message: data.message || "Numbers are not ready yet.",
+          getNumbersAttempted: true,
+          raw: data.raw || data,
+        }));
         return;
       }
 
@@ -1743,7 +1787,7 @@ function OpenRepairsPage({ reports, onStatusChange }) {
               <th>Customer</th>
               <th>Phone</th>
               <th>Damage</th>
-              <th>Paid</th>
+              <th>Payment</th>
               <th>Served by</th>
               <th>Status</th>
             </tr>
@@ -1757,7 +1801,7 @@ function OpenRepairsPage({ reports, onStatusChange }) {
                   <td>{repair.customerPhone || "-"}</td>
                   <td>{repair.details?.model || "-"}</td>
                   <td>{repair.details?.damage || "-"}</td>
-                  <td>{repair.details?.paymentStatus || "-"}</td>
+                  <td>{formatPayment(repair.paymentAmount)} · {repair.details?.paymentStatus || "Not paid"}</td>
                   <td>{repair.servedBy || "-"}</td>
                   <td>
                     <select
@@ -1847,8 +1891,8 @@ function PendingReportCard({ pendingReport, activeEmployee, onClaim, onSave }) {
   function saveCompletedReport() {
     if (!canSave) return;
 
-    if (isCallReport) {
-      onSave(pendingReport.id, {
+    const payload = isCallReport
+      ? {
         id: crypto.randomUUID(),
         type: "call",
         source: pendingReport.source || "telebroad",
@@ -1874,37 +1918,36 @@ function PendingReportCard({ pendingReport, activeEmployee, onClaim, onSave }) {
           callDuration: imported.callDuration ?? pendingReport.details?.callDuration ?? "",
           talkDuration: imported.talkDuration ?? pendingReport.details?.talkDuration ?? "",
         },
-      });
-      return;
-    }
+      }
+      : {
+        id: crypto.randomUUID(),
+        type: pendingReport.type || "sale",
+        source: pendingReport.source || "shopify_pos",
+        pendingSourceId: pendingReport.id,
+        createdAt: new Date().toISOString(),
+        importedAt: pendingReport.createdAt,
+        servedBy: activeEmployee,
+        signature: activeEmployee,
+        signedAt: new Date().toISOString(),
+        customerPhone: fields.customerPhone.trim(),
+        customerPhoneDigits: digitsOnly(fields.customerPhone),
+        paymentAmount: fields.paymentAmount.trim(),
+        paymentMethod: fields.paymentMethod.trim(),
+        notes: fields.notes.trim(),
+        details: {
+          request: "Shopify POS sale",
+          productType: fields.productType.trim(),
+          model: fields.model.trim(),
+          imei: fields.imei.trim(),
+          shopifyOrderId: imported.shopifyOrderId || "",
+          shopifyOrderName: imported.shopifyOrderName || "",
+          shopifyLocation: imported.locationName || "",
+          shopifyStaff: imported.staffName || "",
+          lineItems: imported.lineItems || [],
+        },
+      };
 
-    onSave(pendingReport.id, {
-      id: crypto.randomUUID(),
-      type: pendingReport.type || "sale",
-      source: pendingReport.source || "shopify_pos",
-      pendingSourceId: pendingReport.id,
-      createdAt: new Date().toISOString(),
-      importedAt: pendingReport.createdAt,
-      servedBy: activeEmployee,
-      signature: activeEmployee,
-      signedAt: new Date().toISOString(),
-      customerPhone: fields.customerPhone.trim(),
-      customerPhoneDigits: digitsOnly(fields.customerPhone),
-      paymentAmount: fields.paymentAmount.trim(),
-      paymentMethod: fields.paymentMethod.trim(),
-      notes: fields.notes.trim(),
-      details: {
-        request: "Shopify POS sale",
-        productType: fields.productType.trim(),
-        model: fields.model.trim(),
-        imei: fields.imei.trim(),
-        shopifyOrderId: imported.shopifyOrderId || "",
-        shopifyOrderName: imported.shopifyOrderName || "",
-        shopifyLocation: imported.locationName || "",
-        shopifyStaff: imported.staffName || "",
-        lineItems: imported.lineItems || [],
-      },
-    });
+    Promise.resolve(onSave(pendingReport.id, payload));
   }
 
   const sourceLabel = isCallReport
@@ -2049,6 +2092,19 @@ function PhoneOrderPage({ activeEmployee, sessionRole, phoneOrders, orderHandler
     const timer = window.setInterval(() => setNow(new Date()), 30000);
     return () => window.clearInterval(timer);
   }, []);
+
+  useEffect(() => {
+    if (!orderHandlers.length) return;
+    setForm((current) => {
+      if (current.location && current.assignedTo) return current;
+      const firstHandler = orderHandlers[0];
+      return {
+        ...current,
+        location: current.location || firstHandler.location || "",
+        assignedTo: current.assignedTo || firstHandler.name || "",
+      };
+    });
+  }, [orderHandlers]);
 
   const locations = uniqueValues(orderHandlers.map((handler) => handler.location));
   const locationHandlers = orderHandlers.filter((handler) => handler.location === form.location);
@@ -2262,7 +2318,9 @@ function AdminPage({
   const [handlerForm, setHandlerForm] = useState({ name: "", phone: "", location: "" });
   const activity = useMemo(() => {
     return employees.map((employee) => {
-      const employeeReports = reports.filter((report) => report.servedBy === employee);
+      const employeeReports = reports
+        .filter((report) => report.servedBy === employee)
+        .sort((left, right) => (toJsDate(right.createdAt)?.getTime() || 0) - (toJsDate(left.createdAt)?.getTime() || 0));
       const totals = employeeReports.reduce(
         (acc, report) => {
           acc.amount += Number.parseFloat(report.paymentAmount || "0") || 0;
@@ -2276,7 +2334,9 @@ function AdminPage({
     });
   }, [employees, reports]);
 
-  const sortedReports = [...reports].sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+  const sortedReports = [...reports].sort(
+    (left, right) => (toJsDate(right.createdAt)?.getTime() || 0) - (toJsDate(left.createdAt)?.getTime() || 0),
+  );
 
   function updateHandlerField(name, value) {
     setHandlerForm((current) => ({ ...current, [name]: value }));

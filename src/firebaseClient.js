@@ -8,6 +8,7 @@ import {
   setDoc,
   writeBatch,
 } from "firebase/firestore";
+import { normalizeFirestoreDoc } from "./utils";
 
 let firebasePromise;
 let authPromise;
@@ -43,6 +44,18 @@ export async function ensureFirebaseAuth() {
   return authPromise;
 }
 
+export async function attachAuthMetadata(data) {
+  try {
+    const user = await ensureFirebaseAuth();
+    return {
+      ...data,
+      servedByEmployeeId: user?.uid || data.servedByEmployeeId || "",
+    };
+  } catch {
+    return data;
+  }
+}
+
 export function watchCollection(collectionName, onItems, onError) {
   let unsubscribe = () => {};
   let cancelled = false;
@@ -54,7 +67,7 @@ export function watchCollection(collectionName, onItems, onError) {
       unsubscribe = onSnapshot(
         collection(db, collectionName),
         (snapshot) => {
-          onItems(snapshot.docs.map((item) => ({ id: item.id, ...item.data() })));
+          onItems(snapshot.docs.map((item) => normalizeFirestoreDoc(item.id, item.data())));
         },
         onError,
       );
