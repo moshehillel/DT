@@ -99,6 +99,7 @@ function buildTelebroadPendingReport(payload) {
     status: "pending",
     title: buildPendingCallTitle(payload),
     createdAt,
+    servedBy: employeeName,
     customerPhone,
     customerPhoneDigits: digitsOnly(customerPhone),
     paymentAmount: "",

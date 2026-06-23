@@ -16,7 +16,7 @@ Backend scaffold for Diamant Telecom.
   - Twilio endpoint that returns details for a selected phone menu option.
 
 - `notifyRepairDelivered`
-  - Firestore trigger. When a repair report status changes to `Delivered`, it sends or queues a Twilio text/call.
+  - Firestore trigger. When a repair report status changes to `Ready`, it sends or queues a Twilio text/call.
 
 - `shopifyOrderWebhook`
   - Draft Shopify POS order webhook importer. It writes Shopify POS sales into the `pendingReports` collection for employees to claim and complete.
@@ -180,11 +180,25 @@ Shopify POS example:
   "customerPhone": "(555) 123-4567",
   "imported": {
     "lineItemsText": "1x iPhone 13",
-    "staffName": "Shopify staff name",
     "locationName": "Store"
   }
 }
 ```
+
+When Shopify POS or Telebroad data is imported, the pending report opens for completion without **Claim it**. **Served by** on the saved report is always the employee who clicks save. Shopify POS staff names are not imported.
+
+### Shopify POS IMEI scanning
+
+To auto-fill IMEI in pending sale reports, capture the scanned IMEI in Shopify as a **line item property** named `IMEI` (or containing `imei`).
+
+Typical Shopify POS setup:
+
+1. In Shopify admin, open the phone product used at POS.
+2. Add a line item property / custom property called `IMEI`.
+3. At checkout on POS, scan or type the IMEI into that property before completing the sale.
+4. The order webhook sends `line_items[].properties[]` to `shopifyOrderWebhook`, and the app copies it into the pending sale `imei` field.
+
+Supported property names: `IMEI`, `Device IMEI`, `Phone IMEI`, `Serial`, `Serial Number`, or any property name containing `imei`.
 
 Telebroad answered call example:
 
@@ -195,6 +209,7 @@ Telebroad answered call example:
   "source": "telebroad",
   "status": "pending",
   "title": "Inbound call John Customer (17329942081)",
+  "servedBy": "Sally Edwards",
   "customerPhone": "17329942081",
   "customerPhoneDigits": "17329942081",
   "imported": {

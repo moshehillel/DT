@@ -21,7 +21,6 @@ export const repairStatuses = [
   "In repair",
   "Ready",
   "Picked up",
-  "Delivered",
   "Completed",
   "Cancelled",
 ];
@@ -48,7 +47,7 @@ export const reportTypes = {
       { name: "request", label: "What does the customer want?", placeholder: "Phone, charger, accessory, plan" },
       { name: "productType", label: "Product type", placeholder: "Phone" },
       { name: "model", label: "Phone model", placeholder: "iPhone 14 Pro" },
-      { name: "imei", label: "IMEI", placeholder: "15 digit IMEI" },
+      { name: "imei", label: "IMEI", placeholder: "Scan or type 15-digit IMEI" },
     ],
   },
   repair: {
@@ -61,7 +60,7 @@ export const reportTypes = {
       { name: "damage", label: "What is damaged?", placeholder: "Screen, charging port, battery" },
       { name: "status", label: "Repair status", type: "select", options: repairStatuses },
       { name: "paymentStatus", label: "Repair paid?", type: "select", options: ["Not paid", "Paid"] },
-      { name: "notificationPreference", label: "When delivered notify by", type: "select", options: ["Text message", "Phone call"] },
+      { name: "notificationPreference", label: "When ready notify by", type: "select", options: ["Text message", "Phone call"] },
       { name: "dueDate", label: "Expected ready date", type: "date" },
     ],
   },

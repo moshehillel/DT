@@ -15,6 +15,7 @@ const {
   buildTelebroadPendingReport,
   shouldImportCall,
 } = require("./telebroad");
+const { extractShopifyImei } = require("./shopify");
 
 admin.initializeApp();
 
@@ -342,7 +343,7 @@ exports.notifyRepairDelivered = onDocumentUpdated(
 
     const oldStatus = before.details?.status;
     const newStatus = after.details?.status;
-    if (oldStatus === "Delivered" || newStatus !== "Delivered") return;
+    if (oldStatus === "Ready" || newStatus !== "Ready") return;
 
     const to = after.customerPhone;
     if (!to) {
@@ -350,7 +351,7 @@ exports.notifyRepairDelivered = onDocumentUpdated(
       return;
     }
 
-    const body = `Diamant Telecom: repair ticket ${after.details?.ticketNumber || ""} for ${after.details?.model || "your phone"} is marked delivered.`;
+    const body = `Diamant Telecom: repair ticket ${after.details?.ticketNumber || ""} for ${after.details?.model || "your phone"} is ready for pickup.`;
     const method = after.details?.notificationPreference || "Text message";
 
     try {
@@ -405,6 +406,7 @@ exports.shopifyOrderWebhook = onRequest(HTTP_OPTIONS, async (req, res) => {
   const lineItemsText = lineItems
     .map((item) => `${item.quantity || 1}x ${item.title || item.name || "Item"}`)
     .join(", ");
+  const imei = extractShopifyImei(order);
 
   await db.collection("pendingReports").doc(pendingReportId).set(
     {
@@ -418,7 +420,7 @@ exports.shopifyOrderWebhook = onRequest(HTTP_OPTIONS, async (req, res) => {
       customerPhoneDigits: digitsOnly(order.customer?.phone || order.phone || ""),
       paymentAmount: order.total_price || "",
       paymentMethod: "Shopify POS",
-      notes: "Imported from Shopify POS. Employee must claim and complete missing fields.",
+      notes: "Imported from Shopify POS. Employee must complete missing fields.",
       imported: {
         shopifyOrderId: String(order.id || ""),
         shopifyOrderName: order.name || "",
@@ -429,21 +431,20 @@ exports.shopifyOrderWebhook = onRequest(HTTP_OPTIONS, async (req, res) => {
         customerPhone: order.customer?.phone || order.phone || "",
         customerEmail: order.customer?.email || order.email || "",
         customerName: [order.customer?.first_name, order.customer?.last_name].filter(Boolean).join(" "),
-        staffName: order.staff_member?.name || "",
-        staffId: order.staff_member?.id ? String(order.staff_member.id) : "",
         locationName: order.location?.name || "",
         locationId: order.location_id ? String(order.location_id) : "",
         lineItems,
         lineItemsText,
+        imei,
         paymentGatewayNames: order.payment_gateway_names || [],
         financialStatus: order.financial_status || "",
         fulfillmentStatus: order.fulfillment_status || "",
       },
       details: {
         request: "Shopify POS sale",
-        productType: "Shopify order",
+        productType: "Phone",
         model: lineItemsText,
-        imei: "",
+        imei,
         lineItems,
       },
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),

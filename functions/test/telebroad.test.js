@@ -67,5 +67,6 @@ test("buildTelebroadPendingReport maps call pending report fields", () => {
   assert.equal(report.customerPhoneDigits, "17329942081");
   assert.equal(report.details.outcome, "Answered");
   assert.equal(report.details.handledBy, "Sally Edwards");
+  assert.equal(report.servedBy, "Sally Edwards");
   assert.match(report.title, /Inbound call/);
 });

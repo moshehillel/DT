@@ -210,7 +210,7 @@ function App() {
       id: order.id,
       type: "phoneOrder",
       createdAt: deliveredAt,
-      servedBy: order.assignedTo || activeEmployee,
+      servedBy: activeEmployee,
       customerPhone: order.customerPhone,
       customerPhoneDigits: digitsOnly(order.customerPhone),
       paymentAmount: order.orderTotal,
@@ -270,7 +270,7 @@ function App() {
       ),
     );
 
-    if (status === "Delivered" && oldStatus !== "Delivered" && report?.customerPhone && !FUNCTIONS_BASE_URL) {
+    if (status === "Ready" && oldStatus !== "Ready" && report?.customerPhone && !FUNCTIONS_BASE_URL) {
       queueDeliveryNotification(report);
     }
   }
@@ -284,7 +284,7 @@ function App() {
       customerPhone: report.customerPhone,
       method,
       status: "Queued for backend",
-      message: `Your ${report.details?.model || "phone"} repair has been delivered. Thank you from Diamant Telecom.`,
+      message: `Your ${report.details?.model || "phone"} repair is ready for pickup. Thank you from Diamant Telecom.`,
     };
 
     setNotifications((current) => [notification, ...current]);
@@ -934,7 +934,16 @@ function DynamicField({ field }) {
   return (
     <label className="field">
       <span>{field.label}</span>
-      <input name={field.name} type={field.type || "text"} placeholder={field.placeholder || ""} />
+      <input
+        name={field.name}
+        type={field.type || "text"}
+        placeholder={field.placeholder || ""}
+        {...(field.name === "imei" ? {
+          inputMode: "numeric",
+          autoComplete: "off",
+          spellCheck: false,
+        } : {})}
+      />
     </label>
   );
 }
@@ -1022,9 +1031,6 @@ function RentalReportForm({ activeEmployee, onSave }) {
   const normalizedSimNumber = normalizeRcukSimNumber(form.simNumber);
   const zoneDaysValid = totalDays > 0 && zoneDays === totalDays;
   const needsUsNumber = form.usaNumber;
-  const hasCli = Boolean(submitState.cli);
-  const hasUsDdi = Boolean(submitState.usDdi) && submitState.usDdi.toLowerCase() !== "yes";
-  const numbersReady = hasCli && (!needsUsNumber || hasUsDdi);
   const rentalSubmitted = submitState.status === "submitted" || submitState.status === "numbers-ready";
   const minimumDaysValid = getMinimumRentalDays(form.rentalRegion) <= totalDays;
   const requiresSolaCharge = ["CC", "Card"].includes(form.paymentMethod);
@@ -1037,7 +1043,7 @@ function RentalReportForm({ activeEmployee, onSave }) {
     && isRcukRental;
   const canSave = isSimpleRental
     ? isRentalFormComplete(form) && minimumDaysValid && totalPrice > 0 && solaChargeComplete
-    : rentalSubmitted && submitState.getNumbersAttempted && numbersReady && solaChargeComplete;
+    : rentalSubmitted && submitState.getNumbersAttempted && solaChargeComplete;
 
   function updateField(name, value) {
     setForm((current) => ({ ...current, [name]: value }));
@@ -1308,7 +1314,7 @@ function RentalReportForm({ activeEmployee, onSave }) {
         setSubmitState((current) => ({
           ...current,
           status: "submitted",
-          message: data.message || "Numbers are not ready yet.",
+          message: data.message || "Numbers are not ready yet. You can save the report or try Get numbers again.",
           getNumbersAttempted: true,
           raw: data.raw || data,
         }));
@@ -1322,7 +1328,7 @@ function RentalReportForm({ activeEmployee, onSave }) {
       setSubmitState((current) => ({
         ...current,
         status: ready ? "numbers-ready" : "submitted",
-        message: ready ? "Numbers returned. You can save the rental report." : "Still pending. Try Get numbers again.",
+        message: ready ? "Numbers returned. You can save the rental report." : "Numbers still pending. You can save the report or try Get numbers again.",
         cli,
         usDdi,
         getNumbersAttempted: true,
@@ -1332,7 +1338,7 @@ function RentalReportForm({ activeEmployee, onSave }) {
       setSubmitState((current) => ({
         ...current,
         status: "submitted",
-        message: error.message || "Could not get rental numbers.",
+        message: error.message || "Could not get rental numbers. You can still save the report.",
         getNumbersAttempted: true,
       }));
     }
@@ -1467,7 +1473,7 @@ function RentalReportForm({ activeEmployee, onSave }) {
             </label>
             <label className="field">
               <span>IMEI / device ID</span>
-              <input value={form.imei} onChange={(event) => updateField("imei", event.target.value)} />
+              <input value={form.imei} onChange={(event) => updateField("imei", event.target.value)} inputMode="numeric" autoComplete="off" spellCheck={false} placeholder="Scan or type 15-digit IMEI" />
             </label>
             <label className="field">
               <span>SIM number</span>
@@ -1862,8 +1868,15 @@ function PendingReportCard({ pendingReport, activeEmployee, onClaim, onSave }) {
   const imported = pendingReport.imported || {};
   const isCallReport = pendingReport.type === "call" || pendingReport.source === "telebroad";
   const isShopifySale = pendingReport.source === "shopify_pos";
-  const claimedBySomeoneElse = pendingReport.claimedBy && pendingReport.claimedBy !== activeEmployee;
-  const isClaimedByMe = pendingReport.claimedBy === activeEmployee;
+  const importedAgentName = (
+    imported.employeeName
+    || pendingReport.details?.handledBy
+    || ""
+  ).trim();
+  const readyToComplete = isShopifySale || Boolean(importedAgentName);
+  const claimedBySomeoneElse = !readyToComplete && pendingReport.claimedBy && pendingReport.claimedBy !== activeEmployee;
+  const isClaimedByMe = readyToComplete || pendingReport.claimedBy === activeEmployee;
+  const imeiInputRef = useRef(null);
   const [fields, setFields] = useState(() => ({
     customerPhone: pendingReport.customerPhone || imported.customerPhone || imported.callerIdExternal || "",
     callerName: pendingReport.details?.callerName || imported.callerNameExternal || "",
@@ -1872,7 +1885,7 @@ function PendingReportCard({ pendingReport, activeEmployee, onClaim, onSave }) {
     followUpDate: pendingReport.details?.followUpDate || "",
     productType: pendingReport.details?.productType || "Phone",
     model: pendingReport.details?.model || imported.lineItemsText || "",
-    imei: pendingReport.details?.imei || "",
+    imei: pendingReport.details?.imei || imported.imei || "",
     notes: pendingReport.notes || "",
     paymentAmount: pendingReport.paymentAmount || imported.totalPrice || "",
     paymentMethod: pendingReport.paymentMethod || (isShopifySale ? "Shopify POS" : "Cash"),
@@ -1881,6 +1894,12 @@ function PendingReportCard({ pendingReport, activeEmployee, onClaim, onSave }) {
   function updateField(name, value) {
     setFields((current) => ({ ...current, [name]: value }));
   }
+
+  useEffect(() => {
+    if (isClaimedByMe && isShopifySale && imeiInputRef.current) {
+      imeiInputRef.current.focus();
+    }
+  }, [isClaimedByMe, isShopifySale]);
 
   const canSave = isClaimedByMe && fields.customerPhone.trim() && (
     isCallReport
@@ -1942,7 +1961,6 @@ function PendingReportCard({ pendingReport, activeEmployee, onClaim, onSave }) {
           shopifyOrderId: imported.shopifyOrderId || "",
           shopifyOrderName: imported.shopifyOrderName || "",
           shopifyLocation: imported.locationName || "",
-          shopifyStaff: imported.staffName || "",
           lineItems: imported.lineItems || [],
         },
       };
@@ -1974,7 +1992,7 @@ function PendingReportCard({ pendingReport, activeEmployee, onClaim, onSave }) {
           <>
             <span><strong>Direction:</strong> {imported.direction || pendingReport.details?.direction || "-"}</span>
             <span><strong>Customer:</strong> {fields.customerPhone || "-"}</span>
-            <span><strong>Handled by:</strong> {imported.employeeName || pendingReport.details?.handledBy || "-"}</span>
+            <span><strong>Handled by:</strong> {importedAgentName || "-"}</span>
             <span><strong>Talk time:</strong> {imported.talkDuration !== "" && imported.talkDuration !== undefined ? `${imported.talkDuration}s` : "-"}</span>
             <span><strong>Imported:</strong> {pendingReport.createdAt ? formatShortDate(pendingReport.createdAt) : "-"}</span>
           </>
@@ -1982,27 +2000,34 @@ function PendingReportCard({ pendingReport, activeEmployee, onClaim, onSave }) {
           <>
             <span><strong>Total:</strong> {formatPayment(fields.paymentAmount)}</span>
             <span><strong>Customer:</strong> {fields.customerPhone || "-"}</span>
+            <span><strong>Location:</strong> {imported.locationName || "-"}</span>
             <span><strong>Items:</strong> {imported.lineItemsText || fields.model || "-"}</span>
             <span><strong>Imported:</strong> {pendingReport.createdAt ? formatShortDate(pendingReport.createdAt) : "-"}</span>
           </>
         )}
       </div>
 
-      <div className="claim-strip">
-        {pendingReport.claimedBy ? (
-          <span>
-            Claimed by <strong>{isClaimedByMe ? `you (${activeEmployee})` : pendingReport.claimedBy}</strong>
-            {pendingReport.claimedAt ? ` · ${formatShortDate(pendingReport.claimedAt)}` : ""}
-          </span>
-        ) : (
-          <span>Unclaimed</span>
-        )}
-        {!pendingReport.claimedBy ? (
-          <button className="primary-button" type="button" onClick={() => onClaim(pendingReport.id)}>
-            Claim it
-          </button>
-        ) : null}
-      </div>
+      {!readyToComplete ? (
+        <div className="claim-strip">
+          {pendingReport.claimedBy ? (
+            <span>
+              Claimed by <strong>{isClaimedByMe ? `you (${activeEmployee})` : pendingReport.claimedBy}</strong>
+              {pendingReport.claimedAt ? ` · ${formatShortDate(pendingReport.claimedAt)}` : ""}
+            </span>
+          ) : (
+            <span>Unclaimed</span>
+          )}
+          {!pendingReport.claimedBy ? (
+            <button className="primary-button" type="button" onClick={() => onClaim(pendingReport.id)}>
+              Claim it
+            </button>
+          ) : null}
+        </div>
+      ) : (
+        <div className="claim-strip">
+          <span>Imported from {isCallReport ? "Telebroad" : "Shopify POS"} · ready to complete</span>
+        </div>
+      )}
 
       {isClaimedByMe ? (
         <div className="pending-fields">
@@ -2041,7 +2066,15 @@ function PendingReportCard({ pendingReport, activeEmployee, onClaim, onSave }) {
               </label>
               <label className="field">
                 <span>IMEI</span>
-                <input value={fields.imei} onChange={(event) => updateField("imei", event.target.value)} />
+                <input
+                  ref={imeiInputRef}
+                  value={fields.imei}
+                  onChange={(event) => updateField("imei", event.target.value)}
+                  inputMode="numeric"
+                  autoComplete="off"
+                  spellCheck={false}
+                  placeholder="Scan or type 15-digit IMEI"
+                />
               </label>
               <label className="field">
                 <span>Amount</span>

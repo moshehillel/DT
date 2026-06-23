@@ -35,6 +35,8 @@ service cloud.firestore {
       allow delete: if signedIn() && (
         isAdmin()
         || ("claimedBy" in resource.data && resource.data.claimedBy != "")
+        || ("servedBy" in resource.data && resource.data.servedBy != "")
+        || resource.data.source == "shopify_pos"
       );
     }
 
