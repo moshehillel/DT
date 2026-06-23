@@ -20,6 +20,7 @@ import {
   STORAGE_KEY,
 } from "./constants";
 import { useCloudCollectionState, useCloudDocumentState } from "./hooks/useCloudState";
+import { ensureFirebaseAuth } from "./firebaseClient";
 import {
   buildAppNotifications,
   calculateInclusiveDays,
@@ -135,14 +136,34 @@ function App() {
     setFormNonce((value) => value + 1);
   }
 
-  function claimPendingReport(pendingReportId) {
+  async function claimPendingReport(pendingReportId) {
+    const pending = pendingReports.find((report) => report.id === pendingReportId);
+    if (!pending) return;
+
+    if (pending.claimedBy && pending.claimedBy !== activeEmployee) {
+      window.alert(`This report is already claimed by ${pending.claimedBy}.`);
+      return;
+    }
+
+    if (pending.claimedBy === activeEmployee) return;
+
+    let claimedByEmployeeId = "";
+    try {
+      const user = await ensureFirebaseAuth();
+      claimedByEmployeeId = user?.uid || "";
+    } catch {
+      // Local-only mode still records the employee name on the pending report.
+    }
+
     setPendingReports((current) =>
       current.map((report) =>
         report.id === pendingReportId
           ? {
               ...report,
               claimedBy: activeEmployee,
+              claimedByEmployeeId,
               claimedAt: new Date().toISOString(),
+              status: "claimed",
             }
           : report,
       ),
@@ -1926,13 +1947,16 @@ function PendingReportCard({ pendingReport, activeEmployee, onClaim, onSave }) {
 
       <div className="claim-strip">
         {pendingReport.claimedBy ? (
-          <span>Claimed by <strong>{pendingReport.claimedBy}</strong></span>
+          <span>
+            Claimed by <strong>{isClaimedByMe ? `you (${activeEmployee})` : pendingReport.claimedBy}</strong>
+            {pendingReport.claimedAt ? ` · ${formatShortDate(pendingReport.claimedAt)}` : ""}
+          </span>
         ) : (
           <span>Unclaimed</span>
         )}
         {!pendingReport.claimedBy ? (
-          <button className="secondary-button" type="button" onClick={() => onClaim(pendingReport.id)}>
-            Claim report
+          <button className="primary-button" type="button" onClick={() => onClaim(pendingReport.id)}>
+            Claim it
           </button>
         ) : null}
       </div>

@@ -32,19 +32,12 @@ service cloud.firestore {
     match /pendingReports/{pendingReportId} {
       allow read: if signedIn();
       allow create: if isAdmin();
-      allow update: if isAdmin()
-        || (
-          signedIn()
-          && (
-            !('claimedByEmployeeId' in resource.data)
-            || resource.data.claimedByEmployeeId == request.auth.uid
-          )
-        );
-      allow delete: if isAdmin()
-        || (
-          signedIn()
-          && resource.data.claimedByEmployeeId == request.auth.uid
-        );
+      allow update: if signedIn() && (
+        isAdmin()
+        || !("claimedBy" in resource.data)
+        || resource.data.claimedBy == ""
+      );
+      allow delete: if signedIn();
     }
 
     match /phoneOrders/{orderId} {
