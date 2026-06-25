@@ -54,7 +54,7 @@ export function useCloudCollectionState(collectionName, localKey, fallback) {
         setValue(sortCloudItems(items));
       },
       (error) => {
-        console.error(`Firestore ${collectionName} sync failed`, error);
+        logSyncError(`Firestore ${collectionName} sync failed`, error);
       },
     );
   }, [collectionName]);
@@ -113,7 +113,7 @@ export function useCloudDocumentState(documentId, localKey, fallback) {
         setValue(items);
       },
       (error) => {
-        console.error(`Firestore appState/${documentId} sync failed`, error);
+        logSyncError(`Firestore appState/${documentId} sync failed`, error);
       },
     );
   }, [documentId, fallback]);

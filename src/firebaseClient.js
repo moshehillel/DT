@@ -1,5 +1,11 @@
 import { initializeApp } from "firebase/app";
-import { getAuth, signInAnonymously } from "firebase/auth";
+import {
+  getAuth,
+  onAuthStateChanged,
+  sendPasswordResetEmail,
+  signInWithEmailAndPassword,
+  signOut,
+} from "firebase/auth";
 import {
   collection,
   doc,
@@ -8,10 +14,10 @@ import {
   setDoc,
   writeBatch,
 } from "firebase/firestore";
+import { getFunctions, httpsCallable } from "firebase/functions";
 import { normalizeFirestoreDoc } from "./utils";
 
 let firebasePromise;
-let authPromise;
 
 function firebaseUnavailable() {
   const error = new Error(
@@ -42,6 +48,7 @@ async function getFirebase() {
         return {
           auth: getAuth(app),
           db: getFirestore(app),
+          functions: getFunctions(app),
         };
       });
   }
@@ -64,16 +71,73 @@ export function logSyncError(scope, error) {
   console.error(scope, error);
 }
 
+// Resolves with the signed-in user. The app only mounts data hooks once a user
+// is authenticated, so currentUser is normally already set.
 export async function ensureFirebaseAuth() {
   const { auth } = await getFirebase();
+  if (auth.currentUser) return auth.currentUser;
 
-  if (!authPromise) {
-    authPromise = auth.currentUser
-      ? Promise.resolve(auth.currentUser)
-      : signInAnonymously(auth).then((credential) => credential.user);
-  }
+  return new Promise((resolve, reject) => {
+    const unsubscribe = onAuthStateChanged(auth, (user) => {
+      if (user) {
+        unsubscribe();
+        resolve(user);
+      }
+    });
+    setTimeout(() => {
+      unsubscribe();
+      reject(new Error("Not signed in."));
+    }, 10000);
+  });
+}
 
-  return authPromise;
+// Watches Firebase Auth and reports sign-in state + whether the user is an admin
+// (via the `role: 'admin'` custom claim).
+export function subscribeAuth(onChange) {
+  let unsubscribe = () => {};
+  getFirebase()
+    .then(({ auth }) => {
+      unsubscribe = onAuthStateChanged(auth, async (user) => {
+        if (!user) {
+          onChange({ status: "signed-out", user: null, isAdmin: false });
+          return;
+        }
+        let isAdmin = false;
+        try {
+          const result = await user.getIdTokenResult();
+          isAdmin = result.claims.role === "admin" || result.claims.admin === true;
+        } catch {
+          isAdmin = false;
+        }
+        onChange({ status: "signed-in", user, isAdmin });
+      });
+    })
+    .catch((error) => onChange({ status: "error", user: null, isAdmin: false, error }));
+  return () => unsubscribe();
+}
+
+export async function signInWithEmail(email, password) {
+  const { auth } = await getFirebase();
+  const credential = await signInWithEmailAndPassword(auth, String(email || "").trim(), password);
+  return credential.user;
+}
+
+export async function signOutUser() {
+  const { auth } = await getFirebase();
+  await signOut(auth);
+}
+
+export async function sendReset(email) {
+  const { auth } = await getFirebase();
+  await sendPasswordResetEmail(auth, String(email || "").trim());
+}
+
+// Calls an admin-only Cloud Function (callable) such as employee management.
+export async function callFunction(name, data) {
+  const { functions } = await getFirebase();
+  const callable = httpsCallable(functions, name);
+  const result = await callable(data || {});
+  return result.data;
 }
 
 export async function attachAuthMetadata(data) {

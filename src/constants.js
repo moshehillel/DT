@@ -4,13 +4,11 @@ export const PHONE_ORDERS_KEY = "diamant-telecom-phone-orders-v1";
 export const ORDER_HANDLERS_KEY = "diamant-telecom-order-handlers-v1";
 export const EMPLOYEE_KEY = "diamant-telecom-employees-v1";
 export const ACTIVE_EMPLOYEE_KEY = "diamant-telecom-active-employee-v1";
-export const SESSION_KEY = "diamant-telecom-session-v1";
 export const RESET_REQUESTS_KEY = "diamant-telecom-reset-requests-v1";
 export const PRODUCTS_KEY = "diamant-telecom-products-v1";
 export const STORE_LOCATIONS_KEY = "diamant-telecom-store-locations-v1";
 export const EMPLOYEE_LOCATIONS_KEY = "diamant-telecom-employee-locations-v1";
 export const STORE_DEVICES_KEY = "diamant-telecom-store-devices-v1";
-export const ADMIN_PIN = "admin123";
 export const FUNCTIONS_BASE_URL = import.meta.env.VITE_FUNCTIONS_BASE_URL || "";
 
 export const defaultEmployees = ["Moshe", "Employee 1"];

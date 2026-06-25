@@ -71,6 +71,35 @@ firebase deploy --only hosting,functions,firestore:rules,firestore:indexes
 
 Deploy Firestore indexes before enabling the repair lookup and rental reminder functions.
 
+## Production checklist
+
+Before going live:
+
+1. **Frontend env** — set `VITE_ADMIN_PIN` (don't ship the dev default) and `VITE_FUNCTIONS_BASE_URL` at build time. See `.env.example`.
+2. **Functions secrets** — set on Firebase Functions:
+   - `SOLA_API_KEY`, `SOLA_DEFAULT_DEVICE_ID` (Sola/Cardknox CloudIM terminal)
+   - `TELEBROAD_USERNAME`, `TELEBROAD_PASSWORD` (SMS; `TELEBROAD_SMS_LINE` defaults to the Diamant line)
+   - `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_FROM_NUMBER` (outgoing voice notifications)
+   - `RCUK_API_KEY` (rentals), `SHOPIFY_WEBHOOK_SECRET` (Shopify import verification)
+   - `ALLOWED_WEB_ORIGIN` — set to your site origin to lock down function CORS.
+3. **Authentication:** the app uses Firebase Authentication (email/password). Admins are identified by a `role: 'admin'` custom claim, which the admin-only Firestore rules and Cloud Functions check. Enable the Email/Password provider in the Firebase console, then bootstrap the first admin (below). Admins create and manage all other accounts in-app under **Manage employees**.
+4. **Build** — `npm run build` produces `dist/` with no source maps and split vendor chunks.
+5. **Verify** — run `cd functions && npm test`, then smoke-test a sale, a card charge, an SMS, and a return on a staging project before pointing production traffic at it.
+
+## First admin (bootstrap)
+
+After deploying, create the owner account and grant it admin:
+
+1. In the Firebase console, enable **Authentication → Email/Password**, and add the first user (or sign up via the app's login screen once a user exists).
+2. Grant that user the admin claim (run from the `functions/` folder with credentials that can manage the project):
+
+   ```bash
+   cd functions
+   node scripts/setAdmin.js owner@diamanttelecom.com
+   ```
+
+3. Sign out and back in so the new token carries the claim. That admin can now create all other employees from **Manage employees** (which calls the `createEmployee` / `setEmployeeAdmin` / `deleteEmployee` Cloud Functions).
+
 ## Twilio flows
 
 Draft Twilio Studio voice flows are in `twilio/`. Point them at your deployed `repairStatus`, `phoneInventoryList`, and `phoneInventoryDetails` function URLs.

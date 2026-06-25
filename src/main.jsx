@@ -2,7 +2,6 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
   ACTIVE_EMPLOYEE_KEY,
-  ADMIN_PIN,
   defaultEmployees,
   defaultManualReportType,
   defaultOrderHandlers,
@@ -20,13 +19,20 @@ import {
   repairStatuses,
   reportTypes,
   RESET_REQUESTS_KEY,
-  SESSION_KEY,
   STORAGE_KEY,
   STORE_DEVICES_KEY,
   STORE_LOCATIONS_KEY,
 } from "./constants";
 import { useCloudCollectionState, useCloudDocumentState } from "./hooks/useCloudState";
-import { attachAuthMetadata, ensureFirebaseAuth } from "./firebaseClient";
+import {
+  attachAuthMetadata,
+  callFunction,
+  ensureFirebaseAuth,
+  sendReset,
+  signInWithEmail,
+  signOutUser,
+  subscribeAuth,
+} from "./firebaseClient";
 import { chargeOnDevice, refundToCard } from "./solaTerminal";
 import {
   buildAppNotifications,
@@ -63,6 +69,29 @@ function viewTitleFor(activeView, activeType) {
 }
 
 function App() {
+  const [auth, setAuth] = useState({ status: "loading", user: null, isAdmin: false });
+
+  useEffect(() => subscribeAuth(setAuth), []);
+
+  if (auth.status === "loading") {
+    return (
+      <main className="auth-splash">
+        <img className="brand-logo" src="/logo.webp" alt="Diamant Telecom" />
+        <p className="muted">Loading…</p>
+      </main>
+    );
+  }
+
+  if (auth.status === "signed-in" && auth.user) {
+    return <Workspace key={auth.user.uid} currentUser={auth.user} isAdmin={auth.isAdmin} />;
+  }
+
+  return <LoginPage authError={auth.status === "error" ? auth.error : null} />;
+}
+
+function Workspace({ currentUser, isAdmin }) {
+  const employeeName = currentUser?.displayName || currentUser?.email || "";
+  const sessionRole = isAdmin ? "admin" : "employee";
   const [activeType, setActiveType] = useState(defaultManualReportType);
   const [employees, setEmployees] = useCloudDocumentState("employees", EMPLOYEE_KEY, defaultEmployees);
   const [reports, setReports] = useCloudCollectionState("reports", STORAGE_KEY, []);
@@ -75,28 +104,38 @@ function App() {
   const [storeLocations, setStoreLocations] = useCloudDocumentState("storeLocations", STORE_LOCATIONS_KEY, defaultStoreLocations);
   const [employeeLocations, setEmployeeLocations] = useCloudDocumentState("employeeLocations", EMPLOYEE_LOCATIONS_KEY, []);
   const [storeDevices, setStoreDevices] = useCloudDocumentState("storeDevices", STORE_DEVICES_KEY, []);
+  // Employees are locked to their own identity; admins can file/view as any
+  // employee in the list.
   const [activeEmployee, setActiveEmployee] = useState(
-    localStorage.getItem(ACTIVE_EMPLOYEE_KEY) || employees[0] || "",
+    isAdmin ? localStorage.getItem(ACTIVE_EMPLOYEE_KEY) || employeeName || employees[0] || "" : employeeName,
   );
-  const [sessionRole, setSessionRole] = useState(() => {
-    const savedRole = localStorage.getItem(SESSION_KEY) || "";
-    return savedRole === "signed-in" ? "employee" : savedRole;
-  });
-  const [activeView, setActiveView] = useState("pendingReports");
+  const [activeView, setActiveView] = useState(isAdmin ? "admin" : "pendingReports");
   const [filters, setFilters] = useState(createEmptyFilters);
   const [formNonce, setFormNonce] = useState(0);
   const [dialogOpen, setDialogOpen] = useState(false);
   const [returnTarget, setReturnTarget] = useState(null);
 
+  // Keep the signed-in employee's name in the shared list so admins can see and
+  // attribute to them.
   useEffect(() => {
-    if (!employees.includes(activeEmployee)) {
-      setActiveEmployee(employees[0] || "");
+    if (employeeName && !employees.includes(employeeName)) {
+      setEmployees((current) => (current.includes(employeeName) ? current : [...current, employeeName]));
     }
-  }, [activeEmployee, employees]);
+  }, [employeeName, employees, setEmployees]);
 
   useEffect(() => {
-    localStorage.setItem(ACTIVE_EMPLOYEE_KEY, activeEmployee);
-  }, [activeEmployee]);
+    if (!isAdmin) {
+      setActiveEmployee(employeeName);
+      return;
+    }
+    if (activeEmployee && !employees.includes(activeEmployee)) {
+      setActiveEmployee(employees[0] || employeeName || "");
+    }
+  }, [activeEmployee, employees, employeeName, isAdmin]);
+
+  useEffect(() => {
+    if (isAdmin) localStorage.setItem(ACTIVE_EMPLOYEE_KEY, activeEmployee);
+  }, [activeEmployee, isAdmin]);
 
   const activeLocation = useMemo(() => {
     const match = (employeeLocations || []).find((entry) => entry?.name === activeEmployee);
@@ -539,19 +578,18 @@ function App() {
     setNotifications((current) => [notification, ...current]);
   }
 
-  function addEmployee(name) {
-    const cleanName = name.trim();
-    if (!cleanName || employees.includes(cleanName)) return;
-    setEmployees((current) => [...current, cleanName]);
-    setActiveEmployee(cleanName);
+  // Keep the shared employee-name list in step with the real user accounts so
+  // attribution and admin filters keep working.
+  function syncEmployeeName(name) {
+    const cleanName = String(name || "").trim();
+    if (!cleanName) return;
+    setEmployees((current) => (current.includes(cleanName) ? current : [...current, cleanName]));
   }
 
-  function removeEmployee(name) {
-    if (employees.length <= 1) {
-      window.alert("Keep at least one employee.");
-      return;
-    }
-    setEmployees((current) => current.filter((employee) => employee !== name));
+  function unsyncEmployeeName(name) {
+    const cleanName = String(name || "").trim();
+    if (!cleanName) return;
+    setEmployees((current) => current.filter((employee) => employee !== cleanName));
   }
 
   function clearReports() {
@@ -665,40 +703,9 @@ function App() {
     );
   }
 
-  function login({ employeeName, role, pin }) {
-    const name = employeeName.trim();
-    if (!name) return;
-
-    if (role === "admin") {
-      if (pin !== ADMIN_PIN) {
-        window.alert("Wrong admin PIN. Demo admin PIN is admin123.");
-        return;
-      }
-      if (!employees.includes(name)) {
-        setEmployees((current) => [...current, name]);
-      }
-      setActiveEmployee(name || "Admin");
-      localStorage.setItem(SESSION_KEY, "admin");
-      setSessionRole("admin");
-      setActiveView("admin");
-      return;
-    }
-
-    if (!employees.includes(name)) {
-      setEmployees((current) => [...current, name]);
-    }
-    setActiveEmployee(name);
-    localStorage.setItem(SESSION_KEY, "employee");
-    setSessionRole("employee");
-    setActiveView("pendingReports");
-  }
-
   function requestPasswordReset(employeeName) {
-    const name = employeeName.trim();
+    const name = String(employeeName || "").trim();
     if (!name) return;
-    if (!employees.includes(name)) {
-      setEmployees((current) => [...current, name]);
-    }
     setResetRequests((current) => [
       {
         id: crypto.randomUUID(),
@@ -708,7 +715,7 @@ function App() {
       },
       ...current,
     ]);
-    window.alert("Password reset request saved. In Firebase, this will send a real reset link.");
+    window.alert(`Logged a password-reset request for ${name}. They can also reset themselves from the login screen.`);
   }
 
   function markResetHandled(requestId) {
@@ -719,21 +726,12 @@ function App() {
     );
   }
 
-  function logout() {
-    localStorage.removeItem(SESSION_KEY);
-    setSessionRole("");
-    setActiveView("pendingReports");
-  }
-
-  if (!sessionRole) {
-    return (
-      <LoginPage
-        employees={employees}
-        defaultEmployee={activeEmployee}
-        onLogin={login}
-        onResetPassword={requestPasswordReset}
-      />
-    );
+  async function logout() {
+    try {
+      await signOutUser();
+    } catch (error) {
+      console.error("Sign-out failed", error);
+    }
   }
 
   return (
@@ -864,10 +862,12 @@ function App() {
 
       {dialogOpen && sessionRole === "admin" && (
         <EmployeeDialog
-          employees={employees}
-          onAdd={addEmployee}
-          onRemove={removeEmployee}
           onClose={() => setDialogOpen(false)}
+          onSyncName={syncEmployeeName}
+          onUnsyncName={unsyncEmployeeName}
+          storeLocations={storeLocations}
+          employeeLocations={employeeLocations}
+          onSetLocation={setEmployeeLocation}
         />
       )}
 
@@ -882,14 +882,37 @@ function App() {
   );
 }
 
-function LoginPage({ employees, defaultEmployee, onLogin, onResetPassword }) {
-  const [employee, setEmployee] = useState(defaultEmployee || employees[0] || "");
-  const [role, setRole] = useState("employee");
-  const [pin, setPin] = useState("");
+function LoginPage({ authError }) {
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [status, setStatus] = useState("idle");
+  const [message, setMessage] = useState("");
 
-  function handleSubmit(event) {
+  async function handleSubmit(event) {
     event.preventDefault();
-    onLogin({ employeeName: employee, role, pin });
+    if (!email.trim() || !password) return;
+    setStatus("signing-in");
+    setMessage("");
+    try {
+      await signInWithEmail(email, password);
+      // The auth listener in App will swap to the workspace on success.
+    } catch (error) {
+      setStatus("idle");
+      setMessage(friendlyAuthError(error));
+    }
+  }
+
+  async function handleForgotPassword() {
+    if (!email.trim()) {
+      setMessage("Enter your email above first, then tap Forgot password.");
+      return;
+    }
+    try {
+      await sendReset(email);
+      setMessage("Password reset email sent. Check your inbox.");
+    } catch (error) {
+      setMessage(friendlyAuthError(error));
+    }
   }
 
   return (
@@ -926,64 +949,61 @@ function LoginPage({ employees, defaultEmployee, onLogin, onResetPassword }) {
 
           <form className="login-form" onSubmit={handleSubmit}>
             <div>
-              <p className="eyebrow">{role === "admin" ? "Admin login" : "Employee login"}</p>
-              <h2>{role === "admin" ? "Sign in to manage the store" : "Sign in to report customer activity"}</h2>
-            </div>
-
-            <div className="segmented-control" role="tablist" aria-label="Login type">
-              <button
-                className={role === "employee" ? "selected" : ""}
-                type="button"
-                onClick={() => setRole("employee")}
-              >
-                Employee
-              </button>
-              <button
-                className={role === "admin" ? "selected" : ""}
-                type="button"
-                onClick={() => setRole("admin")}
-              >
-                Admin
-              </button>
+              <p className="eyebrow">Sign in</p>
+              <h2>Sign in to your account</h2>
             </div>
 
             <label className="field">
-              <span>{role === "admin" ? "Admin name" : "Employee name"}</span>
+              <span>Email</span>
               <input
-                list="employee-options"
-                value={employee}
-                onChange={(event) => setEmployee(event.target.value)}
-                placeholder="Type your name"
+                type="email"
+                value={email}
+                onChange={(event) => setEmail(event.target.value)}
+                placeholder="you@diamanttelecom.com"
+                autoComplete="username"
                 required
               />
-              <datalist id="employee-options">
-                {employees.map((name) => (
-                  <option value={name} key={name} />
-                ))}
-              </datalist>
             </label>
 
             <label className="field">
-              <span>{role === "admin" ? "Admin PIN" : "PIN"}</span>
+              <span>Password</span>
               <input
                 type="password"
-                value={pin}
-                onChange={(event) => setPin(event.target.value)}
-                placeholder={role === "admin" ? "Demo: admin123" : "Demo mode: any PIN"}
+                value={password}
+                onChange={(event) => setPassword(event.target.value)}
+                placeholder="Your password"
+                autoComplete="current-password"
+                required
               />
             </label>
 
-            <button className="primary-button" type="submit">{role === "admin" ? "Admin login" : "Sign in"}</button>
-            {role === "employee" ? (
-              <button className="secondary-button" type="button" onClick={() => onResetPassword(employee)}>
-                Reset password
-              </button>
-            ) : null}
+            <button className="primary-button" type="submit" disabled={status === "signing-in"}>
+              {status === "signing-in" ? "Signing in…" : "Sign in"}
+            </button>
+            <button className="secondary-button" type="button" onClick={handleForgotPassword}>
+              Forgot password
+            </button>
+            {message ? <p className="summary-error">{message}</p> : null}
+            {authError ? <p className="summary-error">Could not reach the sign-in service. Check your connection.</p> : null}
           </form>
         </div>
       </section>
     </main>
   );
+}
+
+function friendlyAuthError(error) {
+  const code = error?.code || "";
+  if (code.includes("invalid-credential") || code.includes("wrong-password") || code.includes("user-not-found")) {
+    return "Incorrect email or password.";
+  }
+  if (code.includes("too-many-requests")) {
+    return "Too many attempts. Wait a moment and try again.";
+  }
+  if (code.includes("network")) {
+    return "Network error. Check your connection.";
+  }
+  return error?.message || "Sign-in failed. Please try again.";
 }
 
 function Sidebar({
@@ -4437,35 +4457,174 @@ function ReturnDialog({ report, onClose, onSubmit }) {
   );
 }
 
-function EmployeeDialog({ employees, onAdd, onRemove, onClose }) {
-  const [name, setName] = useState("");
+function friendlyCallError(error) {
+  return error?.message || "Action failed. Make sure you are signed in as an admin and Functions are deployed.";
+}
 
-  function handleAdd() {
-    onAdd(name);
-    setName("");
+function EmployeeDialog({ onClose, onSyncName, onUnsyncName, storeLocations, employeeLocations, onSetLocation }) {
+  const stores = storeLocations || [];
+  const [users, setUsers] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [form, setForm] = useState({ email: "", displayName: "", password: "", location: stores[0] || "", isAdmin: false });
+
+  function locationForName(name) {
+    return (employeeLocations || []).find((entry) => entry?.name === name)?.location || "";
+  }
+
+  async function refresh() {
+    setLoading(true);
+    try {
+      const list = await callFunction("listEmployees");
+      setUsers(Array.isArray(list) ? list : []);
+      setError("");
+    } catch (caught) {
+      setError(friendlyCallError(caught));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    refresh();
+  }, []);
+
+  function updateForm(name, value) {
+    setForm((current) => ({ ...current, [name]: value }));
+  }
+
+  async function createUser(event) {
+    event.preventDefault();
+    if (!form.email.trim() || !form.password || !form.displayName.trim() || !form.location) return;
+    setBusy(true);
+    setError("");
+    try {
+      const created = await callFunction("createEmployee", {
+        email: form.email.trim(),
+        password: form.password,
+        displayName: form.displayName.trim(),
+        isAdmin: form.isAdmin,
+      });
+      const name = created?.displayName || form.displayName.trim();
+      if (name) {
+        onSyncName(name);
+        onSetLocation(name, form.location);
+      }
+      setForm({ email: "", displayName: "", password: "", location: stores[0] || "", isAdmin: false });
+      await refresh();
+    } catch (caught) {
+      setError(friendlyCallError(caught));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function toggleAdmin(user) {
+    setBusy(true);
+    setError("");
+    try {
+      await callFunction("setEmployeeAdmin", { uid: user.uid, isAdmin: !user.admin });
+      await refresh();
+    } catch (caught) {
+      setError(friendlyCallError(caught));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function removeUser(user) {
+    if (!window.confirm(`Delete ${user.displayName || user.email}? They will no longer be able to sign in.`)) return;
+    setBusy(true);
+    setError("");
+    try {
+      await callFunction("deleteEmployee", { uid: user.uid });
+      if (user.displayName) onUnsyncName(user.displayName);
+      await refresh();
+    } catch (caught) {
+      setError(friendlyCallError(caught));
+    } finally {
+      setBusy(false);
+    }
   }
 
   return (
     <div className="dialog-backdrop" role="presentation">
-      <div className="dialog-card" role="dialog" aria-modal="true" aria-labelledby="employee-dialog-title">
+      <div className="dialog-card dialog-card-wide" role="dialog" aria-modal="true" aria-labelledby="employee-dialog-title">
         <div>
           <p className="eyebrow">Team</p>
           <h2 id="employee-dialog-title">Manage employees</h2>
+          <p className="muted">Create sign-in accounts and control who is an admin.</p>
         </div>
-        <label className="field">
-          <span>Add employee</span>
-          <input value={name} onChange={(event) => setName(event.target.value)} placeholder="Employee name" />
-        </label>
+
+        <form className="form-grid dialog-form" onSubmit={createUser}>
+          <label className="field">
+            <span>Name</span>
+            <input value={form.displayName} onChange={(event) => updateForm("displayName", event.target.value)} placeholder="Employee name" required />
+          </label>
+          <label className="field">
+            <span>Email</span>
+            <input type="email" value={form.email} onChange={(event) => updateForm("email", event.target.value)} placeholder="employee@diamanttelecom.com" required />
+          </label>
+          <label className="field">
+            <span>Temporary password</span>
+            <input type="text" value={form.password} onChange={(event) => updateForm("password", event.target.value)} placeholder="At least 6 characters" required />
+          </label>
+          <label className="field">
+            <span>Location</span>
+            <select value={form.location} onChange={(event) => updateForm("location", event.target.value)} required>
+              <option value="">Select store</option>
+              {stores.map((location) => <option key={location}>{location}</option>)}
+            </select>
+          </label>
+          <label className="field checkbox-field">
+            <input type="checkbox" checked={form.isAdmin} onChange={(event) => updateForm("isAdmin", event.target.checked)} />
+            <span>Admin access</span>
+          </label>
+          <button className="primary-button align-end" type="submit" disabled={busy}>
+            {busy ? "Working…" : "Add employee"}
+          </button>
+        </form>
+
+        {error ? <p className="summary-error">{error}</p> : null}
+
         <div className="employee-list">
-          {employees.map((employee) => (
-            <div className="employee-row" key={employee}>
-              <span>{employee}</span>
-              <button type="button" onClick={() => onRemove(employee)}>Remove</button>
-            </div>
-          ))}
+          {loading ? (
+            <p className="muted">Loading accounts…</p>
+          ) : users.length ? (
+            users.map((user) => (
+              <div className="employee-row" key={user.uid}>
+                <div>
+                  <strong>{user.displayName || user.email}</strong>
+                  <p className="muted">{user.email}{user.admin ? " · Admin" : ""}</p>
+                </div>
+                <div className="employee-row-actions">
+                  {user.displayName ? (
+                    <select
+                      className="status-select"
+                      value={locationForName(user.displayName)}
+                      onChange={(event) => onSetLocation(user.displayName, event.target.value)}
+                      title="Store location"
+                    >
+                      <option value="">No location</option>
+                      {stores.map((location) => <option key={location}>{location}</option>)}
+                    </select>
+                  ) : null}
+                  <button className="secondary-button compact-button" type="button" disabled={busy} onClick={() => toggleAdmin(user)}>
+                    {user.admin ? "Make employee" : "Make admin"}
+                  </button>
+                  <button className="secondary-button compact-button" type="button" disabled={busy} onClick={() => removeUser(user)}>
+                    Remove
+                  </button>
+                </div>
+              </div>
+            ))
+          ) : (
+            <p className="muted">No accounts yet. Add your first employee above.</p>
+          )}
         </div>
+
         <div className="form-actions">
-          <button className="primary-button" type="button" onClick={handleAdd}>Add</button>
           <button className="secondary-button" type="button" onClick={onClose}>Done</button>
         </div>
       </div>
@@ -4473,8 +4632,40 @@ function EmployeeDialog({ employees, onAdd, onRemove, onClose }) {
   );
 }
 
+class ErrorBoundary extends React.Component {
+  constructor(props) {
+    super(props);
+    this.state = { hasError: false };
+  }
+
+  static getDerivedStateFromError() {
+    return { hasError: true };
+  }
+
+  componentDidCatch(error, info) {
+    console.error("App crashed:", error, info);
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div className="app-error">
+          <h1>Something went wrong</h1>
+          <p>Please reload the page. Your saved data is safe.</p>
+          <button className="primary-button" type="button" onClick={() => window.location.reload()}>
+            Reload
+          </button>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
 createRoot(document.getElementById("root")).render(
   <React.StrictMode>
-    <App />
+    <ErrorBoundary>
+      <App />
+    </ErrorBoundary>
   </React.StrictMode>,
 );

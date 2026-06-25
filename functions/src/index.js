@@ -1,5 +1,5 @@
 const crypto = require("node:crypto");
-const { onRequest } = require("firebase-functions/v2/https");
+const { onRequest, onCall, HttpsError } = require("firebase-functions/v2/https");
 const { onDocumentUpdated } = require("firebase-functions/v2/firestore");
 const { onSchedule } = require("firebase-functions/v2/scheduler");
 const logger = require("firebase-functions/logger");
@@ -28,7 +28,7 @@ admin.initializeApp();
 
 const db = admin.firestore();
 const REGION = "us-central1";
-const HTTP_OPTIONS = { region: REGION, invoker: "public" };
+const HTTP_OPTIONS = { region: REGION };
 const TWILIO_FROM_NUMBER = process.env.TWILIO_FROM_NUMBER || "";
 const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID || "";
 const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN || "";
@@ -56,6 +56,78 @@ function getPayload(req) {
     ...(typeof req.body === "object" && req.body ? req.body : {}),
   };
 }
+
+// ---- Employee account management (admin-only callable functions) ----
+
+function assertAdmin(request) {
+  if (!request.auth || request.auth.token.role !== "admin") {
+    throw new HttpsError("permission-denied", "Admin access is required.");
+  }
+}
+
+exports.listEmployees = onCall({ region: REGION }, async (request) => {
+  assertAdmin(request);
+  const result = await admin.auth().listUsers(1000);
+  return result.users.map((user) => ({
+    uid: user.uid,
+    email: user.email || "",
+    displayName: user.displayName || "",
+    disabled: user.disabled,
+    admin: user.customClaims?.role === "admin",
+  }));
+});
+
+exports.createEmployee = onCall({ region: REGION }, async (request) => {
+  assertAdmin(request);
+  const { email, password, displayName, isAdmin } = request.data || {};
+  if (!email || !password) {
+    throw new HttpsError("invalid-argument", "Email and password are required.");
+  }
+  if (String(password).length < 6) {
+    throw new HttpsError("invalid-argument", "Password must be at least 6 characters.");
+  }
+  let user;
+  try {
+    user = await admin.auth().createUser({
+      email: String(email).trim(),
+      password: String(password),
+      displayName: String(displayName || "").trim() || undefined,
+    });
+  } catch (error) {
+    throw new HttpsError("already-exists", error.message || "Could not create the user.");
+  }
+  if (isAdmin) {
+    await admin.auth().setCustomUserClaims(user.uid, { role: "admin" });
+  }
+  return {
+    uid: user.uid,
+    email: user.email || "",
+    displayName: user.displayName || "",
+    admin: Boolean(isAdmin),
+  };
+});
+
+exports.setEmployeeAdmin = onCall({ region: REGION }, async (request) => {
+  assertAdmin(request);
+  const { uid, isAdmin } = request.data || {};
+  if (!uid) throw new HttpsError("invalid-argument", "uid is required.");
+  if (uid === request.auth.uid && !isAdmin) {
+    throw new HttpsError("failed-precondition", "You cannot remove your own admin access.");
+  }
+  await admin.auth().setCustomUserClaims(uid, isAdmin ? { role: "admin" } : {});
+  return { uid, admin: Boolean(isAdmin) };
+});
+
+exports.deleteEmployee = onCall({ region: REGION }, async (request) => {
+  assertAdmin(request);
+  const { uid } = request.data || {};
+  if (!uid) throw new HttpsError("invalid-argument", "uid is required.");
+  if (uid === request.auth.uid) {
+    throw new HttpsError("failed-precondition", "You cannot delete your own account.");
+  }
+  await admin.auth().deleteUser(uid);
+  return { uid, deleted: true };
+});
 
 function sendJson(res, status, body) {
   res.status(status).set("Content-Type", "application/json").send(body);
