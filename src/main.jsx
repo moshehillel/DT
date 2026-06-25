@@ -22,11 +22,12 @@ import {
   RESET_REQUESTS_KEY,
   SESSION_KEY,
   STORAGE_KEY,
+  STORE_DEVICES_KEY,
   STORE_LOCATIONS_KEY,
 } from "./constants";
 import { useCloudCollectionState, useCloudDocumentState } from "./hooks/useCloudState";
 import { attachAuthMetadata, ensureFirebaseAuth } from "./firebaseClient";
-import { chargeOnReader, connectReader, getConnectedReader } from "./stripeTerminal";
+import { chargeOnDevice } from "./solaTerminal";
 import {
   buildAppNotifications,
   calculateInclusiveDays,
@@ -73,6 +74,7 @@ function App() {
   const [products, setProducts] = useCloudCollectionState("products", PRODUCTS_KEY, []);
   const [storeLocations, setStoreLocations] = useCloudDocumentState("storeLocations", STORE_LOCATIONS_KEY, defaultStoreLocations);
   const [employeeLocations, setEmployeeLocations] = useCloudDocumentState("employeeLocations", EMPLOYEE_LOCATIONS_KEY, []);
+  const [storeDevices, setStoreDevices] = useCloudDocumentState("storeDevices", STORE_DEVICES_KEY, []);
   const [activeEmployee, setActiveEmployee] = useState(
     localStorage.getItem(ACTIVE_EMPLOYEE_KEY) || employees[0] || "",
   );
@@ -99,6 +101,11 @@ function App() {
     const match = (employeeLocations || []).find((entry) => entry?.name === activeEmployee);
     return match?.location || storeLocations[0] || "";
   }, [employeeLocations, activeEmployee, storeLocations]);
+
+  const activeDeviceId = useMemo(() => {
+    const match = (storeDevices || []).find((entry) => entry?.name === activeLocation);
+    return match?.deviceId || "";
+  }, [storeDevices, activeLocation]);
 
   const employeeCanSeeReport = useMemo(() => {
     return (report) => {
@@ -183,6 +190,15 @@ function App() {
       const others = (current || []).filter((entry) => entry?.name !== name);
       if (!location) return others;
       return [...others, { name, location }];
+    });
+  }
+
+  function setStoreDevice(name, deviceId) {
+    const cleanDeviceId = String(deviceId || "").trim();
+    setStoreDevices((current) => {
+      const others = (current || []).filter((entry) => entry?.name !== name);
+      if (!cleanDeviceId) return others;
+      return [...others, { name, deviceId: cleanDeviceId }];
     });
   }
 
@@ -681,6 +697,7 @@ function App() {
             products={products}
             activeEmployee={activeEmployee}
             activeLocation={activeLocation}
+            activeDeviceId={activeDeviceId}
             onCompleteSale={savePosSale}
           />
         ) : activeView === "inventory" ? (
@@ -689,12 +706,14 @@ function App() {
             employees={employees}
             storeLocations={storeLocations}
             employeeLocations={employeeLocations}
+            storeDevices={storeDevices}
             sessionRole={sessionRole}
             onSaveProduct={saveProduct}
             onRemoveProduct={removeProduct}
             onAddStoreLocation={addStoreLocation}
             onRemoveStoreLocation={removeStoreLocation}
             onSetEmployeeLocation={setEmployeeLocation}
+            onSetStoreDevice={setStoreDevice}
           />
         ) : (
           <AdminPage
@@ -2027,7 +2046,12 @@ function PendingReportCard({ pendingReport, activeEmployee, onClaim, onSave }) {
     imei: pendingReport.details?.imei || imported.imei || "",
     notes: pendingReport.notes || "",
     paymentAmount: pendingReport.paymentAmount || imported.totalPrice || "",
-    paymentMethod: pendingReport.paymentMethod || (isShopifySale ? "Shopify POS" : "Cash"),
+    // Shopify is no longer a payment channel: the employee records how the
+    // customer actually paid (cash, card on the Sola terminal, etc.).
+    paymentMethod:
+      pendingReport.paymentMethod && pendingReport.paymentMethod !== "Shopify POS"
+        ? pendingReport.paymentMethod
+        : "Cash",
   }));
 
   function updateField(name, value) {
@@ -2476,7 +2500,7 @@ function OpenPhoneOrders({ orders, activeEmployee, sessionRole, onDelivered }) {
   );
 }
 
-function PosPage({ products, activeEmployee, activeLocation, onCompleteSale }) {
+function PosPage({ products, activeEmployee, activeLocation, activeDeviceId, onCompleteSale }) {
   const [cart, setCart] = useState([]);
   const [scan, setScan] = useState("");
   const [customerPhone, setCustomerPhone] = useState("");
@@ -2484,9 +2508,7 @@ function PosPage({ products, activeEmployee, activeLocation, onCompleteSale }) {
   const [notes, setNotes] = useState("");
   const [message, setMessage] = useState("");
   const [completedSale, setCompletedSale] = useState(null);
-  const [card, setCard] = useState({ status: "idle", message: "", paymentIntentId: "" });
-  const [reader, setReader] = useState({ status: "disconnected", label: "", message: "" });
-  const [useSimulatedReader, setUseSimulatedReader] = useState(true);
+  const [card, setCard] = useState({ status: "idle", message: "", refNum: "" });
   const scanRef = useRef(null);
 
   useEffect(() => {
@@ -2608,48 +2630,30 @@ function PosPage({ products, activeEmployee, activeLocation, onCompleteSale }) {
 
   useEffect(() => {
     setCard((current) =>
-      current.status === "idle" ? current : { status: "idle", message: "", paymentIntentId: "" },
+      current.status === "idle" ? current : { status: "idle", message: "", refNum: "" },
     );
   }, [total, paymentMethod]);
-
-  async function handleConnectReader() {
-    setReader({ status: "connecting", label: "", message: "Connecting to reader..." });
-    try {
-      const connected = await connectReader({ simulated: useSimulatedReader });
-      setReader({ status: "connected", label: connected?.label || connected?.id || "Reader", message: "" });
-    } catch (error) {
-      setReader({ status: "disconnected", label: "", message: error.message || "Could not connect to a reader." });
-    }
-  }
 
   async function chargeCard() {
     if (!requiresCardCharge || !total) return;
     try {
-      let connected = null;
-      try {
-        connected = await getConnectedReader();
-      } catch {
-        connected = null;
-      }
-      if (!connected) {
-        connected = await connectReader({ simulated: useSimulatedReader });
-        setReader({ status: "connected", label: connected?.label || connected?.id || "Reader", message: "" });
-      }
-      setCard({ status: "charging", message: "Follow the reader: tap, insert, or swipe the card.", paymentIntentId: "" });
-      const result = await chargeOnReader({
+      setCard({ status: "charging", message: "Sending sale to the terminal...", refNum: "" });
+      const result = await chargeOnDevice({
         amount: total.toFixed(2),
-        description: `POS sale - ${activeLocation || "store"}`,
+        deviceId: activeDeviceId,
         location: activeLocation,
         customerPhone: customerPhone.trim(),
+        onStatus: (text) => setCard((current) => ({ ...current, message: text })),
       });
-      const paid = result.status === "succeeded" || result.status === "requires_capture";
       setCard({
-        status: paid ? "paid" : "error",
-        message: paid ? "Card approved." : `Payment status: ${result.status}.`,
-        paymentIntentId: result.paymentIntentId || "",
+        status: "paid",
+        message: result.maskedCardNumber
+          ? `Card approved (${result.cardType || "card"} ${result.maskedCardNumber}).`
+          : "Card approved.",
+        refNum: result.refNum || "",
       });
     } catch (error) {
-      setCard({ status: "error", message: error.message || "Card payment failed.", paymentIntentId: "" });
+      setCard({ status: "error", message: error.message || "Card payment failed.", refNum: "" });
     }
   }
 
@@ -2694,7 +2698,7 @@ function PosPage({ products, activeEmployee, activeLocation, onCompleteSale }) {
         itemCount,
         lineItems,
         cardStatus: requiresCardCharge ? card.status : "",
-        stripePaymentIntentId: requiresCardCharge ? card.paymentIntentId : "",
+        solaRefNum: requiresCardCharge ? card.refNum : "",
       },
     };
     onCompleteSale(sale);
@@ -2703,13 +2707,13 @@ function PosPage({ products, activeEmployee, activeLocation, onCompleteSale }) {
     setCustomerPhone("");
     setNotes("");
     setPaymentMethod(paymentMethods[0]);
-    setCard({ status: "idle", message: "", paymentIntentId: "" });
+    setCard({ status: "idle", message: "", refNum: "" });
     setMessage("");
   }
 
   function startNewSale() {
     setCompletedSale(null);
-    setCard({ status: "idle", message: "", paymentIntentId: "" });
+    setCard({ status: "idle", message: "", refNum: "" });
     setMessage("Ready for the next customer.");
     setTimeout(() => scanRef.current?.focus(), 0);
   }
@@ -2854,40 +2858,22 @@ function PosPage({ products, activeEmployee, activeLocation, onCompleteSale }) {
           {requiresCardCharge ? (
             <div className="payment-panel payment-panel-stack">
               <div>
-                <p className="eyebrow">Card payment (Stripe)</p>
-                <h3>Charge {formatMoney(total)} on reader</h3>
+                <p className="eyebrow">Card payment (Sola terminal)</p>
+                <h3>Charge {formatMoney(total)} on the terminal</h3>
               </div>
               <div className="card-reader-row">
-                <span className={`reader-dot ${reader.status}`} aria-hidden="true" />
+                <span className={`reader-dot ${activeDeviceId ? "connected" : "disconnected"}`} aria-hidden="true" />
                 <span className="muted">
-                  {reader.status === "connected"
-                    ? `Reader: ${reader.label}`
-                    : reader.status === "connecting"
-                      ? "Connecting..."
-                      : "No reader connected"}
+                  {activeDeviceId
+                    ? `Terminal: ${activeDeviceId}`
+                    : "No terminal assigned to this store"}
                 </span>
-                <button
-                  className="secondary-button"
-                  type="button"
-                  onClick={handleConnectReader}
-                  disabled={reader.status === "connecting"}
-                >
-                  {reader.status === "connected" ? "Reconnect" : "Connect reader"}
-                </button>
               </div>
-              <label className="field checkbox-field">
-                <input
-                  type="checkbox"
-                  checked={useSimulatedReader}
-                  onChange={(event) => setUseSimulatedReader(event.target.checked)}
-                />
-                <span>Use Stripe simulated reader (for testing without hardware)</span>
-              </label>
               <button
                 className="secondary-button"
                 type="button"
                 onClick={chargeCard}
-                disabled={!total || card.status === "charging" || card.status === "paid"}
+                disabled={!total || !activeDeviceId || card.status === "charging" || card.status === "paid"}
               >
                 {card.status === "paid"
                   ? "Card charged"
@@ -2895,10 +2881,12 @@ function PosPage({ products, activeEmployee, activeLocation, onCompleteSale }) {
                     ? "Waiting for card..."
                     : "Charge card (tap / dip / swipe)"}
               </button>
+              {!activeDeviceId ? (
+                <p className="summary-error">Assign a Sola device ID to this store in Inventory before taking card payments.</p>
+              ) : null}
               {card.message ? (
                 <p className={card.status === "error" ? "summary-error" : "muted"}>{card.message}</p>
               ) : null}
-              {reader.message ? <p className="summary-error">{reader.message}</p> : null}
             </div>
           ) : null}
           {imeiIssue ? (
@@ -3223,12 +3211,14 @@ function InventoryPage({
   employees,
   storeLocations,
   employeeLocations,
+  storeDevices,
   sessionRole,
   onSaveProduct,
   onRemoveProduct,
   onAddStoreLocation,
   onRemoveStoreLocation,
   onSetEmployeeLocation,
+  onSetStoreDevice,
 }) {
   const isAdmin = sessionRole === "admin";
   const emptyForm = {
@@ -3306,6 +3296,10 @@ function InventoryPage({
 
   function locationFor(name) {
     return (employeeLocations || []).find((entry) => entry?.name === name)?.location || "";
+  }
+
+  function deviceFor(name) {
+    return (storeDevices || []).find((entry) => entry?.name === name)?.deviceId || "";
   }
 
   if (!isAdmin) {
@@ -3497,7 +3491,19 @@ function InventoryPage({
             <div className="request-row" key={location}>
               <div>
                 <strong>{location}</strong>
+                <p className="muted">Sola terminal device ID for card payments at this store</p>
               </div>
+              <label className="field">
+                <span>Sola device ID</span>
+                <input
+                  key={`device-${location}-${deviceFor(location)}`}
+                  defaultValue={deviceFor(location)}
+                  placeholder="CloudIM device ID"
+                  autoComplete="off"
+                  spellCheck={false}
+                  onBlur={(event) => onSetStoreDevice(location, event.target.value)}
+                />
+              </label>
               <button className="secondary-button" type="button" onClick={() => onRemoveStoreLocation(location)}>
                 Remove
               </button>
@@ -3786,7 +3792,7 @@ function ReportDetails({ report }) {
       ["Items", details.itemsText],
       ["Model", details.model],
       ["IMEI", details.imei],
-      ["Card txn", details.stripePaymentIntentId || details.solaTransactionId],
+      ["Card txn", details.solaRefNum || details.stripePaymentIntentId || details.solaTransactionId],
     ],
     call: [
       ["Caller", details.callerName],

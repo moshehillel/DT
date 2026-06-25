@@ -13,7 +13,21 @@ npm run dev
 
 The app keeps a `localStorage` copy of each collection and syncs to Firestore when Firebase Hosting config is available at `/__/firebase/init.json`. Without Firebase, it still works offline in the browser.
 
-Set `VITE_FUNCTIONS_BASE_URL` to your deployed Functions base URL (for example `https://us-central1-PROJECT_ID.cloudfunctions.net`) before using RCUK rentals, Sola card charges, or live SMS notifications.
+Set `VITE_FUNCTIONS_BASE_URL` to your deployed Functions base URL (for example `https://us-central1-PROJECT_ID.cloudfunctions.net`) before using RCUK rentals, Sola card charges, in-person terminal payments, or live SMS notifications.
+
+### Backend environment variables
+
+Set these on Firebase Functions (`firebase functions:secrets:set` or `.env`):
+
+- `SOLA_API_KEY` — Sola / Cardknox API key (used for both online charges and the in-person terminal).
+- `SOLA_DEFAULT_DEVICE_ID` — fallback CloudIM terminal device ID. Per-store device IDs are set in the app under Inventory → Stores.
+- `SOLA_DEVICE_API_BASE_URL` — optional, defaults to `https://device.cardknox.com/v2`.
+- `TELEBROAD_USERNAME`, `TELEBROAD_PASSWORD` — Telebroad TeleConsole account credentials for sending SMS.
+- `TELEBROAD_SMS_LINE` — the Telebroad line / DID texts are sent from (defaults to `13473887467`, the "Diamant Telecom" SMS line; override only if it changes). Look it up anytime with `GET /sms/lines`.
+- `TELEBROAD_API_BASE_URL` — optional, defaults to `https://webserv.telebroad.com/api/teleconsole/rest`.
+- `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_FROM_NUMBER` — still used for outgoing voice-call notifications (e.g. rental return reminders).
+
+In-person card payments use the **Sola CloudIM** cloud API against a **PAX A80** terminal — no per-register software install. SMS is sent through the **Telebroad REST API**; voice-call notifications remain on Twilio.
 
 ## Included features
 

@@ -13,9 +13,16 @@ const {
 const { buildRepairMessage, findRepairByLookup } = require("./repairs");
 const {
   buildTelebroadPendingReport,
+  buildTelebroadSmsRequest,
   shouldImportCall,
 } = require("./telebroad");
 const { extractShopifyImei } = require("./shopify");
+const {
+  buildResultLookup,
+  buildSaleSession,
+  formatAmount,
+  interpretResult,
+} = require("./solaDevice");
 
 admin.initializeApp();
 
@@ -26,6 +33,10 @@ const TWILIO_FROM_NUMBER = process.env.TWILIO_FROM_NUMBER || "";
 const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID || "";
 const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN || "";
 const TWILIO_REQUEST_TOKEN = process.env.TWILIO_REQUEST_TOKEN || "";
+const TELEBROAD_API_BASE_URL = process.env.TELEBROAD_API_BASE_URL || "https://webserv.telebroad.com/api/teleconsole/rest";
+const TELEBROAD_USERNAME = process.env.TELEBROAD_USERNAME || "";
+const TELEBROAD_PASSWORD = process.env.TELEBROAD_PASSWORD || "";
+const TELEBROAD_SMS_LINE = process.env.TELEBROAD_SMS_LINE || "13473887467";
 const RCUK_API_KEY = process.env.RCUK_API_KEY || "";
 const RCUK_API_BASE_URL = process.env.RCUK_API_BASE_URL || "https://myaccount.rcuk.com/api";
 const RCUK_ADD_RENTAL_PATH = process.env.RCUK_ADD_RENTAL_PATH || "/add-rental";
@@ -34,13 +45,10 @@ const RCUK_CHECK_SIM_PATH = process.env.RCUK_CHECK_SIM_PATH || "/check-sim";
 const SOLA_API_KEY = process.env.SOLA_API_KEY || "";
 const SOLA_API_BASE_URL = process.env.SOLA_API_BASE_URL || "https://x1.cardknox.com";
 const SOLA_CREATE_CHARGE_PATH = process.env.SOLA_CREATE_CHARGE_PATH || "/gatewayjson";
-const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY || "";
-const STRIPE_CURRENCY = process.env.STRIPE_CURRENCY || "usd";
+// CloudIM cloud endpoint for card-present terminal payments (PAX A80, etc.).
+const SOLA_DEVICE_API_BASE_URL = process.env.SOLA_DEVICE_API_BASE_URL || "https://device.cardknox.com/v2";
+const SOLA_DEFAULT_DEVICE_ID = process.env.SOLA_DEFAULT_DEVICE_ID || "";
 const RENTAL_REMINDER_TIME_ZONE = process.env.RENTAL_REMINDER_TIME_ZONE || "America/New_York";
-
-// Stripe is only loaded when a secret key is configured so the rest of the
-// functions keep working (and deploying) even before Stripe is set up.
-const stripeClient = STRIPE_SECRET_KEY ? require("stripe")(STRIPE_SECRET_KEY) : null;
 
 function getPayload(req) {
   return {
@@ -279,36 +287,61 @@ function getTwilioClient() {
   return twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
 }
 
-async function sendCustomerNotification({ to, method, body }) {
+// Outgoing voice calls (e.g. rental return reminders) stay on Twilio.
+async function sendVoiceCall({ to, body }) {
   const client = getTwilioClient();
   if (!client) {
-    return {
-      status: "Queued",
-      detail: "Twilio credentials are not configured",
-    };
+    return { status: "Queued", detail: "Twilio credentials are not configured" };
   }
 
-  if (method === "Phone call") {
-    const call = await client.calls.create({
-      to,
-      from: TWILIO_FROM_NUMBER,
-      twiml: `<Response><Say>${escapeXml(body)}</Say></Response>`,
-    });
-    return {
-      status: "Sent",
-      detail: `Call ${call.sid}`,
-    };
-  }
-
-  const message = await client.messages.create({
+  const call = await client.calls.create({
     to,
     from: TWILIO_FROM_NUMBER,
-    body,
+    twiml: `<Response><Say>${escapeXml(body)}</Say></Response>`,
   });
-  return {
-    status: "Sent",
-    detail: `SMS ${message.sid}`,
-  };
+  return { status: "Sent", detail: `Call ${call.sid}` };
+}
+
+// Outgoing SMS goes through the Telebroad REST API.
+async function sendSms({ to, body }) {
+  if (!TELEBROAD_USERNAME || !TELEBROAD_PASSWORD || !TELEBROAD_SMS_LINE) {
+    return { status: "Queued", detail: "Telebroad SMS credentials are not configured" };
+  }
+
+  const { url, options } = buildTelebroadSmsRequest({
+    baseUrl: TELEBROAD_API_BASE_URL,
+    username: TELEBROAD_USERNAME,
+    password: TELEBROAD_PASSWORD,
+    smsLine: TELEBROAD_SMS_LINE,
+    to,
+    message: body,
+  });
+
+  const response = await fetch(url, options);
+  const text = await response.text();
+  let data;
+  try {
+    data = text ? JSON.parse(text) : {};
+  } catch {
+    data = {};
+  }
+
+  // Telebroad returns HTTP 200 even on failure; the error lives in data.error.
+  if (!response.ok || data.error) {
+    const detail = data.error
+      ? `${data.error.code || ""} ${data.error.message || ""}`.trim()
+      : `HTTP ${response.status}`;
+    return { status: "Failed", detail: `Telebroad SMS: ${detail || "unknown error"}` };
+  }
+
+  return { status: "Sent", detail: `Telebroad SMS ${data.result ?? ""}`.trim() };
+}
+
+async function sendCustomerNotification({ to, method, body }) {
+  if (method === "Phone call") {
+    return sendVoiceCall({ to, body });
+  }
+  return sendSms({ to, body });
 }
 
 async function logNotification(reportId, report, status, detail) {
@@ -425,8 +458,10 @@ exports.shopifyOrderWebhook = onRequest(HTTP_OPTIONS, async (req, res) => {
       customerPhone: order.customer?.phone || order.phone || "",
       customerPhoneDigits: digitsOnly(order.customer?.phone || order.phone || ""),
       paymentAmount: order.total_price || "",
-      paymentMethod: "Shopify POS",
-      notes: "Imported from Shopify POS. Employee must complete missing fields.",
+      // Payment is collected in-store (cash or Sola terminal); the employee
+      // records the real method when completing the report.
+      paymentMethod: "",
+      notes: "Imported from Shopify. Employee must complete missing fields and record payment.",
       imported: {
         shopifyOrderId: String(order.id || ""),
         shopifyOrderName: order.name || "",
@@ -796,102 +831,143 @@ exports.solaCreateCharge = onRequest(HTTP_OPTIONS, async (req, res) => {
   }
 });
 
-// Stripe Terminal: hands the browser SDK a short-lived connection token so it
-// can discover and connect to a card reader (real or simulated).
-exports.stripeConnectionToken = onRequest(HTTP_OPTIONS, async (req, res) => {
-  if (handleCors(req, res)) return;
-  if (req.method !== "POST") {
-    sendJson(res, 405, { ok: false, message: "POST required" });
-    return;
-  }
-  if (!stripeClient) {
-    sendJson(res, 501, {
-      ok: false,
-      message: "Stripe is not configured yet. Set STRIPE_SECRET_KEY on Firebase Functions.",
-    });
-    return;
-  }
-
+async function callSolaDevice(path, body) {
+  const response = await fetch(`${SOLA_DEVICE_API_BASE_URL}${path}`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: SOLA_API_KEY,
+    },
+    body: JSON.stringify(body),
+  });
+  const text = await response.text();
+  let data;
   try {
-    const token = await stripeClient.terminal.connectionTokens.create();
-    sendJson(res, 200, { ok: true, secret: token.secret });
-  } catch (error) {
-    logger.error("stripeConnectionToken failed", error);
-    sendJson(res, 500, { ok: false, message: error.message || "Could not create connection token." });
+    data = text ? JSON.parse(text) : {};
+  } catch {
+    data = { xError: text || "Sola device returned a non-JSON response." };
   }
-});
+  return { ok: response.ok, status: response.status, data };
+}
 
-// Stripe Terminal: creates a card-present PaymentIntent for the cart total.
-// Manual capture so the sale is only captured after the reader approves.
-exports.stripeCreatePaymentIntent = onRequest(HTTP_OPTIONS, async (req, res) => {
+// Sola CloudIM: start a card-present sale on a terminal (PAX A80, etc.). The
+// terminal prompts the customer to tap/dip/swipe; we return a session id the
+// POS polls with solaDeviceResult.
+exports.solaDeviceSale = onRequest(HTTP_OPTIONS, async (req, res) => {
   if (handleCors(req, res)) return;
   if (req.method !== "POST") {
     sendJson(res, 405, { ok: false, message: "POST required" });
     return;
   }
-  if (!stripeClient) {
+  if (!SOLA_API_KEY) {
     sendJson(res, 501, {
       ok: false,
-      message: "Stripe is not configured yet. Set STRIPE_SECRET_KEY on Firebase Functions.",
+      message: "Sola is not configured yet. Set SOLA_API_KEY on Firebase Functions.",
     });
     return;
   }
 
   const payload = getPayload(req);
-  const amount = Number.parseFloat(payload.amount || "0");
-  if (!Number.isFinite(amount) || amount <= 0) {
+  const amount = formatAmount(payload.amount);
+  const deviceId = payload.deviceId || SOLA_DEFAULT_DEVICE_ID;
+
+  if (!amount) {
     sendJson(res, 400, { ok: false, message: "A valid amount is required." });
     return;
   }
+  if (!deviceId) {
+    sendJson(res, 400, { ok: false, message: "A terminal deviceId is required. Set it for this store or SOLA_DEFAULT_DEVICE_ID." });
+    return;
+  }
 
   try {
-    const intent = await stripeClient.paymentIntents.create({
-      amount: Math.round(amount * 100),
-      currency: payload.currency || STRIPE_CURRENCY,
-      payment_method_types: ["card_present"],
-      capture_method: "manual",
-      description: payload.description || "Diamant Telecom POS sale",
-      metadata: {
-        source: "pos",
-        location: payload.location || "",
-        customerPhone: payload.customerPhone || "",
-      },
+    const session = buildSaleSession({
+      apiKey: SOLA_API_KEY,
+      deviceId,
+      amount,
+      externalRequestId: payload.externalRequestId || `pos-${Date.now()}`,
+      tip: payload.tip,
+      enableTipPrompt: payload.enableTipPrompt,
     });
-    sendJson(res, 200, { ok: true, id: intent.id, clientSecret: intent.client_secret });
+    const result = await callSolaDevice("/session/async", session);
+    const interpreted = interpretResult(result.data);
+
+    if (!result.ok || interpreted.error) {
+      sendJson(res, 400, {
+        ok: false,
+        message: result.data.xError || result.data.message || "Sola could not start the terminal sale.",
+        raw: result.data,
+      });
+      return;
+    }
+
+    sendJson(res, 200, {
+      ok: true,
+      sessionId: result.data.xSessionId || "",
+      externalRequestId: session.xExternalRequestId,
+      status: interpreted.status,
+      raw: result.data,
+    });
   } catch (error) {
-    logger.error("stripeCreatePaymentIntent failed", error);
-    sendJson(res, 500, { ok: false, message: error.message || "Could not create payment intent." });
+    logger.error("solaDeviceSale failed", error);
+    sendJson(res, 500, { ok: false, message: error.message || "Sola terminal sale failed." });
   }
 });
 
-// Stripe Terminal: captures the PaymentIntent after the reader processes it.
-exports.stripeCapturePaymentIntent = onRequest(HTTP_OPTIONS, async (req, res) => {
+// Sola CloudIM: poll the result of a terminal sale by session id.
+exports.solaDeviceResult = onRequest(HTTP_OPTIONS, async (req, res) => {
   if (handleCors(req, res)) return;
   if (req.method !== "POST") {
     sendJson(res, 405, { ok: false, message: "POST required" });
     return;
   }
-  if (!stripeClient) {
+  if (!SOLA_API_KEY) {
     sendJson(res, 501, {
       ok: false,
-      message: "Stripe is not configured yet. Set STRIPE_SECRET_KEY on Firebase Functions.",
+      message: "Sola is not configured yet. Set SOLA_API_KEY on Firebase Functions.",
     });
     return;
   }
 
   const payload = getPayload(req);
-  const paymentIntentId = payload.paymentIntentId || payload.id || "";
-  if (!paymentIntentId) {
-    sendJson(res, 400, { ok: false, message: "paymentIntentId is required." });
+  const sessionId = payload.sessionId || payload.xSessionId || "";
+  const externalRequestId = payload.externalRequestId || "";
+
+  if (!sessionId && !externalRequestId) {
+    sendJson(res, 400, { ok: false, message: "sessionId or externalRequestId is required." });
     return;
   }
 
   try {
-    const intent = await stripeClient.paymentIntents.capture(paymentIntentId);
-    sendJson(res, 200, { ok: true, id: intent.id, status: intent.status });
+    const lookup = buildResultLookup({ apiKey: SOLA_API_KEY, sessionId, externalRequestId });
+    const result = await callSolaDevice("/session/result", lookup);
+    const interpreted = interpretResult(result.data);
+
+    if (!result.ok) {
+      sendJson(res, 400, {
+        ok: false,
+        message: result.data.xError || result.data.message || "Sola result lookup failed.",
+        raw: result.data,
+      });
+      return;
+    }
+
+    sendJson(res, 200, {
+      ok: true,
+      approved: interpreted.approved,
+      pending: interpreted.pending,
+      declined: interpreted.declined,
+      status: interpreted.status,
+      refNum: result.data.xRefnum || result.data.xRefNum || "",
+      authCode: result.data.xAuthCode || "",
+      cardType: result.data.xCardType || "",
+      maskedCardNumber: result.data.xMaskedCardNumber || "",
+      message: result.data.xError || result.data.xResult || interpreted.status,
+      raw: result.data,
+    });
   } catch (error) {
-    logger.error("stripeCapturePaymentIntent failed", error);
-    sendJson(res, 500, { ok: false, message: error.message || "Could not capture payment." });
+    logger.error("solaDeviceResult failed", error);
+    sendJson(res, 500, { ok: false, message: error.message || "Sola result lookup failed." });
   }
 });
 

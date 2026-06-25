@@ -9,6 +9,7 @@ export const RESET_REQUESTS_KEY = "diamant-telecom-reset-requests-v1";
 export const PRODUCTS_KEY = "diamant-telecom-products-v1";
 export const STORE_LOCATIONS_KEY = "diamant-telecom-store-locations-v1";
 export const EMPLOYEE_LOCATIONS_KEY = "diamant-telecom-employee-locations-v1";
+export const STORE_DEVICES_KEY = "diamant-telecom-store-devices-v1";
 export const ADMIN_PIN = "admin123";
 export const FUNCTIONS_BASE_URL = import.meta.env.VITE_FUNCTIONS_BASE_URL || "";
 
@@ -18,7 +19,7 @@ export const defaultOrderHandlers = [
 ];
 export const defaultStoreLocations = ["Main store"];
 export const productCategories = ["Phone", "Accessory", "SIM", "Other"];
-export const paymentMethods = ["Cash", "CC", "Card", "Check", "Zelle", "Cash App", "Apple Pay", "Shopify POS", "Other"];
+export const paymentMethods = ["Cash", "CC", "Card", "Check", "Zelle", "Cash App", "Apple Pay", "Other"];
 export const repairStatuses = [
   "Received",
   "Diagnosing",

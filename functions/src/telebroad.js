@@ -141,9 +141,32 @@ function buildTelebroadPendingReport(payload) {
   };
 }
 
+// Build the HTTP request for Telebroad's POST /send/sms endpoint. Auth is HTTP
+// Basic (account username/password); parameters go in the JSON body.
+function buildTelebroadSmsRequest({ baseUrl, username, password, smsLine, to, message }) {
+  const url = `${String(baseUrl || "").replace(/\/$/, "")}/send/sms`;
+  const credentials = Buffer.from(`${username || ""}:${password || ""}`).toString("base64");
+  return {
+    url,
+    options: {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Basic ${credentials}`,
+      },
+      body: JSON.stringify({
+        sms_line: smsLine || "",
+        receiver: to || "",
+        msgdata: message || "",
+      }),
+    },
+  };
+}
+
 module.exports = {
   buildPendingCallTitle,
   buildTelebroadPendingReport,
+  buildTelebroadSmsRequest,
   extractCustomerPhone,
   isAnsweredCall,
   sanitizeCallDocId,
