@@ -831,6 +831,84 @@ exports.solaCreateCharge = onRequest(HTTP_OPTIONS, async (req, res) => {
   }
 });
 
+// Refund a previous Sola card sale by reference (the xRefNum returned when the
+// sale was charged). Uses the gateway cc:refund command, so no terminal is
+// needed to send the money back to the original card.
+exports.solaRefund = onRequest(HTTP_OPTIONS, async (req, res) => {
+  if (handleCors(req, res)) return;
+  if (req.method !== "POST") {
+    sendJson(res, 405, { error: "POST required" });
+    return;
+  }
+
+  const payload = getPayload(req);
+  const amount = Number.parseFloat(payload.amount || "0");
+  const refNum = payload.refNum || payload.xRefNum || payload.refnum || "";
+
+  if (!Number.isFinite(amount) || amount <= 0) {
+    sendJson(res, 400, { ok: false, message: "A valid refund amount is required." });
+    return;
+  }
+  if (!refNum) {
+    sendJson(res, 400, { ok: false, message: "The original transaction reference (refNum) is required." });
+    return;
+  }
+  if (!SOLA_API_KEY) {
+    sendJson(res, 501, {
+      ok: false,
+      message: "Sola is not configured yet. Set SOLA_API_KEY on Firebase Functions.",
+    });
+    return;
+  }
+
+  try {
+    const solaPayload = {
+      xKey: SOLA_API_KEY,
+      xVersion: "5.0.0",
+      xSoftwareName: "Diamant Telecom Reports",
+      xSoftwareVersion: "0.1.0",
+      xCommand: "cc:refund",
+      xAmount: amount.toFixed(2),
+      xRefNum: refNum,
+    };
+
+    const response = await fetch(`${SOLA_API_BASE_URL}${SOLA_CREATE_CHARGE_PATH}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(solaPayload),
+    });
+    const text = await response.text();
+    let data;
+    try {
+      data = text ? JSON.parse(text) : {};
+    } catch {
+      data = { message: text || "Sola returned a non-JSON response." };
+    }
+    const normalized = normalizeSolaCharge(data);
+    const approved = String(data.xResult || data.xStatus || data.status || "").toLowerCase() === "approved"
+      || String(data.xStatus || data.status || "").toLowerCase() === "success";
+
+    if (!response.ok || !approved) {
+      sendJson(res, 400, {
+        ok: false,
+        message: data.xError || data.xErrorCode || data.message || "Sola refund failed.",
+        ...normalized,
+      });
+      return;
+    }
+
+    sendJson(res, 200, {
+      ok: true,
+      message: data.xResult || data.message || "Sola refund approved.",
+      ...normalized,
+      status: "refunded",
+    });
+  } catch (error) {
+    logger.error("solaRefund failed", error);
+    sendJson(res, 500, { ok: false, message: error.message || "Sola refund failed." });
+  }
+});
+
 async function callSolaDevice(path, body) {
   const response = await fetch(`${SOLA_DEVICE_API_BASE_URL}${path}`, {
     method: "POST",

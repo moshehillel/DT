@@ -13,14 +13,31 @@ import { normalizeFirestoreDoc } from "./utils";
 let firebasePromise;
 let authPromise;
 
+function firebaseUnavailable() {
+  const error = new Error(
+    "Firebase Hosting config not available — running in local-only mode (data saved in this browser).",
+  );
+  error.code = "firebase-unavailable";
+  return error;
+}
+
 async function getFirebase() {
   if (!firebasePromise) {
     firebasePromise = fetch("/__/firebase/init.json")
-      .then((response) => {
-        if (!response.ok) throw new Error("Firebase hosting config is not available.");
-        return response.json();
-      })
-      .then((firebaseConfig) => {
+      .then(async (response) => {
+        // When the app is not served by Firebase Hosting (e.g. `vite` dev), this
+        // path returns index.html, so guard against a non-JSON response instead
+        // of letting JSON.parse throw a noisy error for every collection.
+        const text = await response.text();
+        let firebaseConfig;
+        try {
+          firebaseConfig = JSON.parse(text);
+        } catch {
+          throw firebaseUnavailable();
+        }
+        if (!response.ok || !firebaseConfig || !firebaseConfig.projectId) {
+          throw firebaseUnavailable();
+        }
         const app = initializeApp(firebaseConfig);
         return {
           auth: getAuth(app),
@@ -30,6 +47,21 @@ async function getFirebase() {
   }
 
   return firebasePromise;
+}
+
+let offlineLogged = false;
+
+// Collapses the "no Firebase config" case into a single friendly message, while
+// still surfacing real Firestore errors.
+export function logSyncError(scope, error) {
+  if (error && error.code === "firebase-unavailable") {
+    if (!offlineLogged) {
+      offlineLogged = true;
+      console.info("Diamant Telecom: Firestore sync is off (local-only mode). Data is saved in this browser.");
+    }
+    return;
+  }
+  console.error(scope, error);
 }
 
 export async function ensureFirebaseAuth() {

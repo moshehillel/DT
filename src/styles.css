@@ -174,8 +174,11 @@ button:active {
   padding: 24px;
   display: flex;
   flex-direction: column;
-  gap: 22px;
+  gap: 18px;
   border-right: 1px solid #223240;
+  position: sticky;
+  top: 0;
+  height: 100vh;
 }
 
 .brand {
@@ -194,6 +197,24 @@ button:active {
   box-shadow: 0 10px 22px rgba(15, 118, 110, 0.24);
   font-weight: 800;
   font-size: 22px;
+}
+
+.brand-logo {
+  background: none;
+  box-shadow: none;
+  width: auto;
+  height: 42px;
+  max-width: 150px;
+  border-radius: 8px;
+  object-fit: contain;
+}
+
+.receipt-logo {
+  display: block;
+  max-width: 180px;
+  max-height: 72px;
+  margin: 0 auto 8px;
+  object-fit: contain;
 }
 
 .brand h1,
@@ -231,6 +252,32 @@ button:active {
 
 .report-tabs {
   display: grid;
+  gap: 10px;
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  align-content: start;
+  padding-right: 4px;
+}
+
+.nav-section-title {
+  margin: 8px 2px 0;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: #8fa3b3;
+}
+
+.report-tabs .nav-section-title:first-child {
+  margin-top: 0;
+}
+
+.sidebar-account {
+  margin-top: auto;
+  padding-top: 16px;
+  border-top: 1px solid #223240;
+  display: flex;
+  flex-direction: column;
   gap: 10px;
 }
 
@@ -719,12 +766,18 @@ textarea:focus {
 
 .filters {
   display: grid;
-  grid-template-columns: minmax(220px, 1.6fr) repeat(4, minmax(140px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(170px, 1fr));
+  align-items: end;
+  gap: 12px;
   margin-bottom: 16px;
-  padding: 14px;
+  padding: 16px;
   border: 1px solid var(--line);
-  border-radius: 8px;
+  border-radius: 12px;
   background: #f8fafb;
+}
+
+.filters .field:first-child {
+  grid-column: span 2;
 }
 
 .align-end {
@@ -1637,5 +1690,134 @@ tr:last-child td {
   .history-header .pos-search {
     width: 100%;
     flex: 1 1 100%;
+  }
+}
+
+.return-lines {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  max-height: 320px;
+  overflow-y: auto;
+  margin: 4px 0;
+}
+
+.return-line {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 12px;
+  border: 1px solid #e6e6ef;
+  border-radius: 12px;
+  background: #fafaff;
+}
+
+.return-line-info {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.return-line-controls {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 260px;
+}
+
+.return-qty-field {
+  width: 140px;
+}
+
+.return-summary {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 18px;
+  padding: 10px 0;
+  border-top: 1px solid #e6e6ef;
+  margin-top: 4px;
+}
+
+.order-items {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 16px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: #f8fafb;
+}
+
+.order-items-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.order-item-row {
+  display: flex;
+  gap: 10px;
+  align-items: flex-end;
+}
+
+.order-item-row .field {
+  flex: 1 1 auto;
+}
+
+.order-item-qty {
+  flex: 0 0 90px;
+}
+
+.order-item-price {
+  flex: 0 0 130px;
+}
+
+.order-item-remove {
+  flex: 0 0 auto;
+  font-size: 18px;
+  line-height: 1;
+}
+
+.order-items-total {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 16px;
+  border-top: 1px solid var(--line);
+  padding-top: 12px;
+}
+
+.status-pill {
+  display: inline-block;
+  padding: 3px 10px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.status-pill.returned {
+  background: #fde8e8;
+  color: #9b1c1c;
+}
+
+@media (max-width: 720px) {
+  .order-item-row {
+    flex-wrap: wrap;
+  }
+
+  .order-item-qty,
+  .order-item-price {
+    flex: 1 1 100px;
+  }
+}
+
+@media (max-width: 720px) {
+  .return-line {
+    flex-direction: column;
+  }
+
+  .return-line-controls {
+    min-width: 0;
   }
 }

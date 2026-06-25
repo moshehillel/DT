@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import {
+  logSyncError,
   replaceAppStateDocument,
   syncCollectionItems,
   upsertCollectionItems,
@@ -45,7 +46,7 @@ export function useCloudCollectionState(collectionName, localKey, fallback) {
           upsertCollectionItems(collectionName, valueRef.current)
             .catch((error) => {
               saveQueuedRef.current = false;
-              console.error(`Firestore ${collectionName} bootstrap failed`, error);
+              logSyncError(`Firestore ${collectionName} bootstrap failed`, error);
             });
           return;
         }
@@ -69,7 +70,7 @@ export function useCloudCollectionState(collectionName, localKey, fallback) {
         pendingWritesRef.current += 1;
         syncCollectionItems(collectionName, current, normalized)
           .catch((error) => {
-            console.error(`Firestore ${collectionName} sync failed`, error);
+            logSyncError(`Firestore ${collectionName} sync failed`, error);
           })
           .finally(() => {
             pendingWritesRef.current = Math.max(0, pendingWritesRef.current - 1);
@@ -105,7 +106,7 @@ export function useCloudDocumentState(documentId, localKey, fallback) {
           replaceAppStateDocument(documentId, valueRef.current)
             .catch((error) => {
               saveQueuedRef.current = false;
-              console.error(`Firestore appState/${documentId} sync failed`, error);
+              logSyncError(`Firestore appState/${documentId} sync failed`, error);
             });
           return;
         }
@@ -124,7 +125,9 @@ export function useCloudDocumentState(documentId, localKey, fallback) {
         : nextValueOrUpdater;
 
       if (cloudReadyRef.current) {
-        replaceAppStateDocument(documentId, nextValue).catch(console.error);
+        replaceAppStateDocument(documentId, nextValue).catch((error) =>
+          logSyncError(`Firestore appState/${documentId} sync failed`, error),
+        );
       }
 
       return nextValue;

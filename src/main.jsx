@@ -27,7 +27,7 @@ import {
 } from "./constants";
 import { useCloudCollectionState, useCloudDocumentState } from "./hooks/useCloudState";
 import { attachAuthMetadata, ensureFirebaseAuth } from "./firebaseClient";
-import { chargeOnDevice } from "./solaTerminal";
+import { chargeOnDevice, refundToCard } from "./solaTerminal";
 import {
   buildAppNotifications,
   calculateInclusiveDays,
@@ -86,6 +86,7 @@ function App() {
   const [filters, setFilters] = useState(createEmptyFilters);
   const [formNonce, setFormNonce] = useState(0);
   const [dialogOpen, setDialogOpen] = useState(false);
+  const [returnTarget, setReturnTarget] = useState(null);
 
   useEffect(() => {
     if (!employees.includes(activeEmployee)) {
@@ -117,6 +118,8 @@ function App() {
   const filteredReports = useMemo(() => {
     const query = filters.query.trim().toLowerCase();
     const phoneQuery = digitsOnly(query);
+    const itemQuery = filters.item.trim().toLowerCase();
+    const nameQuery = filters.customerName.trim().toLowerCase();
     const amountMin = Number.parseFloat(filters.amountMin);
     const amountMax = Number.parseFloat(filters.amountMax);
     const dateFrom = filters.dateFrom ? new Date(`${filters.dateFrom}T00:00:00`) : null;
@@ -141,12 +144,31 @@ function App() {
         .join(" ")
         .toLowerCase();
       const searchableDigits = digitsOnly(searchable);
+      const reportLocation = report.location || report.details?.location || "";
+      const itemSearchable = [
+        report.details?.model,
+        report.details?.itemsText,
+        report.details?.imei,
+        report.details?.simNumber,
+        report.details?.simPhone,
+        ...(report.details?.lineItems || []).flatMap((line) => [line.name, line.sku, line.imei]),
+      ]
+        .filter(Boolean)
+        .join(" ")
+        .toLowerCase();
+      const nameSearchable = [report.details?.customerName, report.details?.callerName]
+        .filter(Boolean)
+        .join(" ")
+        .toLowerCase();
 
       return (
         (filters.type === "all" || report.type === filters.type) &&
         (sessionRole !== "admin" || filters.employee === "all" || report.servedBy === filters.employee) &&
         (filters.paymentMethod === "all" || report.paymentMethod === filters.paymentMethod) &&
         (filters.status === "all" || report.details?.status === filters.status) &&
+        (filters.location === "all" || reportLocation === filters.location) &&
+        (!itemQuery || itemSearchable.includes(itemQuery)) &&
+        (!nameQuery || nameSearchable.includes(nameQuery)) &&
         (!dateFrom || (reportDate && reportDate >= dateFrom)) &&
         (!dateTo || (reportDate && reportDate <= dateTo)) &&
         (!Number.isFinite(amountMin) || reportAmount >= amountMin) &&
@@ -155,6 +177,11 @@ function App() {
       );
     });
   }, [employeeCanSeeReport, filters, reports, sessionRole]);
+
+  const visibleReports = useMemo(
+    () => (sessionRole === "admin" ? reports : reports.filter(employeeCanSeeReport)),
+    [employeeCanSeeReport, reports, sessionRole],
+  );
 
   const visibleEmployees = sessionRole === "admin" ? employees : [activeEmployee];
   const visibleNotifications = useMemo(() => {
@@ -370,6 +397,8 @@ function App() {
         contactDetails: order.contactDetails,
         address: order.address,
         model: order.model,
+        itemsText: order.itemsText || order.model,
+        lineItems: order.lineItems || [],
         orderTotal: order.orderTotal,
         paymentStatus: order.paymentStatus,
         createdBy: order.createdBy,
@@ -537,6 +566,105 @@ function App() {
     setReports([]);
   }
 
+  function deleteReport(reportId) {
+    if (sessionRole !== "admin") {
+      window.alert("Only admin can delete reports.");
+      return;
+    }
+    const report = reports.find((item) => item.id === reportId);
+    const label = report ? reportTypes[report.type]?.label || report.type : "report";
+    const confirmed = window.confirm(
+      `Delete this ${label} report? This removes it for everyone and cannot be undone.`,
+    );
+    if (!confirmed) return;
+    setReports((current) => current.filter((item) => item.id !== reportId));
+  }
+
+  async function processReturn(original, selection) {
+    const returnLines = (selection.returnLines || []).filter((line) => Number(line.returnQty) > 0);
+    if (!returnLines.length) return;
+
+    const refundTotal = returnLines.reduce(
+      (sum, line) => sum + (Number(line.price) || 0) * (Number(line.returnQty) || 0),
+      0,
+    );
+    const itemsText = returnLines
+      .map((line) => `${line.returnQty}x ${line.name}${line.imei ? ` (IMEI ${line.imei})` : ""}`)
+      .join(", ");
+    const imeiLine = returnLines.find((line) => line.requiresImei && line.imei);
+
+    const returnReport = await attachAuthMetadata({
+      id: crypto.randomUUID(),
+      type: "return",
+      source: "return",
+      createdAt: new Date().toISOString(),
+      servedBy: activeEmployee,
+      location: original.location || original.details?.location || activeLocation,
+      customerPhone: original.customerPhone || "",
+      customerPhoneDigits: digitsOnly(original.customerPhone),
+      paymentAmount: (-refundTotal).toFixed(2),
+      paymentMethod: selection.refundMethod || original.paymentMethod || "",
+      notes: selection.notes || "",
+      details: {
+        request: "Return / refund",
+        originalReportId: original.id,
+        refundMethod: selection.refundMethod || original.paymentMethod || "",
+        refundTotal: refundTotal.toFixed(2),
+        solaRefundRef: selection.solaRefundRef || "",
+        itemsText,
+        model: itemsText,
+        imei: imeiLine?.imei || "",
+        lineItems: returnLines.map((line) => ({
+          productId: line.productId,
+          sku: line.sku,
+          name: line.name,
+          price: line.price,
+          qty: line.returnQty,
+          imei: line.imei || "",
+          requiresImei: Boolean(line.requiresImei),
+        })),
+      },
+    });
+
+    // Record the refund and remember how much of each original line was returned.
+    setReports((current) => [
+      returnReport,
+      ...current.map((report) => {
+        if (report.id !== original.id) return report;
+        const returnedByIndex = { ...(report.details?.returnedByIndex || {}) };
+        returnLines.forEach((line) => {
+          returnedByIndex[line.lineIndex] = (returnedByIndex[line.lineIndex] || 0) + Number(line.returnQty);
+        });
+        const originalLines = report.details?.lineItems || [];
+        const fullyReturned = originalLines.length > 0 && originalLines.every((item, index) => {
+          const soldQty = item.requiresImei ? 1 : Number(item.qty) || 1;
+          return (returnedByIndex[index] || 0) >= soldQty;
+        });
+        const returnStatus = fullyReturned ? "Fully returned" : "Partially returned";
+        return { ...report, details: { ...report.details, returnedByIndex, returnStatus } };
+      }),
+    ]);
+
+    // Put the returned units back into stock (scanned IMEIs rejoin the lot).
+    setProducts((current) =>
+      current.map((product) => {
+        const lines = returnLines.filter((line) => line.productId === product.id);
+        if (!lines.length) return product;
+        if (product.requiresImei) {
+          const returnedImeis = lines.map((line) => line.imei).filter(Boolean);
+          const merged = [...new Set([...(product.imeis || []), ...returnedImeis])];
+          return { ...product, imeis: merged, quantity: merged.length, updatedAt: new Date().toISOString() };
+        }
+        const addQty = lines.reduce((sum, line) => sum + (Number(line.returnQty) || 0), 0);
+        return {
+          ...product,
+          quantity: (Number(product.quantity) || 0) + addQty,
+          updatedAt: new Date().toISOString(),
+        };
+      }),
+    );
+  }
+
   function login({ employeeName, role, pin }) {
     const name = employeeName.trim();
     if (!name) return;
@@ -681,13 +809,17 @@ function App() {
 
             <ReportHistory
               employees={visibleEmployees}
+              storeLocations={storeLocations}
               reports={filteredReports}
               filters={filters}
               onFiltersChange={setFilters}
               onClearFilters={() => setFilters(createEmptyFilters())}
               onStatusChange={updateRepairStatus}
               onExport={() => exportCsv(filteredReports)}
+              onExportAll={() => exportCsv(visibleReports)}
               onClearReports={clearReports}
+              onDeleteReport={sessionRole === "admin" ? deleteReport : null}
+              onReturn={setReturnTarget}
               notifications={visibleNotifications}
             />
           </>
@@ -738,6 +870,14 @@ function App() {
           onClose={() => setDialogOpen(false)}
         />
       )}
+
+      {returnTarget && (
+        <ReturnDialog
+          report={returnTarget}
+          onClose={() => setReturnTarget(null)}
+          onSubmit={processReturn}
+        />
+      )}
     </div>
   );
 }
@@ -757,7 +897,7 @@ function LoginPage({ employees, defaultEmployee, onLogin, onResetPassword }) {
       <section className="login-shell">
         <div className="login-aside">
           <div className="brand">
-            <span className="brand-mark">D</span>
+            <img className="brand-mark brand-logo" src="/logo.webp" alt="Diamant Telecom" />
             <div>
               <h1>Diamant Telecom</h1>
               <p>Store reports</p>
@@ -777,7 +917,7 @@ function LoginPage({ employees, defaultEmployee, onLogin, onResetPassword }) {
 
         <div className="login-panel">
           <div className="brand login-brand">
-            <span className="brand-mark">D</span>
+            <img className="brand-mark brand-logo" src="/logo.webp" alt="Diamant Telecom" />
             <div>
               <h1>Diamant Telecom</h1>
               <p>Store reports</p>
@@ -861,94 +1001,53 @@ function Sidebar({
   return (
     <aside className="sidebar">
       <div className="brand">
-        <span className="brand-mark">D</span>
+        <img className="brand-mark brand-logo" src="/logo.webp" alt="Diamant Telecom" />
         <div>
           <h1>Diamant Telecom</h1>
           <p>Store reports</p>
         </div>
       </div>
 
-      <label className="field">
-        <span>{sessionRole === "admin" ? "Active employee" : "Signed in employee"}</span>
-        {sessionRole === "admin" ? (
-          <select value={activeEmployee} onChange={(event) => onEmployeeChange(event.target.value)}>
-            {employees.map((employee) => (
-              <option key={employee}>{employee}</option>
-            ))}
-          </select>
-        ) : (
-          <input value={activeEmployee} disabled readOnly />
-        )}
-      </label>
-
-      {sessionRole === "admin" ? (
-        <button className="ghost-button" type="button" onClick={onManageEmployees}>
-          Manage employees
-        </button>
-      ) : null}
-      {sessionRole === "admin" ? (
+      <nav className="report-tabs" aria-label="Navigation">
+        <p className="nav-section-title">Daily</p>
         <button
-          className={`ghost-button ${activeView === "admin" ? "active-ghost" : ""}`}
+          className={`tab pending-tab ${activeView === "pendingReports" ? "active" : ""}`}
           type="button"
-          onClick={() => onViewChange(activeView === "admin" ? "reports" : "admin")}
+          onClick={() => onViewChange("pendingReports")}
         >
-          {activeView === "admin" ? "Back to reports" : "Admin page"}
+          <span className="tab-mark">P</span>
+          <span>
+            <strong>Pending reports</strong>
+            <small>Claim Shopify & call imports</small>
+          </span>
         </button>
-      ) : null}
-      <button className="ghost-button" type="button" onClick={onLogout}>
-        Sign out
-      </button>
+        <button
+          className={`tab open-repairs-tab ${activeView === "openRepairs" ? "active" : ""}`}
+          type="button"
+          onClick={() => onViewChange("openRepairs")}
+        >
+          <span className="tab-mark">O</span>
+          <span>
+            <strong>Open repairs</strong>
+            <small>Active tickets</small>
+          </span>
+        </button>
 
-      <nav className="report-tabs" aria-label="Report type">
-          <button
-            className={`tab pending-tab ${activeView === "pendingReports" ? "active" : ""}`}
-            type="button"
-            onClick={() => onViewChange("pendingReports")}
-          >
-            <span className="tab-mark">P</span>
-            <span>
-              <strong>Pending reports</strong>
-              <small>Claim Shopify & call imports</small>
-            </span>
-          </button>
-          <button
-            className={`tab open-repairs-tab ${activeView === "openRepairs" ? "active" : ""}`}
-            type="button"
-            onClick={() => onViewChange("openRepairs")}
-          >
-            <span className="tab-mark">O</span>
-            <span>
-              <strong>Open repairs</strong>
-              <small>Active tickets</small>
-            </span>
-          </button>
-          <button
-            className={`tab pos-tab ${activeView === "pos" ? "active" : ""}`}
-            type="button"
-            onClick={() => onViewChange("pos")}
-          >
-            <span className="tab-mark">$</span>
-            <span>
-              <strong>Point of sale</strong>
-              <small>Scan items & checkout</small>
-            </span>
-          </button>
-          {sessionRole === "admin" ? (
-            <button
-              className={`tab inventory-tab ${activeView === "inventory" ? "active" : ""}`}
-              type="button"
-              onClick={() => onViewChange("inventory")}
-            >
-              <span className="tab-mark">I</span>
-              <span>
-                <strong>Inventory</strong>
-                <small>Catalog, stock & stores</small>
-              </span>
-            </button>
-          ) : null}
-          {manualReportTypeKeys.map((type) => {
-            const config = reportTypes[type];
-            return (
+        <p className="nav-section-title">Sell &amp; record</p>
+        <button
+          className={`tab pos-tab ${activeView === "pos" ? "active" : ""}`}
+          type="button"
+          onClick={() => onViewChange("pos")}
+        >
+          <span className="tab-mark">$</span>
+          <span>
+            <strong>Point of sale</strong>
+            <small>Scan items & checkout</small>
+          </span>
+        </button>
+        {manualReportTypeKeys.map((type) => {
+          const config = reportTypes[type];
+          return (
             <button
               className={`tab ${activeView === "reports" && activeType === type ? "active" : ""}`}
               type="button"
@@ -964,9 +1063,60 @@ function Sidebar({
                 <small>{config.description}</small>
               </span>
             </button>
-            );
-          })}
-        </nav>
+          );
+        })}
+
+        {sessionRole === "admin" ? (
+          <>
+            <p className="nav-section-title">Manage</p>
+            <button
+              className={`tab inventory-tab ${activeView === "inventory" ? "active" : ""}`}
+              type="button"
+              onClick={() => onViewChange("inventory")}
+            >
+              <span className="tab-mark">I</span>
+              <span>
+                <strong>Inventory</strong>
+                <small>Catalog, stock & stores</small>
+              </span>
+            </button>
+            <button
+              className={`tab ${activeView === "admin" ? "active" : ""}`}
+              type="button"
+              onClick={() => onViewChange("admin")}
+            >
+              <span className="tab-mark">A</span>
+              <span>
+                <strong>Admin</strong>
+                <small>Activity, audit & access</small>
+              </span>
+            </button>
+          </>
+        ) : null}
+      </nav>
+
+      <div className="sidebar-account">
+        <label className="field">
+          <span>{sessionRole === "admin" ? "Active employee" : "Signed in employee"}</span>
+          {sessionRole === "admin" ? (
+            <select value={activeEmployee} onChange={(event) => onEmployeeChange(event.target.value)}>
+              {employees.map((employee) => (
+                <option key={employee}>{employee}</option>
+              ))}
+            </select>
+          ) : (
+            <input value={activeEmployee} disabled readOnly />
+          )}
+        </label>
+        {sessionRole === "admin" ? (
+          <button className="ghost-button" type="button" onClick={onManageEmployees}>
+            Manage employees
+          </button>
+        ) : null}
+        <button className="ghost-button" type="button" onClick={onLogout}>
+          Sign out
+        </button>
+      </div>
     </aside>
   );
 }
@@ -1011,11 +1161,10 @@ function ReportForm({ activeType, activeEmployee, reports, onSave }) {
       savedReport.ticketDigits = details.ticketDigits;
     }
 
-    Promise.resolve(onSave(savedReport)).then(() => {
-      if (activeType === "repair") {
-        window.alert(`Repair ticket created: ${details.ticketNumber}`);
-      }
-    });
+    onSave(savedReport);
+    if (activeType === "repair") {
+      printRepairTicket(savedReport);
+    }
   }
 
   return (
@@ -1761,15 +1910,31 @@ function RentalReportForm({ activeEmployee, onSave }) {
 
 function ReportHistory({
   employees,
+  storeLocations,
   reports,
   filters,
   onFiltersChange,
   onClearFilters,
   onStatusChange,
   onExport,
+  onExportAll,
   onClearReports,
+  onDeleteReport,
+  onReturn,
   notifications,
 }) {
+  const hasActions = Boolean(onDeleteReport || onReturn);
+  const columnCount = hasActions ? 9 : 8;
+
+  const MAX_RANGE_DAYS = 30;
+  const hasRange = Boolean(filters.dateFrom && filters.dateTo);
+  const rangeDays = hasRange ? calculateInclusiveDays(filters.dateFrom, filters.dateTo) : 0;
+  const rangeTooLong = rangeDays > MAX_RANGE_DAYS;
+  const rangeReversed = hasRange && rangeDays === 0;
+  const rangeValid = hasRange && !rangeTooLong && !rangeReversed;
+  const maxToDate = filters.dateFrom
+    ? calculateReturnDueDate(filters.dateFrom, MAX_RANGE_DAYS - 1)
+    : "";
   const totals = reports.reduce(
     (acc, report) => {
       acc.count += 1;
@@ -1777,7 +1942,7 @@ function ReportHistory({
       acc[report.type] += 1;
       return acc;
     },
-        { count: 0, amount: 0, call: 0, sale: 0, repair: 0, sim: 0, rental: 0, phoneOrder: 0 },
+        { count: 0, amount: 0, call: 0, sale: 0, repair: 0, sim: 0, rental: 0, phoneOrder: 0, return: 0 },
   );
 
   function updateFilter(name, value) {
@@ -1792,7 +1957,10 @@ function ReportHistory({
           <h2>Reports</h2>
         </div>
         <div className="history-actions">
-          <button className="secondary-button" type="button" onClick={onExport}>Export CSV</button>
+          <button className="secondary-button" type="button" onClick={onExport} disabled={!rangeValid}>Export view (CSV)</button>
+          {onExportAll ? (
+            <button className="secondary-button" type="button" onClick={onExportAll}>Export all (CSV)</button>
+          ) : null}
           <button className="danger-button" type="button" onClick={onClearReports}>Clear local data</button>
         </div>
       </div>
@@ -1816,6 +1984,7 @@ function ReportHistory({
             <option value="sim">SIM activations</option>
             <option value="rental">Phone rentals</option>
             <option value="phoneOrder">Phone orders</option>
+            <option value="return">Returns</option>
           </select>
         </label>
         <label className="field">
@@ -1846,12 +2015,37 @@ function ReportHistory({
           </select>
         </label>
         <label className="field">
-          <span>From date</span>
-          <input type="date" value={filters.dateFrom} onChange={(event) => updateFilter("dateFrom", event.target.value)} />
+          <span>Store</span>
+          <select value={filters.location} onChange={(event) => updateFilter("location", event.target.value)}>
+            <option value="all">All stores</option>
+            {(storeLocations || []).map((location) => (
+              <option value={location} key={location}>{location}</option>
+            ))}
+          </select>
         </label>
         <label className="field">
-          <span>To date</span>
-          <input type="date" value={filters.dateTo} onChange={(event) => updateFilter("dateTo", event.target.value)} />
+          <span>Item / model</span>
+          <input
+            value={filters.item}
+            onChange={(event) => updateFilter("item", event.target.value)}
+            placeholder="Model, item, SKU, IMEI"
+          />
+        </label>
+        <label className="field">
+          <span>Customer name</span>
+          <input
+            value={filters.customerName}
+            onChange={(event) => updateFilter("customerName", event.target.value)}
+            placeholder="Customer or caller name"
+          />
+        </label>
+        <label className="field">
+          <span>From date</span>
+          <input type="date" value={filters.dateFrom} max={filters.dateTo || undefined} onChange={(event) => updateFilter("dateFrom", event.target.value)} required />
+        </label>
+        <label className="field">
+          <span>To date (max 30 days)</span>
+          <input type="date" value={filters.dateTo} min={filters.dateFrom || undefined} max={maxToDate || undefined} onChange={(event) => updateFilter("dateTo", event.target.value)} required />
         </label>
         <label className="field">
           <span>Min paid</span>
@@ -1866,6 +2060,8 @@ function ReportHistory({
         </button>
       </div>
 
+      {rangeValid ? (
+      <>
       <div className="summary-strip">
         <span className="metric">Reports <strong>{totals.count}</strong></span>
         <span className="metric">Payments <strong>{formatMoney(totals.amount)}</strong></span>
@@ -1875,6 +2071,7 @@ function ReportHistory({
         <span className="metric">SIM <strong>{totals.sim}</strong></span>
         <span className="metric">Rentals <strong>{totals.rental}</strong></span>
         <span className="metric">Orders <strong>{totals.phoneOrder}</strong></span>
+        <span className="metric">Returns <strong>{totals.return}</strong></span>
         <span className="metric">Queued notices <strong>{notifications.length}</strong></span>
       </div>
 
@@ -1890,6 +2087,7 @@ function ReportHistory({
               <th>Method</th>
               <th>Served by</th>
               <th>Status</th>
+              {hasActions ? <th></th> : null}
             </tr>
           </thead>
           <tbody>
@@ -1899,16 +2097,29 @@ function ReportHistory({
                   report={report}
                   key={report.id}
                   onStatusChange={onStatusChange}
+                  onDeleteReport={onDeleteReport}
+                  onReturn={onReturn}
+                  hasActions={hasActions}
                 />
               ))
             ) : (
               <tr>
-                <td colSpan="8" className="empty-state">No reports match this view.</td>
+                <td colSpan={columnCount} className="empty-state">No reports match this view.</td>
               </tr>
             )}
           </tbody>
         </table>
       </div>
+      </>
+      ) : (
+        <p className="empty-state">
+          {rangeReversed
+            ? "The from date is after the to date."
+            : rangeTooLong
+              ? `Pick a range of ${MAX_RANGE_DAYS} days or fewer (you selected ${rangeDays} days), or use Export all (CSV) for the full history.`
+              : "Select a date range (max 30 days) to view reports. Use Export all (CSV) to download the full history."}
+        </p>
+      )}
       {notifications.length ? (
         <div className="notification-panel">
           <div>
@@ -2277,12 +2488,21 @@ function PhoneOrderPage({ activeEmployee, sessionRole, phoneOrders, orderHandler
     customerPhone: "",
     contactDetails: "",
     address: "",
-    model: "",
-    orderTotal: "",
     paymentStatus: "Paid",
     paymentMethod: "Cash",
     notes: "",
   });
+  const [items, setItems] = useState([{ id: crypto.randomUUID(), name: "", qty: "1", price: "" }]);
+
+  function updateItem(id, patch) {
+    setItems((current) => current.map((item) => (item.id === id ? { ...item, ...patch } : item)));
+  }
+  function addItem() {
+    setItems((current) => [...current, { id: crypto.randomUUID(), name: "", qty: "1", price: "" }]);
+  }
+  function removeItem(id) {
+    setItems((current) => (current.length > 1 ? current.filter((item) => item.id !== id) : current));
+  }
 
   useEffect(() => {
     const timer = window.setInterval(() => setNow(new Date()), 30000);
@@ -2310,12 +2530,19 @@ function PhoneOrderPage({ activeEmployee, sessionRole, phoneOrders, orderHandler
   const visibleOrders = sessionRole === "admin"
     ? phoneOrders
     : phoneOrders.filter((order) => order.assignedTo === activeEmployee);
+  const validItems = items.filter((item) => item.name.trim());
+  const orderTotal = validItems.reduce(
+    (sum, item) => sum + (Number(item.price) || 0) * (Number(item.qty) || 1),
+    0,
+  );
+  const itemsText = validItems
+    .map((item) => `${Number(item.qty) || 1}x ${item.name.trim()}`)
+    .join(", ");
   const canCreate = form.location.trim()
     && form.assignedTo.trim()
     && form.customerPhone.trim()
     && form.address.trim()
-    && form.model.trim()
-    && form.orderTotal.trim()
+    && validItems.length > 0
     && form.paymentStatus.trim();
 
   function updateField(name, value) {
@@ -2347,8 +2574,14 @@ function PhoneOrderPage({ activeEmployee, sessionRole, phoneOrders, orderHandler
       customerPhoneDigits: digitsOnly(form.customerPhone),
       contactDetails: form.contactDetails.trim(),
       address: form.address.trim(),
-      model: form.model.trim(),
-      orderTotal: form.orderTotal.trim(),
+      model: itemsText,
+      itemsText,
+      lineItems: validItems.map((item) => ({
+        name: item.name.trim(),
+        qty: Number(item.qty) || 1,
+        price: Number(item.price) || 0,
+      })),
+      orderTotal: orderTotal.toFixed(2),
       paymentStatus: form.paymentStatus,
       paymentMethod: form.paymentMethod,
       notes: form.notes.trim(),
@@ -2410,15 +2643,57 @@ function PhoneOrderPage({ activeEmployee, sessionRole, phoneOrders, orderHandler
           </label>
         </div>
 
-        <div className="form-grid">
-          <label className="field">
-            <span>Phone / order</span>
-            <input value={form.model} onChange={(event) => updateField("model", event.target.value)} placeholder="iPhone 15, case, charger..." required />
-          </label>
-          <label className="field">
+        <div className="order-items">
+          <div className="order-items-head">
+            <p className="form-section-title">Items</p>
+            <button className="secondary-button compact-button" type="button" onClick={addItem}>Add item</button>
+          </div>
+          {items.map((item, index) => (
+            <div className="order-item-row" key={item.id}>
+              <label className="field">
+                {index === 0 ? <span>Item / model</span> : null}
+                <input
+                  value={item.name}
+                  onChange={(event) => updateItem(item.id, { name: event.target.value })}
+                  placeholder="iPhone 15, case, charger..."
+                />
+              </label>
+              <label className="field order-item-qty">
+                {index === 0 ? <span>Qty</span> : null}
+                <input
+                  type="number"
+                  min="1"
+                  value={item.qty}
+                  onChange={(event) => updateItem(item.id, { qty: event.target.value })}
+                />
+              </label>
+              <label className="field order-item-price">
+                {index === 0 ? <span>Unit price</span> : null}
+                <input
+                  inputMode="decimal"
+                  value={item.price}
+                  onChange={(event) => updateItem(item.id, { price: event.target.value })}
+                  placeholder="0.00"
+                />
+              </label>
+              <button
+                className="secondary-button compact-button order-item-remove"
+                type="button"
+                onClick={() => removeItem(item.id)}
+                disabled={items.length === 1}
+                aria-label="Remove item"
+              >
+                ×
+              </button>
+            </div>
+          ))}
+          <div className="order-items-total">
             <span>Order total</span>
-            <input inputMode="decimal" value={form.orderTotal} onChange={(event) => updateField("orderTotal", event.target.value)} required />
-          </label>
+            <strong>{formatMoney(orderTotal)}</strong>
+          </div>
+        </div>
+
+        <div className="form-grid">
           <label className="field">
             <span>Payment status</span>
             <select value={form.paymentStatus} onChange={(event) => updateField("paymentStatus", event.target.value)}>
@@ -2703,6 +2978,7 @@ function PosPage({ products, activeEmployee, activeLocation, activeDeviceId, onC
     };
     onCompleteSale(sale);
     setCompletedSale(sale);
+    printSaleReceipt(sale);
     setCart([]);
     setCustomerPhone("");
     setNotes("");
@@ -2943,6 +3219,121 @@ function PosPage({ products, activeEmployee, activeLocation, activeDeviceId, onC
   );
 }
 
+// Opens a print window and prints an 80mm-style sale receipt. Reused for both
+// the manual "Print receipt" button and the automatic print on checkout.
+function printSaleReceipt(sale) {
+  const details = sale.details || {};
+  const lines = details.lineItems || [];
+  const total = Number(sale.paymentAmount) || 0;
+  const soldAt = toJsDate(sale.createdAt) || new Date();
+  const logoUrl = `${window.location.origin}/logo.webp`;
+
+  const printWindow = window.open("", "_blank", "width=380,height=640");
+  if (!printWindow) {
+    window.print();
+    return;
+  }
+  const rows = lines
+    .map(
+      (line) => `
+        <tr>
+          <td>${line.qty}x ${escapeHtml(line.name)}${line.imei ? `<br/><small>IMEI ${escapeHtml(line.imei)}</small>` : ""}</td>
+          <td style="text-align:right">${formatMoney((Number(line.price) || 0) * (Number(line.qty) || 0))}</td>
+        </tr>`,
+    )
+    .join("");
+  printWindow.document.write(`
+    <html>
+      <head>
+        <title>Receipt</title>
+        <style>
+          body { font-family: ui-sans-serif, system-ui, sans-serif; padding: 16px; color: #111; }
+          h2 { margin: 0 0 2px; }
+          .receipt-logo { display: block; max-width: 180px; max-height: 70px; margin: 0 auto 8px; object-fit: contain; }
+          .meta { font-size: 12px; color: #555; margin-bottom: 12px; }
+          table { width: 100%; border-collapse: collapse; font-size: 13px; }
+          td { padding: 6px 0; border-bottom: 1px dashed #ccc; vertical-align: top; }
+          .total { font-size: 16px; font-weight: 700; margin-top: 12px; display: flex; justify-content: space-between; }
+          .thanks { text-align: center; margin-top: 16px; font-size: 12px; color: #555; }
+        </style>
+      </head>
+      <body>
+        <img class="receipt-logo" src="${logoUrl}" alt="Diamant Telecom" onerror="this.style.display='none'" />
+        <h2>Diamant Telecom</h2>
+        <div class="meta">
+          ${escapeHtml(details.location || "")}<br/>
+          ${soldAt.toLocaleString()}<br/>
+          Cashier: ${escapeHtml(sale.servedBy || "")}${sale.customerPhone ? `<br/>Customer: ${escapeHtml(sale.customerPhone)}` : ""}
+        </div>
+        <table>${rows}</table>
+        <div class="total"><span>Total</span><span>${formatMoney(total)}</span></div>
+        <div class="meta" style="margin-top:6px">Paid by ${escapeHtml(sale.paymentMethod || "")}</div>
+        <div class="thanks">Thank you!</div>
+      </body>
+    </html>`);
+  printWindow.document.close();
+  printWindow.focus();
+  printWindow.print();
+}
+
+// Prints a repair drop-off ticket with the generated ticket number so the
+// customer has a claim slip for pickup.
+function printRepairTicket(report) {
+  const details = report.details || {};
+  const createdAt = (toJsDate(report.createdAt) || new Date()).toLocaleString();
+  const logoUrl = `${window.location.origin}/logo.webp`;
+
+  const printWindow = window.open("", "_blank", "width=380,height=640");
+  if (!printWindow) {
+    window.print();
+    return;
+  }
+  const rowsSource = [
+    ["Phone", report.customerPhone],
+    ["Model", details.model],
+    ["Issue", details.damage],
+    ["Paid", details.paymentStatus],
+    ["Expected ready", details.dueDate],
+    ["Notify by", details.notificationPreference],
+    ["Served by", report.servedBy],
+  ];
+  const rows = rowsSource
+    .filter(([, value]) => value)
+    .map(([label, value]) => `<tr><td>${escapeHtml(label)}</td><td style="text-align:right">${escapeHtml(String(value))}</td></tr>`)
+    .join("");
+  printWindow.document.write(`
+    <html>
+      <head>
+        <title>Repair ticket ${escapeHtml(details.ticketNumber || "")}</title>
+        <style>
+          body { font-family: ui-sans-serif, system-ui, sans-serif; padding: 16px; color: #111; }
+          h2 { margin: 0 0 2px; text-align: center; }
+          .receipt-logo { display: block; max-width: 180px; max-height: 70px; margin: 0 auto 8px; object-fit: contain; }
+          .eyebrow { text-align: center; font-size: 12px; color: #555; text-transform: uppercase; letter-spacing: 1px; }
+          .ticket { text-align: center; font-size: 26px; font-weight: 800; margin: 10px 0; letter-spacing: 1px; }
+          .meta { font-size: 12px; color: #555; text-align: center; margin-bottom: 12px; }
+          table { width: 100%; border-collapse: collapse; font-size: 13px; }
+          td { padding: 6px 0; border-bottom: 1px dashed #ccc; vertical-align: top; }
+          .notes { font-size: 12px; color: #555; margin-top: 10px; }
+          .thanks { text-align: center; margin-top: 16px; font-size: 12px; color: #555; }
+        </style>
+      </head>
+      <body>
+        <img class="receipt-logo" src="${logoUrl}" alt="Diamant Telecom" onerror="this.style.display='none'" />
+        <h2>Diamant Telecom</h2>
+        <div class="eyebrow">Repair ticket</div>
+        <div class="ticket">${escapeHtml(details.ticketNumber || "")}</div>
+        <div class="meta">${createdAt}</div>
+        <table>${rows}</table>
+        ${report.notes ? `<div class="notes">Notes: ${escapeHtml(report.notes)}</div>` : ""}
+        <div class="thanks">Keep this ticket for pickup. Thank you!</div>
+      </body>
+    </html>`);
+  printWindow.document.close();
+  printWindow.focus();
+  printWindow.print();
+}
+
 function SaleReceiptDialog({ sale, onClose }) {
   const details = sale.details || {};
   const lines = details.lineItems || [];
@@ -2950,55 +3341,13 @@ function SaleReceiptDialog({ sale, onClose }) {
   const soldAt = toJsDate(sale.createdAt) || new Date();
 
   function printReceipt() {
-    const printWindow = window.open("", "_blank", "width=380,height=640");
-    if (!printWindow) {
-      window.print();
-      return;
-    }
-    const rows = lines
-      .map(
-        (line) => `
-          <tr>
-            <td>${line.qty}x ${escapeHtml(line.name)}${line.imei ? `<br/><small>IMEI ${escapeHtml(line.imei)}</small>` : ""}</td>
-            <td style="text-align:right">${formatMoney((Number(line.price) || 0) * (Number(line.qty) || 0))}</td>
-          </tr>`,
-      )
-      .join("");
-    printWindow.document.write(`
-      <html>
-        <head>
-          <title>Receipt</title>
-          <style>
-            body { font-family: ui-sans-serif, system-ui, sans-serif; padding: 16px; color: #111; }
-            h2 { margin: 0 0 2px; }
-            .meta { font-size: 12px; color: #555; margin-bottom: 12px; }
-            table { width: 100%; border-collapse: collapse; font-size: 13px; }
-            td { padding: 6px 0; border-bottom: 1px dashed #ccc; vertical-align: top; }
-            .total { font-size: 16px; font-weight: 700; margin-top: 12px; display: flex; justify-content: space-between; }
-            .thanks { text-align: center; margin-top: 16px; font-size: 12px; color: #555; }
-          </style>
-        </head>
-        <body>
-          <h2>Diamant Telecom</h2>
-          <div class="meta">
-            ${escapeHtml(details.location || "")}<br/>
-            ${soldAt.toLocaleString()}<br/>
-            Cashier: ${escapeHtml(sale.servedBy || "")}${sale.customerPhone ? `<br/>Customer: ${escapeHtml(sale.customerPhone)}` : ""}
-          </div>
-          <table>${rows}</table>
-          <div class="total"><span>Total</span><span>${formatMoney(total)}</span></div>
-          <div class="meta" style="margin-top:6px">Paid by ${escapeHtml(sale.paymentMethod || "")}</div>
-          <div class="thanks">Thank you!</div>
-        </body>
-      </html>`);
-    printWindow.document.close();
-    printWindow.focus();
-    printWindow.print();
+    printSaleReceipt(sale);
   }
 
   return (
     <div className="dialog-backdrop" role="presentation">
       <div className="dialog-card receipt-card" role="dialog" aria-modal="true">
+        <img className="receipt-logo" src="/logo.webp" alt="Diamant Telecom" />
         <div className="receipt-success">
           <span className="receipt-check" aria-hidden="true">&#10003;</span>
           <div>
@@ -3575,7 +3924,7 @@ function AdminPage({
           acc[report.type] += 1;
           return acc;
         },
-        { amount: 0, call: 0, sale: 0, repair: 0, sim: 0, rental: 0, phoneOrder: 0 },
+        { amount: 0, call: 0, sale: 0, repair: 0, sim: 0, rental: 0, phoneOrder: 0, return: 0 },
       );
       const lastReport = employeeReports[0];
       return { employee, count: employeeReports.length, totals, lastReport };
@@ -3753,7 +4102,11 @@ function AdminPage({
   );
 }
 
-function ReportRow({ report, onStatusChange }) {
+function ReportRow({ report, onStatusChange, onDeleteReport, onReturn, hasActions }) {
+  const saleLineItems = report.details?.lineItems || [];
+  const returnableType = report.type === "sale" || report.type === "phoneOrder";
+  const fullyReturned = report.details?.returnStatus === "Fully returned";
+  const canReturn = Boolean(onReturn) && returnableType && saleLineItems.length > 0 && !fullyReturned;
   return (
     <tr>
       <td>{formatShortDate(report.createdAt)}</td>
@@ -3774,10 +4127,34 @@ function ReportRow({ report, onStatusChange }) {
               <option key={status}>{status}</option>
             ))}
           </select>
+        ) : report.details?.returnStatus ? (
+          <span className="status-pill returned">{report.details.returnStatus}</span>
         ) : (
           <span className="muted">-</span>
         )}
       </td>
+      {hasActions ? (
+        <td className="pos-row-actions">
+          {canReturn ? (
+            <button
+              className="secondary-button compact-button"
+              type="button"
+              onClick={() => onReturn(report)}
+            >
+              Return
+            </button>
+          ) : null}
+          {onDeleteReport ? (
+            <button
+              className="secondary-button compact-button"
+              type="button"
+              onClick={() => onDeleteReport(report.id)}
+            >
+              Delete
+            </button>
+          ) : null}
+        </td>
+      ) : null}
     </tr>
   );
 }
@@ -3793,6 +4170,7 @@ function ReportDetails({ report }) {
       ["Model", details.model],
       ["IMEI", details.imei],
       ["Card txn", details.solaRefNum || details.stripePaymentIntentId || details.solaTransactionId],
+      ["Returned", details.returnStatus],
     ],
     call: [
       ["Caller", details.callerName],
@@ -3844,6 +4222,15 @@ function ReportDetails({ report }) {
       ["Contact", details.contactDetails],
       ["Payment", details.paymentStatus],
       ["Delivered", details.deliveredAt ? formatShortDate(details.deliveredAt) : ""],
+      ["Returned", details.returnStatus],
+    ],
+    return: [
+      ["Items", details.itemsText],
+      ["IMEI", details.imei],
+      ["Refund method", details.refundMethod],
+      ["Card refund", details.solaRefundRef],
+      ["Original sale", details.originalReportId],
+      ["Refunded", details.refundTotal ? formatMoney(Number(details.refundTotal)) : ""],
     ],
   }[report.type];
 
@@ -3859,6 +4246,193 @@ function ReportDetails({ report }) {
         <span>-</span>
       )}
       {report.notes ? <span className="muted">{report.notes}</span> : null}
+    </div>
+  );
+}
+
+function ReturnDialog({ report, onClose, onSubmit }) {
+  const details = report.details || {};
+  const lineItems = details.lineItems || [];
+  const returnedByIndex = details.returnedByIndex || {};
+  const originalRefNum = details.solaRefNum || "";
+
+  const [lines, setLines] = useState(() =>
+    lineItems.map((item, index) => {
+      const soldQty = item.requiresImei ? 1 : Number(item.qty) || 1;
+      const alreadyReturned = Number(returnedByIndex[index]) || 0;
+      return {
+        index,
+        productId: item.productId,
+        sku: item.sku,
+        name: item.name,
+        price: Number(item.price) || 0,
+        requiresImei: Boolean(item.requiresImei),
+        soldImei: item.imei || "",
+        remaining: Math.max(0, soldQty - alreadyReturned),
+        returnQty: 0,
+        scanImei: "",
+      };
+    }),
+  );
+  const [refundMethod, setRefundMethod] = useState(report.paymentMethod || "Cash");
+  const [notes, setNotes] = useState("");
+  const [refundState, setRefundState] = useState({ status: "idle", message: "", ref: "" });
+
+  function setLine(index, patch) {
+    setLines((current) => current.map((line) => (line.index === index ? { ...line, ...patch } : line)));
+  }
+
+  function selectAll() {
+    setLines((current) => current.map((line) => ({ ...line, returnQty: line.remaining })));
+  }
+
+  const refundTotal = lines.reduce((sum, line) => sum + line.price * line.returnQty, 0);
+  const anySelected = lines.some((line) => line.returnQty > 0);
+  const imeiNeedsScan = lines.some(
+    (line) => line.requiresImei && line.returnQty > 0 && line.scanImei !== line.soldImei,
+  );
+  const requiresSolaRefund = ["CC", "Card"].includes(refundMethod) && Boolean(originalRefNum);
+  const canSubmit = anySelected && refundTotal > 0 && !imeiNeedsScan && refundState.status !== "refunding";
+
+  async function handleConfirm() {
+    if (!canSubmit) return;
+
+    let solaRef = refundState.ref;
+    if (requiresSolaRefund && refundState.status !== "refunded") {
+      try {
+        setRefundState({ status: "refunding", message: "Refunding card...", ref: "" });
+        const result = await refundToCard({ amount: Number(refundTotal.toFixed(2)), refNum: originalRefNum });
+        solaRef = result.refNum;
+        setRefundState({ status: "refunded", message: "Card refunded.", ref: solaRef });
+      } catch (error) {
+        setRefundState({
+          status: "error",
+          message: `${error.message || "Card refund failed."} Switch the refund method to record it manually.`,
+          ref: "",
+        });
+        return;
+      }
+    }
+
+    const returnLines = lines
+      .filter((line) => line.returnQty > 0)
+      .map((line) => ({
+        productId: line.productId,
+        sku: line.sku,
+        name: line.name,
+        price: line.price,
+        returnQty: line.returnQty,
+        requiresImei: line.requiresImei,
+        imei: line.requiresImei ? line.scanImei : "",
+        lineIndex: line.index,
+      }));
+
+    await Promise.resolve(onSubmit(report, { returnLines, refundMethod, solaRefundRef: solaRef, notes }));
+    onClose();
+  }
+
+  return (
+    <div className="dialog-backdrop" role="presentation">
+      <div className="dialog-card dialog-card-wide" role="dialog" aria-modal="true">
+        <div>
+          <p className="eyebrow">Return / refund</p>
+          <h3>Return items from this sale</h3>
+          <p className="muted">
+            {formatShortDate(report.createdAt)} · {report.customerPhone || "no phone"} · paid {formatPayment(report.paymentAmount)} ({report.paymentMethod || "-"})
+          </p>
+        </div>
+
+        <div className="return-lines">
+          {lines.map((line) => (
+            <div className="return-line" key={line.index}>
+              <div className="return-line-info">
+                <strong>{line.name}</strong>
+                <span className="muted">{line.sku} · {formatMoney(line.price)}</span>
+                {line.remaining === 0 ? <span className="muted">Already returned</span> : null}
+              </div>
+              {line.requiresImei ? (
+                <div className="return-line-controls">
+                  <label className="field checkbox-field">
+                    <input
+                      type="checkbox"
+                      disabled={line.remaining === 0}
+                      checked={line.returnQty > 0}
+                      onChange={(event) => setLine(line.index, { returnQty: event.target.checked ? 1 : 0, scanImei: "" })}
+                    />
+                    <span>Return this unit</span>
+                  </label>
+                  {line.returnQty > 0 ? (
+                    <label className="field">
+                      <span>Scan IMEI to restock (sold: {line.soldImei || "n/a"})</span>
+                      <input
+                        value={line.scanImei}
+                        onChange={(event) => setLine(line.index, { scanImei: event.target.value.replace(/\D/g, "").slice(0, 15) })}
+                        placeholder="Scan the returned phone's IMEI"
+                        inputMode="numeric"
+                        autoComplete="off"
+                        spellCheck={false}
+                      />
+                      {line.scanImei && line.scanImei !== line.soldImei ? (
+                        <span className="summary-error">IMEI does not match the one sold on this line.</span>
+                      ) : null}
+                    </label>
+                  ) : null}
+                </div>
+              ) : (
+                <label className="field return-qty-field">
+                  <span>Return qty (max {line.remaining})</span>
+                  <input
+                    type="number"
+                    min="0"
+                    max={line.remaining}
+                    value={line.returnQty}
+                    disabled={line.remaining === 0}
+                    onChange={(event) => {
+                      const next = Math.max(0, Math.min(line.remaining, Number(event.target.value) || 0));
+                      setLine(line.index, { returnQty: next });
+                    }}
+                  />
+                </label>
+              )}
+            </div>
+          ))}
+        </div>
+
+        <div className="form-grid">
+          <label className="field">
+            <span>Refund method</span>
+            <select value={refundMethod} onChange={(event) => setRefundMethod(event.target.value)}>
+              {paymentMethods.map((method) => <option key={method}>{method}</option>)}
+            </select>
+          </label>
+          <label className="field full">
+            <span>Notes</span>
+            <textarea rows="2" value={notes} onChange={(event) => setNotes(event.target.value)} />
+          </label>
+        </div>
+
+        {requiresSolaRefund ? (
+          <p className="muted">This card sale will be refunded to the original card via Sola (ref {originalRefNum}).</p>
+        ) : null}
+        {refundState.message ? (
+          <p className={refundState.status === "error" ? "summary-error" : "muted"}>{refundState.message}</p>
+        ) : null}
+
+        <div className="return-summary">
+          <span>Refund total</span>
+          <strong>{formatMoney(refundTotal)}</strong>
+        </div>
+
+        <div className="pos-form-actions">
+          <button className="primary-button" type="button" disabled={!canSubmit} onClick={handleConfirm}>
+            {requiresSolaRefund
+              ? `Refund ${formatMoney(refundTotal)} to card & restock`
+              : `Refund ${formatMoney(refundTotal)} & restock`}
+          </button>
+          <button className="secondary-button" type="button" onClick={selectAll}>Return everything</button>
+          <button className="secondary-button" type="button" onClick={onClose}>Cancel</button>
+        </div>
+      </div>
     </div>
   );
 }

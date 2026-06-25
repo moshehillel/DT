@@ -105,6 +105,13 @@ export const reportTypes = {
     description: "Manual deliveries",
     fields: [],
   },
+  return: {
+    title: "Return / refund",
+    label: "Return",
+    mark: "RT",
+    description: "Refunds and restocks",
+    fields: [],
+  },
 };
 
 // Sale and call reports are imported from Shopify POS and Telebroad webhooks.

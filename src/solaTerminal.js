@@ -80,3 +80,15 @@ export async function chargeOnDevice({
 
   throw new Error("Timed out waiting for the terminal. Check the card was presented and try again.");
 }
+
+// Refund a previous card sale back to the original card by reference number.
+export async function refundToCard({ amount, refNum }) {
+  if (!FUNCTIONS_BASE_URL) {
+    throw new Error("Set VITE_FUNCTIONS_BASE_URL to your Firebase Functions URL to refund cards.");
+  }
+  if (!refNum) {
+    throw new Error("This sale has no card reference, so it can't be refunded to the card automatically.");
+  }
+  const result = await postJson("/solaRefund", { amount, refNum });
+  return { refNum: result.transactionId || refNum, status: result.status || "refunded" };
+}
