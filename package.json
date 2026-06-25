@@ -9,6 +9,7 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@stripe/terminal-js": "^0.26.0",
     "@vitejs/plugin-react": "^5.1.2",
     "firebase": "^12.15.0",
     "react": "^19.2.3",

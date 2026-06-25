@@ -34,7 +34,13 @@ const RCUK_CHECK_SIM_PATH = process.env.RCUK_CHECK_SIM_PATH || "/check-sim";
 const SOLA_API_KEY = process.env.SOLA_API_KEY || "";
 const SOLA_API_BASE_URL = process.env.SOLA_API_BASE_URL || "https://x1.cardknox.com";
 const SOLA_CREATE_CHARGE_PATH = process.env.SOLA_CREATE_CHARGE_PATH || "/gatewayjson";
+const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY || "";
+const STRIPE_CURRENCY = process.env.STRIPE_CURRENCY || "usd";
 const RENTAL_REMINDER_TIME_ZONE = process.env.RENTAL_REMINDER_TIME_ZONE || "America/New_York";
+
+// Stripe is only loaded when a secret key is configured so the rest of the
+// functions keep working (and deploying) even before Stripe is set up.
+const stripeClient = STRIPE_SECRET_KEY ? require("stripe")(STRIPE_SECRET_KEY) : null;
 
 function getPayload(req) {
   return {
@@ -787,6 +793,105 @@ exports.solaCreateCharge = onRequest(HTTP_OPTIONS, async (req, res) => {
       ok: false,
       message: error.message || "Sola charge failed.",
     });
+  }
+});
+
+// Stripe Terminal: hands the browser SDK a short-lived connection token so it
+// can discover and connect to a card reader (real or simulated).
+exports.stripeConnectionToken = onRequest(HTTP_OPTIONS, async (req, res) => {
+  if (handleCors(req, res)) return;
+  if (req.method !== "POST") {
+    sendJson(res, 405, { ok: false, message: "POST required" });
+    return;
+  }
+  if (!stripeClient) {
+    sendJson(res, 501, {
+      ok: false,
+      message: "Stripe is not configured yet. Set STRIPE_SECRET_KEY on Firebase Functions.",
+    });
+    return;
+  }
+
+  try {
+    const token = await stripeClient.terminal.connectionTokens.create();
+    sendJson(res, 200, { ok: true, secret: token.secret });
+  } catch (error) {
+    logger.error("stripeConnectionToken failed", error);
+    sendJson(res, 500, { ok: false, message: error.message || "Could not create connection token." });
+  }
+});
+
+// Stripe Terminal: creates a card-present PaymentIntent for the cart total.
+// Manual capture so the sale is only captured after the reader approves.
+exports.stripeCreatePaymentIntent = onRequest(HTTP_OPTIONS, async (req, res) => {
+  if (handleCors(req, res)) return;
+  if (req.method !== "POST") {
+    sendJson(res, 405, { ok: false, message: "POST required" });
+    return;
+  }
+  if (!stripeClient) {
+    sendJson(res, 501, {
+      ok: false,
+      message: "Stripe is not configured yet. Set STRIPE_SECRET_KEY on Firebase Functions.",
+    });
+    return;
+  }
+
+  const payload = getPayload(req);
+  const amount = Number.parseFloat(payload.amount || "0");
+  if (!Number.isFinite(amount) || amount <= 0) {
+    sendJson(res, 400, { ok: false, message: "A valid amount is required." });
+    return;
+  }
+
+  try {
+    const intent = await stripeClient.paymentIntents.create({
+      amount: Math.round(amount * 100),
+      currency: payload.currency || STRIPE_CURRENCY,
+      payment_method_types: ["card_present"],
+      capture_method: "manual",
+      description: payload.description || "Diamant Telecom POS sale",
+      metadata: {
+        source: "pos",
+        location: payload.location || "",
+        customerPhone: payload.customerPhone || "",
+      },
+    });
+    sendJson(res, 200, { ok: true, id: intent.id, clientSecret: intent.client_secret });
+  } catch (error) {
+    logger.error("stripeCreatePaymentIntent failed", error);
+    sendJson(res, 500, { ok: false, message: error.message || "Could not create payment intent." });
+  }
+});
+
+// Stripe Terminal: captures the PaymentIntent after the reader processes it.
+exports.stripeCapturePaymentIntent = onRequest(HTTP_OPTIONS, async (req, res) => {
+  if (handleCors(req, res)) return;
+  if (req.method !== "POST") {
+    sendJson(res, 405, { ok: false, message: "POST required" });
+    return;
+  }
+  if (!stripeClient) {
+    sendJson(res, 501, {
+      ok: false,
+      message: "Stripe is not configured yet. Set STRIPE_SECRET_KEY on Firebase Functions.",
+    });
+    return;
+  }
+
+  const payload = getPayload(req);
+  const paymentIntentId = payload.paymentIntentId || payload.id || "";
+  if (!paymentIntentId) {
+    sendJson(res, 400, { ok: false, message: "paymentIntentId is required." });
+    return;
+  }
+
+  try {
+    const intent = await stripeClient.paymentIntents.capture(paymentIntentId);
+    sendJson(res, 200, { ok: true, id: intent.id, status: intent.status });
+  } catch (error) {
+    logger.error("stripeCapturePaymentIntent failed", error);
+    sendJson(res, 500, { ok: false, message: error.message || "Could not capture payment." });
   }
 });
 

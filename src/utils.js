@@ -59,6 +59,15 @@ export function digitsOnly(value) {
   return String(value || "").replace(/\D/g, "");
 }
 
+export function escapeHtml(value) {
+  return String(value || "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}
+
 export function normalizeRcukSimNumber(value) {
   const digits = digitsOnly(value);
   if (!digits) return "";

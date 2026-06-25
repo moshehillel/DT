@@ -6,21 +6,27 @@ import {
   defaultEmployees,
   defaultManualReportType,
   defaultOrderHandlers,
+  defaultStoreLocations,
   EMPLOYEE_KEY,
+  EMPLOYEE_LOCATIONS_KEY,
   FUNCTIONS_BASE_URL,
   manualReportTypeKeys,
   ORDER_HANDLERS_KEY,
   paymentMethods,
   PENDING_REPORTS_KEY,
   PHONE_ORDERS_KEY,
+  productCategories,
+  PRODUCTS_KEY,
   repairStatuses,
   reportTypes,
   RESET_REQUESTS_KEY,
   SESSION_KEY,
   STORAGE_KEY,
+  STORE_LOCATIONS_KEY,
 } from "./constants";
 import { useCloudCollectionState, useCloudDocumentState } from "./hooks/useCloudState";
 import { attachAuthMetadata, ensureFirebaseAuth } from "./firebaseClient";
+import { chargeOnReader, connectReader, getConnectedReader } from "./stripeTerminal";
 import {
   buildAppNotifications,
   calculateInclusiveDays,
@@ -28,6 +34,7 @@ import {
   calculateReturnDueDate,
   createEmptyFilters,
   digitsOnly,
+  escapeHtml,
   exportCsv,
   formatDateTime,
   formatMoney,
@@ -44,6 +51,16 @@ import {
 } from "./utils";
 import "./styles.css";
 
+function viewTitleFor(activeView, activeType) {
+  if (activeView === "admin") return "Admin workspace";
+  if (activeView === "pendingReports") return "Pending reports";
+  if (activeView === "openRepairs") return "Open repairs";
+  if (activeView === "pos") return "Point of sale";
+  if (activeView === "inventory") return "Inventory";
+  if (activeView === "reports" && reportTypes[activeType]) return reportTypes[activeType].title;
+  return "Store reporting";
+}
+
 function App() {
   const [activeType, setActiveType] = useState(defaultManualReportType);
   const [employees, setEmployees] = useCloudDocumentState("employees", EMPLOYEE_KEY, defaultEmployees);
@@ -53,6 +70,9 @@ function App() {
   const [orderHandlers, setOrderHandlers] = useCloudCollectionState("orderHandlers", ORDER_HANDLERS_KEY, defaultOrderHandlers);
   const [notifications, setNotifications] = useCloudCollectionState("notificationLogs", "diamant-telecom-notifications-v1", []);
   const [resetRequests, setResetRequests] = useCloudCollectionState("passwordResetRequests", RESET_REQUESTS_KEY, []);
+  const [products, setProducts] = useCloudCollectionState("products", PRODUCTS_KEY, []);
+  const [storeLocations, setStoreLocations] = useCloudDocumentState("storeLocations", STORE_LOCATIONS_KEY, defaultStoreLocations);
+  const [employeeLocations, setEmployeeLocations] = useCloudDocumentState("employeeLocations", EMPLOYEE_LOCATIONS_KEY, []);
   const [activeEmployee, setActiveEmployee] = useState(
     localStorage.getItem(ACTIVE_EMPLOYEE_KEY) || employees[0] || "",
   );
@@ -60,7 +80,7 @@ function App() {
     const savedRole = localStorage.getItem(SESSION_KEY) || "";
     return savedRole === "signed-in" ? "employee" : savedRole;
   });
-  const [activeView, setActiveView] = useState("reports");
+  const [activeView, setActiveView] = useState("pendingReports");
   const [filters, setFilters] = useState(createEmptyFilters);
   const [formNonce, setFormNonce] = useState(0);
   const [dialogOpen, setDialogOpen] = useState(false);
@@ -75,6 +95,18 @@ function App() {
     localStorage.setItem(ACTIVE_EMPLOYEE_KEY, activeEmployee);
   }, [activeEmployee]);
 
+  const activeLocation = useMemo(() => {
+    const match = (employeeLocations || []).find((entry) => entry?.name === activeEmployee);
+    return match?.location || storeLocations[0] || "";
+  }, [employeeLocations, activeEmployee, storeLocations]);
+
+  const employeeCanSeeReport = useMemo(() => {
+    return (report) => {
+      const store = report.location || report.details?.location || "";
+      return !store || store === activeLocation || report.servedBy === activeEmployee;
+    };
+  }, [activeLocation, activeEmployee]);
+
   const filteredReports = useMemo(() => {
     const query = filters.query.trim().toLowerCase();
     const phoneQuery = digitsOnly(query);
@@ -84,7 +116,7 @@ function App() {
     const dateTo = filters.dateTo ? new Date(`${filters.dateTo}T23:59:59`) : null;
     const availableReports = sessionRole === "admin"
       ? reports
-      : reports.filter((report) => report.servedBy === activeEmployee);
+      : reports.filter(employeeCanSeeReport);
 
     return availableReports.filter((report) => {
       const reportDate = toJsDate(report.createdAt);
@@ -115,25 +147,118 @@ function App() {
         (!query || searchable.includes(query) || (phoneQuery && searchableDigits.includes(phoneQuery)))
       );
     });
-  }, [activeEmployee, filters, reports, sessionRole]);
+  }, [employeeCanSeeReport, filters, reports, sessionRole]);
 
   const visibleEmployees = sessionRole === "admin" ? employees : [activeEmployee];
   const visibleNotifications = useMemo(() => {
     if (sessionRole === "admin") return notifications;
     const visibleReportIds = new Set(
-      reports.filter((report) => report.servedBy === activeEmployee).map((report) => report.id),
+      reports.filter(employeeCanSeeReport).map((report) => report.id),
     );
     return notifications.filter((notice) => visibleReportIds.has(notice.reportId));
-  }, [activeEmployee, notifications, reports, sessionRole]);
+  }, [employeeCanSeeReport, notifications, reports, sessionRole]);
   const appNotifications = useMemo(() => {
     const availableReports = sessionRole === "admin"
       ? reports
-      : reports.filter((report) => report.servedBy === activeEmployee);
+      : reports.filter(employeeCanSeeReport);
     return buildAppNotifications(availableReports);
-  }, [activeEmployee, reports, sessionRole]);
+  }, [employeeCanSeeReport, reports, sessionRole]);
+
+  function addStoreLocation(name) {
+    const cleanName = String(name || "").trim();
+    if (!cleanName || storeLocations.includes(cleanName)) return;
+    setStoreLocations((current) => [...current, cleanName]);
+  }
+
+  function removeStoreLocation(name) {
+    if (storeLocations.length <= 1) {
+      window.alert("Keep at least one store location.");
+      return;
+    }
+    setStoreLocations((current) => current.filter((location) => location !== name));
+  }
+
+  function setEmployeeLocation(name, location) {
+    setEmployeeLocations((current) => {
+      const others = (current || []).filter((entry) => entry?.name !== name);
+      if (!location) return others;
+      return [...others, { name, location }];
+    });
+  }
+
+  function saveProduct(product) {
+    const id = product.id || crypto.randomUUID();
+    const requiresImei = Boolean(product.requiresImei);
+    const imeis = requiresImei
+      ? [
+          ...new Set(
+            (product.imeis || [])
+              .map((value) => String(value || "").replace(/\D/g, "").slice(0, 15))
+              .filter(Boolean),
+          ),
+        ]
+      : [];
+    const quantity = requiresImei
+      ? imeis.length
+      : Number.isFinite(Number(product.quantity))
+        ? Number(product.quantity)
+        : 0;
+    const normalized = {
+      ...product,
+      id,
+      sku: String(product.sku || "").trim(),
+      name: String(product.name || "").trim(),
+      price: String(product.price ?? "").trim(),
+      category: product.category || productCategories[0],
+      requiresImei,
+      location: product.location || "",
+      imeis,
+      quantity,
+      updatedAt: new Date().toISOString(),
+    };
+    setProducts((current) => {
+      const exists = current.some((item) => item.id === id);
+      if (exists) {
+        return current.map((item) => (item.id === id ? { ...item, ...normalized } : item));
+      }
+      return [{ ...normalized, createdAt: new Date().toISOString() }, ...current];
+    });
+  }
+
+  function removeProduct(productId) {
+    setProducts((current) => current.filter((item) => item.id !== productId));
+  }
+
+  async function savePosSale(sale) {
+    const enriched = await attachAuthMetadata(sale);
+    setReports((current) => [enriched, ...current]);
+    setProducts((current) =>
+      current.map((product) => {
+        const lines = (sale.details?.lineItems || []).filter((line) => line.productId === product.id);
+        if (!lines.length) return product;
+        if (product.requiresImei) {
+          const soldImeis = new Set(lines.map((line) => line.imei).filter(Boolean));
+          if (!soldImeis.size) return product;
+          const remaining = (product.imeis || []).filter((imei) => !soldImeis.has(imei));
+          return {
+            ...product,
+            imeis: remaining,
+            quantity: remaining.length,
+            updatedAt: new Date().toISOString(),
+          };
+        }
+        const soldQty = lines.reduce((total, line) => total + (Number(line.qty) || 0), 0);
+        const nextQuantity = Math.max(0, (Number(product.quantity) || 0) - soldQty);
+        return { ...product, quantity: nextQuantity, updatedAt: new Date().toISOString() };
+      }),
+    );
+  }
 
   async function saveReport(report) {
-    const enriched = await attachAuthMetadata(report);
+    const enriched = await attachAuthMetadata({
+      ...report,
+      location: report.location || activeLocation,
+    });
     setReports((current) => [enriched, ...current]);
     setFormNonce((value) => value + 1);
   }
@@ -177,7 +302,10 @@ function App() {
   }
 
   async function savePendingReport(pendingReportId, completedReport) {
-    const enriched = await attachAuthMetadata(completedReport);
+    const enriched = await attachAuthMetadata({
+      ...completedReport,
+      location: completedReport.location || completedReport.details?.location || activeLocation,
+    });
     setReports((current) => [enriched, ...current]);
     setPendingReports((current) => current.filter((report) => report.id !== pendingReportId));
   }
@@ -211,6 +339,7 @@ function App() {
       type: "phoneOrder",
       createdAt: deliveredAt,
       servedBy: activeEmployee,
+      location: order.location || activeLocation,
       customerPhone: order.customerPhone,
       customerPhoneDigits: digitsOnly(order.customerPhone),
       paymentAmount: order.orderTotal,
@@ -417,7 +546,7 @@ function App() {
     setActiveEmployee(name);
     localStorage.setItem(SESSION_KEY, "employee");
     setSessionRole("employee");
-    setActiveView("reports");
+    setActiveView("pendingReports");
   }
 
   function requestPasswordReset(employeeName) {
@@ -449,7 +578,7 @@ function App() {
   function logout() {
     localStorage.removeItem(SESSION_KEY);
     setSessionRole("");
-    setActiveView("reports");
+    setActiveView("pendingReports");
   }
 
   if (!sessionRole) {
@@ -485,7 +614,7 @@ function App() {
             <strong>{activeEmployee} - {sessionRole === "admin" ? "Admin" : "Employee"}</strong>
           </div>
           <div className="topbar-meta">
-            <span>{activeView === "admin" ? "Admin workspace" : "Store reporting"}</span>
+            <span>{viewTitleFor(activeView, activeType)}</span>
           </div>
           <button className="secondary-button" type="button" onClick={logout}>
             Logout
@@ -546,6 +675,27 @@ function App() {
               notifications={visibleNotifications}
             />
           </>
+        ) : activeView === "pos" ? (
+          <PosPage
+            key={`pos-${formNonce}`}
+            products={products}
+            activeEmployee={activeEmployee}
+            activeLocation={activeLocation}
+            onCompleteSale={savePosSale}
+          />
+        ) : activeView === "inventory" ? (
+          <InventoryPage
+            products={products}
+            employees={employees}
+            storeLocations={storeLocations}
+            employeeLocations={employeeLocations}
+            sessionRole={sessionRole}
+            onSaveProduct={saveProduct}
+            onRemoveProduct={removeProduct}
+            onAddStoreLocation={addStoreLocation}
+            onRemoveStoreLocation={removeStoreLocation}
+            onSetEmployeeLocation={setEmployeeLocation}
+          />
         ) : (
           <AdminPage
             employees={employees}
@@ -730,10 +880,9 @@ function Sidebar({
         Sign out
       </button>
 
-      {activeView === "reports" ? (
-        <nav className="report-tabs" aria-label="Report type">
+      <nav className="report-tabs" aria-label="Report type">
           <button
-            className="tab pending-tab"
+            className={`tab pending-tab ${activeView === "pendingReports" ? "active" : ""}`}
             type="button"
             onClick={() => onViewChange("pendingReports")}
           >
@@ -744,7 +893,7 @@ function Sidebar({
             </span>
           </button>
           <button
-            className="tab open-repairs-tab"
+            className={`tab open-repairs-tab ${activeView === "openRepairs" ? "active" : ""}`}
             type="button"
             onClick={() => onViewChange("openRepairs")}
           >
@@ -754,14 +903,41 @@ function Sidebar({
               <small>Active tickets</small>
             </span>
           </button>
+          <button
+            className={`tab pos-tab ${activeView === "pos" ? "active" : ""}`}
+            type="button"
+            onClick={() => onViewChange("pos")}
+          >
+            <span className="tab-mark">$</span>
+            <span>
+              <strong>Point of sale</strong>
+              <small>Scan items & checkout</small>
+            </span>
+          </button>
+          {sessionRole === "admin" ? (
+            <button
+              className={`tab inventory-tab ${activeView === "inventory" ? "active" : ""}`}
+              type="button"
+              onClick={() => onViewChange("inventory")}
+            >
+              <span className="tab-mark">I</span>
+              <span>
+                <strong>Inventory</strong>
+                <small>Catalog, stock & stores</small>
+              </span>
+            </button>
+          ) : null}
           {manualReportTypeKeys.map((type) => {
             const config = reportTypes[type];
             return (
             <button
-              className={`tab ${activeType === type ? "active" : ""}`}
+              className={`tab ${activeView === "reports" && activeType === type ? "active" : ""}`}
               type="button"
               key={type}
-              onClick={() => onTypeChange(type)}
+              onClick={() => {
+                onTypeChange(type);
+                onViewChange("reports");
+              }}
             >
               <span className="tab-mark">{config.mark}</span>
               <span>
@@ -772,43 +948,6 @@ function Sidebar({
             );
           })}
         </nav>
-      ) : null}
-      {activeView === "openRepairs" ? (
-        <nav className="report-tabs" aria-label="Repair view">
-          <button className="tab active" type="button">
-            <span className="tab-mark">O</span>
-            <span>
-              <strong>Open repairs</strong>
-              <small>Active tickets</small>
-            </span>
-          </button>
-          <button className="tab" type="button" onClick={() => onViewChange("reports")}>
-            <span className="tab-mark">B</span>
-            <span>
-              <strong>Back</strong>
-              <small>New reports</small>
-            </span>
-          </button>
-        </nav>
-      ) : null}
-      {activeView === "pendingReports" ? (
-        <nav className="report-tabs" aria-label="Pending view">
-          <button className="tab active" type="button">
-            <span className="tab-mark">P</span>
-            <span>
-              <strong>Pending reports</strong>
-              <small>Claim Shopify & call imports</small>
-            </span>
-          </button>
-          <button className="tab" type="button" onClick={() => onViewChange("reports")}>
-            <span className="tab-mark">B</span>
-            <span>
-              <strong>Back</strong>
-              <small>New reports</small>
-            </span>
-          </button>
-        </nav>
-      ) : null}
     </aside>
   );
 }
@@ -2337,6 +2476,1076 @@ function OpenPhoneOrders({ orders, activeEmployee, sessionRole, onDelivered }) {
   );
 }
 
+function PosPage({ products, activeEmployee, activeLocation, onCompleteSale }) {
+  const [cart, setCart] = useState([]);
+  const [scan, setScan] = useState("");
+  const [customerPhone, setCustomerPhone] = useState("");
+  const [paymentMethod, setPaymentMethod] = useState(paymentMethods[0]);
+  const [notes, setNotes] = useState("");
+  const [message, setMessage] = useState("");
+  const [completedSale, setCompletedSale] = useState(null);
+  const [card, setCard] = useState({ status: "idle", message: "", paymentIntentId: "" });
+  const [reader, setReader] = useState({ status: "disconnected", label: "", message: "" });
+  const [useSimulatedReader, setUseSimulatedReader] = useState(true);
+  const scanRef = useRef(null);
+
+  useEffect(() => {
+    scanRef.current?.focus();
+  }, []);
+
+  const availableProducts = useMemo(
+    () =>
+      products
+        .filter((product) => !activeLocation || !product.location || product.location === activeLocation)
+        .sort((a, b) => String(a.name || "").localeCompare(String(b.name || ""))),
+    [products, activeLocation],
+  );
+
+  const productsById = useMemo(
+    () => Object.fromEntries(products.map((product) => [product.id, product])),
+    [products],
+  );
+
+  function imeiLineStatus(line) {
+    if (!line.requiresImei) return "ok";
+    if (!line.imei) return "missing";
+    const duplicate = cart.filter((other) => other.requiresImei && other.imei === line.imei).length > 1;
+    if (duplicate) return "duplicate";
+    const stock = productsById[line.productId]?.imeis || [];
+    if (stock.length > 0 && !stock.includes(line.imei)) return "notstock";
+    return "ok";
+  }
+
+  function makeLine(product) {
+    return {
+      lineId: crypto.randomUUID(),
+      productId: product.id,
+      sku: product.sku,
+      name: product.name,
+      price: Number(product.price) || 0,
+      qty: 1,
+      requiresImei: Boolean(product.requiresImei),
+      imei: "",
+      category: product.category || "",
+    };
+  }
+
+  function findProductBySku(sku) {
+    const clean = String(sku || "").trim().toLowerCase();
+    if (!clean) return null;
+    const matches = products.filter(
+      (product) => String(product.sku || "").trim().toLowerCase() === clean,
+    );
+    if (!matches.length) return null;
+    return (
+      matches.find((product) => product.location === activeLocation) ||
+      matches.find((product) => !product.location) ||
+      matches[0]
+    );
+  }
+
+  function addProductToCart(product) {
+    setCart((current) => {
+      if (product.requiresImei) {
+        return [...current, makeLine(product)];
+      }
+      const existing = current.find((line) => line.productId === product.id && !line.requiresImei);
+      if (existing) {
+        return current.map((line) =>
+          line.lineId === existing.lineId ? { ...line, qty: line.qty + 1 } : line,
+        );
+      }
+      return [...current, makeLine(product)];
+    });
+  }
+
+  function handleScan(event) {
+    event.preventDefault();
+    const term = scan.trim();
+    if (!term) return;
+    const product = findProductBySku(term);
+    if (!product) {
+      setMessage(`No product found for "${term}".`);
+    } else {
+      addProductToCart(product);
+      setMessage(`Added ${product.name}.`);
+    }
+    setScan("");
+    scanRef.current?.focus();
+  }
+
+  function updateQty(lineId, qty) {
+    const value = Math.max(1, Number(qty) || 1);
+    setCart((current) => current.map((line) => (line.lineId === lineId ? { ...line, qty: value } : line)));
+  }
+
+  function updateImei(lineId, imei) {
+    const digits = String(imei || "").replace(/\D/g, "").slice(0, 15);
+    setCart((current) => current.map((line) => (line.lineId === lineId ? { ...line, imei: digits } : line)));
+  }
+
+  function removeLine(lineId) {
+    setCart((current) => current.filter((line) => line.lineId !== lineId));
+  }
+
+  const total = cart.reduce((sum, line) => sum + line.price * line.qty, 0);
+  const itemCount = cart.reduce((sum, line) => sum + line.qty, 0);
+  const requiresCardCharge = ["CC", "Card"].includes(paymentMethod);
+  const cardChargeComplete = !requiresCardCharge || card.status === "paid";
+  const imeiIssue = (() => {
+    if (cart.some((line) => imeiLineStatus(line) === "missing")) {
+      return "Scan an IMEI for every phone before checkout.";
+    }
+    if (cart.some((line) => imeiLineStatus(line) === "duplicate")) {
+      return "The same IMEI is on two lines. Each phone needs its own unique IMEI.";
+    }
+    if (cart.some((line) => imeiLineStatus(line) === "notstock")) {
+      return "An IMEI is not in this product's inventory. Scan a phone that is in stock.";
+    }
+    return "";
+  })();
+  const canCheckout = cart.length > 0 && !imeiIssue && cardChargeComplete;
+
+  useEffect(() => {
+    setCard((current) =>
+      current.status === "idle" ? current : { status: "idle", message: "", paymentIntentId: "" },
+    );
+  }, [total, paymentMethod]);
+
+  async function handleConnectReader() {
+    setReader({ status: "connecting", label: "", message: "Connecting to reader..." });
+    try {
+      const connected = await connectReader({ simulated: useSimulatedReader });
+      setReader({ status: "connected", label: connected?.label || connected?.id || "Reader", message: "" });
+    } catch (error) {
+      setReader({ status: "disconnected", label: "", message: error.message || "Could not connect to a reader." });
+    }
+  }
+
+  async function chargeCard() {
+    if (!requiresCardCharge || !total) return;
+    try {
+      let connected = null;
+      try {
+        connected = await getConnectedReader();
+      } catch {
+        connected = null;
+      }
+      if (!connected) {
+        connected = await connectReader({ simulated: useSimulatedReader });
+        setReader({ status: "connected", label: connected?.label || connected?.id || "Reader", message: "" });
+      }
+      setCard({ status: "charging", message: "Follow the reader: tap, insert, or swipe the card.", paymentIntentId: "" });
+      const result = await chargeOnReader({
+        amount: total.toFixed(2),
+        description: `POS sale - ${activeLocation || "store"}`,
+        location: activeLocation,
+        customerPhone: customerPhone.trim(),
+      });
+      const paid = result.status === "succeeded" || result.status === "requires_capture";
+      setCard({
+        status: paid ? "paid" : "error",
+        message: paid ? "Card approved." : `Payment status: ${result.status}.`,
+        paymentIntentId: result.paymentIntentId || "",
+      });
+    } catch (error) {
+      setCard({ status: "error", message: error.message || "Card payment failed.", paymentIntentId: "" });
+    }
+  }
+
+  function handleCheckout() {
+    if (!canCheckout) {
+      if (imeiIssue) setMessage(imeiIssue);
+      else if (!cardChargeComplete) setMessage("Charge the card before completing the sale.");
+      return;
+    }
+    const lineItems = cart.map((line) => ({
+      productId: line.productId,
+      sku: line.sku,
+      name: line.name,
+      price: line.price,
+      qty: line.qty,
+      imei: line.imei,
+      requiresImei: line.requiresImei,
+      category: line.category,
+    }));
+    const itemsText = cart
+      .map((line) => `${line.qty}x ${line.name}${line.imei ? ` (IMEI ${line.imei})` : ""}`)
+      .join(", ");
+    const phoneLine = cart.find((line) => line.requiresImei && line.imei);
+    const sale = {
+      id: crypto.randomUUID(),
+      type: "sale",
+      source: "pos",
+      servedBy: activeEmployee,
+      location: activeLocation,
+      customerPhone: customerPhone.trim(),
+      paymentAmount: total.toFixed(2),
+      paymentMethod,
+      notes: notes.trim(),
+      createdAt: new Date().toISOString(),
+      details: {
+        request: "POS sale",
+        productType: cart.length === 1 ? cart[0].category || "Item" : "Mixed",
+        location: activeLocation,
+        itemsText,
+        model: cart.length === 1 ? cart[0].name : itemsText,
+        imei: phoneLine?.imei || "",
+        itemCount,
+        lineItems,
+        cardStatus: requiresCardCharge ? card.status : "",
+        stripePaymentIntentId: requiresCardCharge ? card.paymentIntentId : "",
+      },
+    };
+    onCompleteSale(sale);
+    setCompletedSale(sale);
+    setCart([]);
+    setCustomerPhone("");
+    setNotes("");
+    setPaymentMethod(paymentMethods[0]);
+    setCard({ status: "idle", message: "", paymentIntentId: "" });
+    setMessage("");
+  }
+
+  function startNewSale() {
+    setCompletedSale(null);
+    setCard({ status: "idle", message: "", paymentIntentId: "" });
+    setMessage("Ready for the next customer.");
+    setTimeout(() => scanRef.current?.focus(), 0);
+  }
+
+  return (
+    <>
+      <section className="workspace pos-hero">
+        <div className="workspace-header">
+          <div>
+            <p className="eyebrow">Point of sale</p>
+            <h2>Scan items and check out</h2>
+          </div>
+          <div className="summary-strip">
+            <span className="metric">Store <strong>{activeLocation || "Unassigned"}</strong></span>
+            <span className="metric">Cashier <strong>{activeEmployee}</strong></span>
+          </div>
+        </div>
+
+        <form className="pos-scan" onSubmit={handleScan}>
+          <input
+            ref={scanRef}
+            className="pos-scan-input"
+            value={scan}
+            onChange={(event) => setScan(event.target.value)}
+            placeholder="Scan or type a barcode / SKU, then Enter"
+            inputMode="text"
+            autoComplete="off"
+            spellCheck={false}
+          />
+          <button className="primary-button" type="submit">Add</button>
+        </form>
+        {message ? (
+          <p className={`pos-message ${message.includes("Added") || message.includes("Ready") ? "pos-message-ok" : ""}`}>
+            {message}
+          </p>
+        ) : null}
+      </section>
+
+      <div className="pos-layout">
+        <section className="history pos-cart">
+          <div className="history-header">
+            <div>
+              <p className="eyebrow">Cart</p>
+              <h2>{itemCount} item{itemCount === 1 ? "" : "s"}</h2>
+            </div>
+          </div>
+          {cart.length ? (
+            <div className="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Item</th>
+                    <th>Price</th>
+                    <th>Qty</th>
+                    <th>IMEI</th>
+                    <th>Line</th>
+                    <th></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {cart.map((line) => (
+                    <tr key={line.lineId}>
+                      <td>
+                        <strong>{line.name}</strong>
+                        <p className="muted">{line.sku}</p>
+                      </td>
+                      <td>{formatMoney(line.price)}</td>
+                      <td>
+                        {line.requiresImei ? (
+                          <span className="muted">1</span>
+                        ) : (
+                          <input
+                            className="pos-qty"
+                            type="number"
+                            min="1"
+                            value={line.qty}
+                            onChange={(event) => updateQty(line.lineId, event.target.value)}
+                          />
+                        )}
+                      </td>
+                      <td>
+                        {line.requiresImei ? (
+                          <input
+                            className={`pos-imei ${imeiLineStatus(line) === "ok" ? "" : "pos-imei-missing"}`}
+                            value={line.imei}
+                            onChange={(event) => updateImei(line.lineId, event.target.value)}
+                            placeholder="Scan IMEI"
+                            inputMode="numeric"
+                            autoComplete="off"
+                            spellCheck={false}
+                          />
+                        ) : (
+                          <span className="muted">-</span>
+                        )}
+                      </td>
+                      <td>{formatMoney(line.price * line.qty)}</td>
+                      <td>
+                        <button className="secondary-button" type="button" onClick={() => removeLine(line.lineId)}>
+                          Remove
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          ) : (
+            <p className="empty-state">Scan a product to start a sale.</p>
+          )}
+        </section>
+
+        <section className="workspace pos-checkout">
+          <div className="workspace-header">
+            <div>
+              <p className="eyebrow">Checkout</p>
+              <h2>{formatMoney(total)}</h2>
+            </div>
+          </div>
+          <div className="form-grid">
+            <label className="field">
+              <span>Customer phone (optional)</span>
+              <input
+                inputMode="tel"
+                value={customerPhone}
+                onChange={(event) => setCustomerPhone(event.target.value)}
+                placeholder="For receipt / follow-up"
+              />
+            </label>
+            <label className="field">
+              <span>Payment method</span>
+              <select value={paymentMethod} onChange={(event) => setPaymentMethod(event.target.value)}>
+                {paymentMethods.map((method) => (
+                  <option key={method}>{method}</option>
+                ))}
+              </select>
+            </label>
+            <label className="field full">
+              <span>Notes (optional)</span>
+              <textarea value={notes} onChange={(event) => setNotes(event.target.value)} rows={2} />
+            </label>
+          </div>
+          {requiresCardCharge ? (
+            <div className="payment-panel payment-panel-stack">
+              <div>
+                <p className="eyebrow">Card payment (Stripe)</p>
+                <h3>Charge {formatMoney(total)} on reader</h3>
+              </div>
+              <div className="card-reader-row">
+                <span className={`reader-dot ${reader.status}`} aria-hidden="true" />
+                <span className="muted">
+                  {reader.status === "connected"
+                    ? `Reader: ${reader.label}`
+                    : reader.status === "connecting"
+                      ? "Connecting..."
+                      : "No reader connected"}
+                </span>
+                <button
+                  className="secondary-button"
+                  type="button"
+                  onClick={handleConnectReader}
+                  disabled={reader.status === "connecting"}
+                >
+                  {reader.status === "connected" ? "Reconnect" : "Connect reader"}
+                </button>
+              </div>
+              <label className="field checkbox-field">
+                <input
+                  type="checkbox"
+                  checked={useSimulatedReader}
+                  onChange={(event) => setUseSimulatedReader(event.target.checked)}
+                />
+                <span>Use Stripe simulated reader (for testing without hardware)</span>
+              </label>
+              <button
+                className="secondary-button"
+                type="button"
+                onClick={chargeCard}
+                disabled={!total || card.status === "charging" || card.status === "paid"}
+              >
+                {card.status === "paid"
+                  ? "Card charged"
+                  : card.status === "charging"
+                    ? "Waiting for card..."
+                    : "Charge card (tap / dip / swipe)"}
+              </button>
+              {card.message ? (
+                <p className={card.status === "error" ? "summary-error" : "muted"}>{card.message}</p>
+              ) : null}
+              {reader.message ? <p className="summary-error">{reader.message}</p> : null}
+            </div>
+          ) : null}
+          {imeiIssue ? (
+            <p className="muted pos-warning">{imeiIssue}</p>
+          ) : null}
+          {requiresCardCharge && !cardChargeComplete && !imeiIssue ? (
+            <p className="muted pos-warning">Charge the card before completing the sale.</p>
+          ) : null}
+          <button className="primary-button" type="button" disabled={!canCheckout} onClick={handleCheckout}>
+            Complete sale - {formatMoney(total)}
+          </button>
+        </section>
+      </div>
+
+      <section className="history">
+        <div className="history-header">
+          <div>
+            <p className="eyebrow">Quick add</p>
+            <h2>Tap a product</h2>
+          </div>
+        </div>
+        <div className="pos-product-grid">
+          {availableProducts.length ? (
+            availableProducts.map((product) => (
+              <button
+                className="pos-product"
+                type="button"
+                key={product.id}
+                onClick={() => {
+                  addProductToCart(product);
+                  setMessage(`Added ${product.name}.`);
+                  scanRef.current?.focus();
+                }}
+              >
+                <strong>{product.name}</strong>
+                <span>{formatMoney(Number(product.price) || 0)}</span>
+                <small className="muted">
+                  {product.requiresImei
+                    ? `In stock ${product.imeis?.length || 0} - IMEI`
+                    : `Stock ${Number(product.quantity) || 0}`}
+                </small>
+              </button>
+            ))
+          ) : (
+            <p className="empty-state">No products for this store yet. Add them in Inventory.</p>
+          )}
+        </div>
+      </section>
+
+      {completedSale ? (
+        <SaleReceiptDialog sale={completedSale} onClose={startNewSale} />
+      ) : null}
+    </>
+  );
+}
+
+function SaleReceiptDialog({ sale, onClose }) {
+  const details = sale.details || {};
+  const lines = details.lineItems || [];
+  const total = Number(sale.paymentAmount) || 0;
+  const soldAt = toJsDate(sale.createdAt) || new Date();
+
+  function printReceipt() {
+    const printWindow = window.open("", "_blank", "width=380,height=640");
+    if (!printWindow) {
+      window.print();
+      return;
+    }
+    const rows = lines
+      .map(
+        (line) => `
+          <tr>
+            <td>${line.qty}x ${escapeHtml(line.name)}${line.imei ? `<br/><small>IMEI ${escapeHtml(line.imei)}</small>` : ""}</td>
+            <td style="text-align:right">${formatMoney((Number(line.price) || 0) * (Number(line.qty) || 0))}</td>
+          </tr>`,
+      )
+      .join("");
+    printWindow.document.write(`
+      <html>
+        <head>
+          <title>Receipt</title>
+          <style>
+            body { font-family: ui-sans-serif, system-ui, sans-serif; padding: 16px; color: #111; }
+            h2 { margin: 0 0 2px; }
+            .meta { font-size: 12px; color: #555; margin-bottom: 12px; }
+            table { width: 100%; border-collapse: collapse; font-size: 13px; }
+            td { padding: 6px 0; border-bottom: 1px dashed #ccc; vertical-align: top; }
+            .total { font-size: 16px; font-weight: 700; margin-top: 12px; display: flex; justify-content: space-between; }
+            .thanks { text-align: center; margin-top: 16px; font-size: 12px; color: #555; }
+          </style>
+        </head>
+        <body>
+          <h2>Diamant Telecom</h2>
+          <div class="meta">
+            ${escapeHtml(details.location || "")}<br/>
+            ${soldAt.toLocaleString()}<br/>
+            Cashier: ${escapeHtml(sale.servedBy || "")}${sale.customerPhone ? `<br/>Customer: ${escapeHtml(sale.customerPhone)}` : ""}
+          </div>
+          <table>${rows}</table>
+          <div class="total"><span>Total</span><span>${formatMoney(total)}</span></div>
+          <div class="meta" style="margin-top:6px">Paid by ${escapeHtml(sale.paymentMethod || "")}</div>
+          <div class="thanks">Thank you!</div>
+        </body>
+      </html>`);
+    printWindow.document.close();
+    printWindow.focus();
+    printWindow.print();
+  }
+
+  return (
+    <div className="dialog-backdrop" role="presentation">
+      <div className="dialog-card receipt-card" role="dialog" aria-modal="true">
+        <div className="receipt-success">
+          <span className="receipt-check" aria-hidden="true">&#10003;</span>
+          <div>
+            <h3>Sale complete</h3>
+            <p className="muted">{formatMoney(total)} paid by {sale.paymentMethod}</p>
+          </div>
+        </div>
+
+        <div className="receipt-meta">
+          <span><strong>Store:</strong> {details.location || "-"}</span>
+          <span><strong>Cashier:</strong> {sale.servedBy || "-"}</span>
+          <span><strong>Time:</strong> {formatShortDate(sale.createdAt)}</span>
+          {sale.customerPhone ? <span><strong>Customer:</strong> {sale.customerPhone}</span> : null}
+        </div>
+
+        <div className="receipt-lines">
+          {lines.map((line, index) => (
+            <div className="receipt-line" key={`${line.productId}-${index}`}>
+              <div>
+                <strong>{line.qty}x {line.name}</strong>
+                {line.imei ? <small className="muted">IMEI {line.imei}</small> : null}
+              </div>
+              <span>{formatMoney((Number(line.price) || 0) * (Number(line.qty) || 0))}</span>
+            </div>
+          ))}
+        </div>
+
+        <div className="receipt-total">
+          <span>Total</span>
+          <strong>{formatMoney(total)}</strong>
+        </div>
+
+        <div className="pos-form-actions">
+          <button className="primary-button" type="button" onClick={onClose} autoFocus>
+            New sale
+          </button>
+          <button className="secondary-button" type="button" onClick={printReceipt}>
+            Print receipt
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ImeiLotCapture({ imeis, target, onChangeImeis, blocked = [] }) {
+  const [entry, setEntry] = useState("");
+  const [error, setError] = useState("");
+  const inputRef = useRef(null);
+
+  const targetNum = Number(target) || 0;
+  const reachedTarget = targetNum > 0 && imeis.length >= targetNum;
+
+  function addImei() {
+    const value = entry.replace(/\D/g, "").slice(0, 15);
+    setEntry("");
+    if (!value) return;
+    if (blocked.includes(value)) {
+      setError(`IMEI ${value} is already in this product's stock.`);
+      inputRef.current?.focus();
+      return;
+    }
+    if (imeis.includes(value)) {
+      setError(`IMEI ${value} was already scanned in this lot.`);
+      inputRef.current?.focus();
+      return;
+    }
+    if (reachedTarget) {
+      setError(`You already scanned ${targetNum} IMEIs. Increase the quantity to add more.`);
+      inputRef.current?.focus();
+      return;
+    }
+    onChangeImeis([...imeis, value]);
+    setError("");
+    inputRef.current?.focus();
+  }
+
+  function handleEntryKeyDown(event) {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      addImei();
+    }
+  }
+
+  function removeImei(value) {
+    onChangeImeis(imeis.filter((imei) => imei !== value));
+  }
+
+  return (
+    <div className="field full imei-lot">
+      <span>
+        Scan an IMEI for each unit
+        {targetNum > 0 ? ` (${targetNum} needed to match stock quantity)` : ""}
+      </span>
+      <div className="imei-lot-scan">
+        <label className="field">
+          <span>Scan IMEI one at a time</span>
+          <input
+            ref={inputRef}
+            value={entry}
+            onChange={(event) => setEntry(event.target.value)}
+            onKeyDown={handleEntryKeyDown}
+            placeholder="Scan or type 15-digit IMEI, then Enter"
+            inputMode="numeric"
+            autoComplete="off"
+            spellCheck={false}
+            disabled={reachedTarget}
+          />
+        </label>
+        <button
+          className="secondary-button align-end"
+          type="button"
+          onClick={addImei}
+          disabled={reachedTarget}
+        >
+          Add IMEI
+        </button>
+      </div>
+      <p className="imei-lot-progress">
+        {imeis.length} scanned{targetNum > 0 ? ` / ${targetNum}` : ""}
+        {reachedTarget ? " — complete" : ""}
+      </p>
+      {targetNum > 0 ? (
+        <div className="imei-progress-bar" role="progressbar" aria-valuenow={imeis.length} aria-valuemin={0} aria-valuemax={targetNum}>
+          <div
+            className="imei-progress-fill"
+            style={{ width: `${Math.min(100, (imeis.length / targetNum) * 100)}%` }}
+          />
+        </div>
+      ) : null}
+      {error ? <p className="pos-warning">{error}</p> : null}
+      {imeis.length ? (
+        <div className="imei-chip-list">
+          {imeis.map((imei, index) => (
+            <span className="imei-chip" key={imei}>
+              <strong>{index + 1}.</strong> {imei}
+              <button type="button" onClick={() => removeImei(imei)} aria-label={`Remove ${imei}`}>
+                ×
+              </button>
+            </span>
+          ))}
+        </div>
+      ) : (
+        <p className="imei-lot-empty">Scan the first IMEI above to start this lot.</p>
+      )}
+    </div>
+  );
+}
+
+function RestockDialog({ product, onClose, onAddStock }) {
+  const requiresImei = Boolean(product.requiresImei);
+  const [quantity, setQuantity] = useState("0");
+  const [imeis, setImeis] = useState([]);
+  const currentStock = requiresImei ? product.imeis?.length || 0 : Number(product.quantity) || 0;
+
+  function submit(event) {
+    event.preventDefault();
+    const target = Number(quantity) || 0;
+    if (!target) {
+      window.alert("Enter how many units to add.");
+      return;
+    }
+    if (requiresImei && imeis.length !== target) {
+      window.alert(`You are adding ${target} units but scanned ${imeis.length} IMEIs. Scan exactly ${target}.`);
+      return;
+    }
+    onAddStock({ addQuantity: target, newImeis: imeis });
+    onClose();
+  }
+
+  return (
+    <div className="dialog-backdrop" role="presentation">
+      <div className="dialog-card dialog-card-wide" role="dialog" aria-modal="true">
+        <div>
+          <p className="eyebrow">Add stock</p>
+          <h3>{product.name}</h3>
+          <p className="muted">In stock now: {currentStock}{requiresImei ? " IMEIs" : ""}</p>
+        </div>
+        <form className="form-grid dialog-form" onSubmit={submit}>
+          <label className="field">
+            <span>Quantity to add</span>
+            <input
+              type="number"
+              min="0"
+              value={quantity}
+              onChange={(event) => setQuantity(event.target.value)}
+              autoFocus
+            />
+          </label>
+          {requiresImei ? (
+            <ImeiLotCapture
+              imeis={imeis}
+              target={quantity}
+              onChangeImeis={setImeis}
+              blocked={product.imeis || []}
+            />
+          ) : null}
+          <div className="pos-form-actions">
+            <button className="primary-button" type="submit">Add to stock</button>
+            <button className="secondary-button" type="button" onClick={onClose}>Cancel</button>
+          </div>
+        </form>
+      </div>
+    </div>
+  );
+}
+
+function InventoryPage({
+  products,
+  employees,
+  storeLocations,
+  employeeLocations,
+  sessionRole,
+  onSaveProduct,
+  onRemoveProduct,
+  onAddStoreLocation,
+  onRemoveStoreLocation,
+  onSetEmployeeLocation,
+}) {
+  const isAdmin = sessionRole === "admin";
+  const emptyForm = {
+    id: "",
+    sku: "",
+    name: "",
+    price: "",
+    category: productCategories[0],
+    requiresImei: false,
+    location: storeLocations[0] || "",
+    quantity: "0",
+    imeis: [],
+  };
+  const [form, setForm] = useState(emptyForm);
+  const [newStore, setNewStore] = useState("");
+  const [search, setSearch] = useState("");
+  const [restock, setRestock] = useState(null);
+
+  function updateField(name, value) {
+    setForm((current) => ({ ...current, [name]: value }));
+  }
+
+  function addStock(product, { addQuantity, newImeis }) {
+    if (product.requiresImei) {
+      onSaveProduct({ ...product, imeis: [...(product.imeis || []), ...newImeis] });
+    } else {
+      onSaveProduct({ ...product, quantity: (Number(product.quantity) || 0) + addQuantity });
+    }
+  }
+
+  function submit(event) {
+    event.preventDefault();
+    if (!form.sku.trim() || !form.name.trim()) {
+      window.alert("SKU and name are required.");
+      return;
+    }
+    if (form.requiresImei) {
+      const target = Number(form.quantity) || 0;
+      if (!target) {
+        window.alert("Set a stock quantity, then scan that many IMEIs.");
+        return;
+      }
+      if (form.imeis.length !== target) {
+        window.alert(`Stock quantity is ${target} but you scanned ${form.imeis.length} IMEIs. Scan exactly ${target}.`);
+        return;
+      }
+    }
+    onSaveProduct(form);
+    setForm({ ...emptyForm, location: form.location });
+  }
+
+  function editProduct(product) {
+    setForm({
+      ...emptyForm,
+      ...product,
+      price: String(product.price ?? ""),
+      quantity: String(product.quantity ?? 0),
+      imeis: product.imeis || [],
+    });
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  }
+
+  const filtered = useMemo(() => {
+    const query = search.trim().toLowerCase();
+    return products
+      .filter((product) => {
+        if (!query) return true;
+        return [product.name, product.sku, product.category, product.location]
+          .join(" ")
+          .toLowerCase()
+          .includes(query);
+      })
+      .sort((a, b) => String(a.name || "").localeCompare(String(b.name || "")));
+  }, [products, search]);
+
+  function locationFor(name) {
+    return (employeeLocations || []).find((entry) => entry?.name === name)?.location || "";
+  }
+
+  if (!isAdmin) {
+    return (
+      <section className="workspace">
+        <div className="workspace-header">
+          <div>
+            <p className="eyebrow">Inventory</p>
+            <h2>Admin only</h2>
+          </div>
+        </div>
+        <p className="empty-state">Only admins can manage the catalog and stores.</p>
+      </section>
+    );
+  }
+
+  return (
+    <>
+      <section className="workspace">
+        <div className="workspace-header">
+          <div>
+            <p className="eyebrow">Inventory</p>
+            <h2>{form.id ? "Edit product" : "Add product"}</h2>
+          </div>
+        </div>
+        <form className="form-grid inventory-form" onSubmit={submit}>
+          <p className="form-section-title">Product details</p>
+          <label className="field">
+            <span>SKU / barcode</span>
+            <input
+              value={form.sku}
+              onChange={(event) => updateField("sku", event.target.value)}
+              placeholder="Scan or type"
+              autoComplete="off"
+              spellCheck={false}
+              required
+            />
+          </label>
+          <label className="field">
+            <span>Name</span>
+            <input value={form.name} onChange={(event) => updateField("name", event.target.value)} required />
+          </label>
+          <label className="field">
+            <span>Price</span>
+            <input
+              inputMode="decimal"
+              value={form.price}
+              onChange={(event) => updateField("price", event.target.value)}
+              placeholder="0.00"
+            />
+          </label>
+          <label className="field">
+            <span>Category</span>
+            <select value={form.category} onChange={(event) => updateField("category", event.target.value)}>
+              {productCategories.map((category) => (
+                <option key={category}>{category}</option>
+              ))}
+            </select>
+          </label>
+          <label className="field">
+            <span>Store</span>
+            <select value={form.location} onChange={(event) => updateField("location", event.target.value)}>
+              <option value="">All stores</option>
+              {storeLocations.map((location) => (
+                <option key={location}>{location}</option>
+              ))}
+            </select>
+          </label>
+          <p className="form-section-title">Stock</p>
+          <label className="field">
+            <span>Stock quantity</span>
+            <input
+              type="number"
+              min="0"
+              value={form.quantity}
+              onChange={(event) => updateField("quantity", event.target.value)}
+            />
+          </label>
+          <label className="field checkbox-field">
+            <input
+              type="checkbox"
+              checked={form.requiresImei}
+              onChange={(event) => updateField("requiresImei", event.target.checked)}
+            />
+            <span>Require IMEI scan at checkout (phones)</span>
+          </label>
+          {form.requiresImei ? (
+            <ImeiLotCapture
+              imeis={form.imeis}
+              target={form.quantity}
+              onChangeImeis={(next) => updateField("imeis", next)}
+            />
+          ) : null}
+          <div className="pos-form-actions form-actions-row">
+            <button className="primary-button" type="submit">{form.id ? "Save changes" : "Add product"}</button>
+            {form.id ? (
+              <button className="secondary-button" type="button" onClick={() => setForm(emptyForm)}>
+                Cancel
+              </button>
+            ) : null}
+          </div>
+        </form>
+      </section>
+
+      <section className="history">
+        <div className="history-header">
+          <div>
+            <p className="eyebrow">Catalog</p>
+            <h2>Products ({products.length})</h2>
+          </div>
+          <input
+            className="pos-search"
+            value={search}
+            onChange={(event) => setSearch(event.target.value)}
+            placeholder="Search name, SKU, store"
+          />
+        </div>
+        <div className="table-wrap catalog-table">
+          <table>
+            <thead>
+              <tr>
+                <th>Name</th>
+                <th>SKU</th>
+                <th>Category</th>
+                <th>Store</th>
+                <th>Price</th>
+                <th>Stock</th>
+                <th>IMEI</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody>
+              {filtered.length ? (
+                filtered.map((product) => (
+                  <tr key={product.id}>
+                    <td><strong>{product.name}</strong></td>
+                    <td>{product.sku}</td>
+                    <td>{product.category}</td>
+                    <td>{product.location || "All stores"}</td>
+                    <td>{formatMoney(Number(product.price) || 0)}</td>
+                    <td>{product.requiresImei ? (product.imeis?.length || 0) : Number(product.quantity) || 0}</td>
+                    <td>{product.requiresImei ? "Yes" : "No"}</td>
+                    <td className="pos-row-actions">
+                      <button className="secondary-button compact-button" type="button" onClick={() => setRestock(product)}>
+                        Restock
+                      </button>
+                      <button className="secondary-button compact-button" type="button" onClick={() => editProduct(product)}>
+                        Edit
+                      </button>
+                      <button className="secondary-button compact-button" type="button" onClick={() => onRemoveProduct(product.id)}>
+                        Delete
+                      </button>
+                    </td>
+                  </tr>
+                ))
+              ) : (
+                <tr>
+                  <td colSpan="8" className="empty-state">No products yet.</td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section className="history">
+        <div className="history-header">
+          <div>
+            <p className="eyebrow">Stores</p>
+            <h2>Locations</h2>
+          </div>
+        </div>
+        <form
+          className="handler-form"
+          onSubmit={(event) => {
+            event.preventDefault();
+            onAddStoreLocation(newStore);
+            setNewStore("");
+          }}
+        >
+          <label className="field">
+            <span>New store name</span>
+            <input value={newStore} onChange={(event) => setNewStore(event.target.value)} required />
+          </label>
+          <button className="primary-button align-end" type="submit">Add store</button>
+        </form>
+        <div className="request-list">
+          {storeLocations.map((location) => (
+            <div className="request-row" key={location}>
+              <div>
+                <strong>{location}</strong>
+              </div>
+              <button className="secondary-button" type="button" onClick={() => onRemoveStoreLocation(location)}>
+                Remove
+              </button>
+            </div>
+          ))}
+        </div>
+      </section>
+
+      <section className="history">
+        <div className="history-header">
+          <div>
+            <p className="eyebrow">Staff</p>
+            <h2>Assign employees to a store</h2>
+          </div>
+        </div>
+        <div className="request-list">
+          {employees.map((employee) => (
+            <div className="request-row" key={employee}>
+              <div>
+                <strong>{employee}</strong>
+                <p className="muted">POS sales are recorded at this store</p>
+              </div>
+              <select
+                className="status-select"
+                value={locationFor(employee)}
+                onChange={(event) => onSetEmployeeLocation(employee, event.target.value)}
+              >
+                <option value="">Default ({storeLocations[0] || "none"})</option>
+                {storeLocations.map((location) => (
+                  <option key={location}>{location}</option>
+                ))}
+              </select>
+            </div>
+          ))}
+        </div>
+      </section>
+
+      {restock ? (
+        <RestockDialog
+          product={restock}
+          onClose={() => setRestock(null)}
+          onAddStock={(payload) => addStock(restock, payload)}
+        />
+      ) : null}
+    </>
+  );
+}
+
 function AdminPage({
   employees,
   reports,
@@ -2573,8 +3782,11 @@ function ReportDetails({ report }) {
     sale: [
       ["Request", details.request],
       ["Product", details.productType],
+      ["Store", details.location],
+      ["Items", details.itemsText],
       ["Model", details.model],
       ["IMEI", details.imei],
+      ["Card txn", details.stripePaymentIntentId || details.solaTransactionId],
     ],
     call: [
       ["Caller", details.callerName],
