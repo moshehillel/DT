@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
   ACTIVE_EMPLOYEE_KEY,
+  CUSTOMERS_KEY,
   defaultEmployees,
   defaultManualReportType,
   defaultOrderHandlers,
@@ -108,6 +109,7 @@ function Workspace({ currentUser, isAdmin }) {
   const [employeeLocations, setEmployeeLocations] = useCloudDocumentState("employeeLocations", EMPLOYEE_LOCATIONS_KEY, []);
   const [storeDevices, setStoreDevices] = useCloudDocumentState("storeDevices", STORE_DEVICES_KEY, []);
   const [storeTax, setStoreTax] = useCloudDocumentState("storeTax", STORE_TAX_KEY, []);
+  const [customers, setCustomers] = useCloudCollectionState("customers", CUSTOMERS_KEY, []);
   // Employees are locked to their own identity; admins can file/view as any
   // employee in the list.
   const [activeEmployee, setActiveEmployee] = useState(
@@ -282,6 +284,122 @@ function Workspace({ currentUser, isAdmin }) {
     );
   }
 
+  // Auto-add/merge a customer into the CRM from any sale/call/order. Only fills
+  // blank fields on an existing customer — never overwrites entered details.
+  function upsertCustomer(info) {
+    const phone = String(info?.phone || "").trim();
+    const digits = digitsOnly(phone);
+    if (!digits) return;
+    setCustomers((current) => {
+      const index = current.findIndex((entry) => entry.phoneDigits === digits);
+      const now = new Date().toISOString();
+      if (index === -1) {
+        return [
+          {
+            id: crypto.randomUUID(),
+            name: String(info.name || "").trim(),
+            phone,
+            phoneDigits: digits,
+            address: String(info.address || "").trim(),
+            email: String(info.email || "").trim(),
+            contactDetails: String(info.contactDetails || "").trim(),
+            notes: "",
+            createdAt: now,
+            updatedAt: now,
+          },
+          ...current,
+        ];
+      }
+      const existing = current[index];
+      const merged = {
+        ...existing,
+        phone: existing.phone || phone,
+        name: existing.name || String(info.name || "").trim(),
+        address: existing.address || String(info.address || "").trim(),
+        email: existing.email || String(info.email || "").trim(),
+        contactDetails: existing.contactDetails || String(info.contactDetails || "").trim(),
+      };
+      if (
+        merged.phone === existing.phone &&
+        merged.name === existing.name &&
+        merged.address === existing.address &&
+        merged.email === existing.email &&
+        merged.contactDetails === existing.contactDetails
+      ) {
+        return current;
+      }
+      merged.updatedAt = now;
+      const next = [...current];
+      next[index] = merged;
+      return next;
+    });
+  }
+
+  // Manual create/edit from the CRM page.
+  function saveCustomer(customer) {
+    const phone = String(customer.phone || "").trim();
+    const digits = digitsOnly(phone);
+    const now = new Date().toISOString();
+    const normalized = {
+      phone,
+      phoneDigits: digits,
+      name: String(customer.name || "").trim(),
+      address: String(customer.address || "").trim(),
+      email: String(customer.email || "").trim(),
+      contactDetails: String(customer.contactDetails || "").trim(),
+      notes: String(customer.notes || "").trim(),
+      updatedAt: now,
+    };
+    setCustomers((current) => {
+      if (customer.id && current.some((entry) => entry.id === customer.id)) {
+        return current.map((entry) => (entry.id === customer.id ? { ...entry, ...normalized } : entry));
+      }
+      const index = digits ? current.findIndex((entry) => entry.phoneDigits === digits) : -1;
+      if (index !== -1) {
+        const next = [...current];
+        next[index] = { ...next[index], ...normalized };
+        return next;
+      }
+      return [{ ...normalized, id: customer.id || crypto.randomUUID(), createdAt: now }, ...current];
+    });
+  }
+
+  function removeCustomer(customerId) {
+    setCustomers((current) => current.filter((entry) => entry.id !== customerId));
+  }
+
+  // Backfill the CRM with any customer phone seen in reports but not yet saved.
+  function syncCustomersFromReports() {
+    const existing = new Set(customers.map((entry) => entry.phoneDigits));
+    const seen = new Set();
+    const additions = [];
+    const now = new Date().toISOString();
+    reports.forEach((report) => {
+      const digits = report.customerPhoneDigits || digitsOnly(report.customerPhone);
+      if (!digits || existing.has(digits) || seen.has(digits)) return;
+      seen.add(digits);
+      const details = report.details || {};
+      additions.push({
+        id: crypto.randomUUID(),
+        name: String(details.customerName || details.callerName || "").trim(),
+        phone: String(report.customerPhone || "").trim(),
+        phoneDigits: digits,
+        address: String(details.address || "").trim(),
+        email: "",
+        contactDetails: String(details.contactDetails || "").trim(),
+        notes: "",
+        createdAt: now,
+        updatedAt: now,
+      });
+    });
+    if (!additions.length) {
+      window.alert("All customers from reports are already in the CRM.");
+      return;
+    }
+    setCustomers((current) => [...additions, ...current]);
+    window.alert(`Added ${additions.length} customer${additions.length === 1 ? "" : "s"} from reports.`);
+  }
+
   function setEmployeeLocation(name, location) {
     setEmployeeLocations((current) => {
       const others = (current || []).filter((entry) => entry?.name !== name);
@@ -344,6 +462,7 @@ function Workspace({ currentUser, isAdmin }) {
 
   async function savePosSale(sale) {
     const enriched = await attachAuthMetadata(sale);
+    upsertCustomer({ phone: sale.customerPhone });
     setReports((current) => [enriched, ...current]);
     setProducts((current) =>
       current.map((product) => {
@@ -371,6 +490,11 @@ function Workspace({ currentUser, isAdmin }) {
     const enriched = await attachAuthMetadata({
       ...report,
       location: report.location || activeLocation,
+    });
+    upsertCustomer({
+      phone: report.customerPhone,
+      name: report.details?.customerName || report.details?.callerName,
+      address: report.details?.address,
     });
     setReports((current) => [enriched, ...current]);
     setFormNonce((value) => value + 1);
@@ -419,6 +543,10 @@ function Workspace({ currentUser, isAdmin }) {
       ...completedReport,
       location: completedReport.location || completedReport.details?.location || activeLocation,
     });
+    upsertCustomer({
+      phone: completedReport.customerPhone,
+      name: completedReport.details?.callerName || completedReport.details?.customerName,
+    });
     setReports((current) => [enriched, ...current]);
     setPendingReports((current) => current.filter((report) => report.id !== pendingReportId));
   }
@@ -437,6 +565,12 @@ function Workspace({ currentUser, isAdmin }) {
       assignedEmployeeId,
       createdByEmployeeId: assignedEmployeeId,
     };
+    upsertCustomer({
+      phone: order.customerPhone,
+      name: order.customerName,
+      address: order.address,
+      contactDetails: order.contactDetails,
+    });
     setPhoneOrders((current) => [enrichedOrder, ...current]);
     queuePhoneOrderAssignedNotifications(enrichedOrder);
     setFormNonce((value) => value + 1);
@@ -829,6 +963,7 @@ function Workspace({ currentUser, isAdmin }) {
           <PendingReportsPage
             pendingReports={pendingReports}
             activeEmployee={activeEmployee}
+            customers={customers}
             onClaim={claimPendingReport}
             onSave={savePendingReport}
           />
@@ -837,12 +972,21 @@ function Workspace({ currentUser, isAdmin }) {
             reports={filteredReports}
             onStatusChange={updateRepairStatus}
           />
+        ) : activeView === "customers" ? (
+          <CustomersPage
+            customers={customers}
+            sessionRole={sessionRole}
+            onSave={saveCustomer}
+            onRemove={removeCustomer}
+            onSync={syncCustomersFromReports}
+          />
         ) : activeView === "reports" ? (
           <>
             {activeType === "rental" ? (
               <RentalReportForm
                 key={`${activeType}-${formNonce}`}
                 activeEmployee={activeEmployee}
+                customers={customers}
                 onSave={saveReport}
               />
             ) : activeType === "phoneOrder" ? (
@@ -853,6 +997,7 @@ function Workspace({ currentUser, isAdmin }) {
                 phoneOrders={phoneOrders}
                 orderHandlers={orderHandlers}
                 storeTax={storeTax}
+                customers={customers}
                 onCreate={createPhoneOrder}
                 onDelivered={completePhoneOrder}
               />
@@ -862,6 +1007,7 @@ function Workspace({ currentUser, isAdmin }) {
                 activeType={activeType}
                 activeEmployee={activeEmployee}
                 reports={reports}
+                customers={customers}
                 onSave={saveReport}
               />
             )}
@@ -891,6 +1037,7 @@ function Workspace({ currentUser, isAdmin }) {
             activeLocation={activeLocation}
             activeDeviceId={activeDeviceId}
             activeTaxRate={activeTaxRate}
+            customers={customers}
             onCompleteSale={savePosSale}
           />
         ) : activeView === "inventory" ? (
@@ -1117,6 +1264,17 @@ function Sidebar({
             <small>Active tickets</small>
           </span>
         </button>
+        <button
+          className={`tab ${activeView === "customers" ? "active" : ""}`}
+          type="button"
+          onClick={() => onViewChange("customers")}
+        >
+          <span className="tab-mark">C</span>
+          <span>
+            <strong>Customers</strong>
+            <small>CRM &amp; contacts</small>
+          </span>
+        </button>
 
         <p className="nav-section-title">Sell &amp; record</p>
         <button
@@ -1206,8 +1364,9 @@ function Sidebar({
   );
 }
 
-function ReportForm({ activeType, activeEmployee, reports, onSave }) {
+function ReportForm({ activeType, activeEmployee, reports, customers, onSave }) {
   const [now, setNow] = useState(new Date());
+  const [customerPhone, setCustomerPhone] = useState("");
   const config = reportTypes[activeType];
 
   useEffect(() => {
@@ -1266,7 +1425,15 @@ function ReportForm({ activeType, activeEmployee, reports, onSave }) {
         <div className="form-grid">
           <label className="field">
             <span>Customer / caller number</span>
-            <input name="customerPhone" inputMode="tel" autoComplete="tel" placeholder="(555) 123-4567" required />
+            <CustomerPhoneInput
+              name="customerPhone"
+              value={customerPhone}
+              onChange={setCustomerPhone}
+              customers={customers}
+              onSelectCustomer={(customer) => setCustomerPhone(customer.phone)}
+              placeholder="(555) 123-4567"
+              required
+            />
           </label>
 
           <label className="field">
@@ -1361,7 +1528,7 @@ function NotificationCenter({ notifications }) {
   );
 }
 
-function RentalReportForm({ activeEmployee, onSave }) {
+function RentalReportForm({ activeEmployee, customers, onSave }) {
   const [now, setNow] = useState(new Date());
   const [form, setForm] = useState({
     rentalRegion: "RCUK",
@@ -1884,7 +2051,13 @@ function RentalReportForm({ activeEmployee, onSave }) {
           <div className="form-grid">
             <label className="field">
               <span>Customer phone</span>
-              <input inputMode="tel" value={form.customerPhone} onChange={(event) => updateField("customerPhone", event.target.value)} required />
+              <CustomerPhoneInput
+                value={form.customerPhone}
+                onChange={(value) => updateField("customerPhone", value)}
+                customers={customers}
+                onSelectCustomer={(customer) => updateField("customerPhone", customer.phone)}
+                required
+              />
             </label>
             <label className="field">
               <span>Days until return</span>
@@ -2325,7 +2498,7 @@ function OpenRepairsPage({ reports, onStatusChange }) {
   );
 }
 
-function PendingReportsPage({ pendingReports, activeEmployee, onClaim, onSave }) {
+function PendingReportsPage({ pendingReports, activeEmployee, customers, onClaim, onSave }) {
   return (
     <section className="history">
       <div className="history-header">
@@ -2343,6 +2516,7 @@ function PendingReportsPage({ pendingReports, activeEmployee, onClaim, onSave })
               key={pendingReport.id}
               pendingReport={pendingReport}
               activeEmployee={activeEmployee}
+              customers={customers}
               onClaim={onClaim}
               onSave={onSave}
             />
@@ -2355,7 +2529,7 @@ function PendingReportsPage({ pendingReports, activeEmployee, onClaim, onSave })
   );
 }
 
-function PendingReportCard({ pendingReport, activeEmployee, onClaim, onSave }) {
+function PendingReportCard({ pendingReport, activeEmployee, customers, onClaim, onSave }) {
   const imported = pendingReport.imported || {};
   const isCallReport = pendingReport.type === "call" || pendingReport.source === "telebroad";
   const isShopifySale = pendingReport.source === "shopify_pos";
@@ -2535,7 +2709,16 @@ function PendingReportCard({ pendingReport, activeEmployee, onClaim, onSave }) {
         <div className="pending-fields">
           <label className="field">
             <span>Customer phone</span>
-            <input value={fields.customerPhone} onChange={(event) => updateField("customerPhone", event.target.value)} />
+            <CustomerPhoneInput
+              value={fields.customerPhone}
+              onChange={(value) => updateField("customerPhone", value)}
+              customers={customers}
+              onSelectCustomer={(customer) => setFields((current) => ({
+                ...current,
+                customerPhone: customer.phone || current.customerPhone,
+                callerName: customer.name || current.callerName,
+              }))}
+            />
           </label>
           {isCallReport ? (
             <>
@@ -2607,9 +2790,19 @@ function PendingReportCard({ pendingReport, activeEmployee, onClaim, onSave }) {
   );
 }
 
-function PhoneOrderPage({ activeEmployee, sessionRole, phoneOrders, orderHandlers, storeTax, onCreate, onDelivered }) {
+function PhoneOrderPage({ activeEmployee, sessionRole, phoneOrders, orderHandlers, storeTax, customers, onCreate, onDelivered }) {
   const [now, setNow] = useState(new Date());
   const [outOfState, setOutOfState] = useState(false);
+
+  function fillFromCustomer(customer) {
+    setForm((current) => ({
+      ...current,
+      customerPhone: customer.phone || current.customerPhone,
+      customerName: customer.name || current.customerName,
+      address: customer.address || current.address,
+      contactDetails: customer.contactDetails || current.contactDetails,
+    }));
+  }
   const [form, setForm] = useState({
     location: orderHandlers[0]?.location || "",
     assignedTo: orderHandlers[0]?.name || "",
@@ -2768,7 +2961,13 @@ function PhoneOrderPage({ activeEmployee, sessionRole, phoneOrders, orderHandler
           </label>
           <label className="field">
             <span>Customer phone</span>
-            <input inputMode="tel" value={form.customerPhone} onChange={(event) => updateField("customerPhone", event.target.value)} required />
+            <CustomerPhoneInput
+              value={form.customerPhone}
+              onChange={(value) => updateField("customerPhone", value)}
+              customers={customers}
+              onSelectCustomer={fillFromCustomer}
+              required
+            />
           </label>
           <label className="field">
             <span>Contact details</span>
@@ -2921,9 +3120,10 @@ function OpenPhoneOrders({ orders, activeEmployee, sessionRole, onDelivered }) {
   );
 }
 
-function PosPage({ products, activeEmployee, activeLocation, activeDeviceId, activeTaxRate, onCompleteSale }) {
+function PosPage({ products, activeEmployee, activeLocation, activeDeviceId, activeTaxRate, customers, onCompleteSale }) {
   const [cart, setCart] = useState([]);
   const [scan, setScan] = useState("");
+  const [scanMode, setScanMode] = useState(true);
   const [customerPhone, setCustomerPhone] = useState("");
   const [paymentMethod, setPaymentMethod] = useState(paymentMethods[0]);
   const [outOfState, setOutOfState] = useState(false);
@@ -3165,18 +3365,22 @@ function PosPage({ products, activeEmployee, activeLocation, activeDeviceId, act
           </div>
         </div>
 
+        <div className="segmented-control scan-mode" role="tablist" aria-label="Entry mode">
+          <button type="button" className={scanMode ? "selected" : ""} onClick={() => { setScanMode(true); scanRef.current?.focus(); }}>Scan</button>
+          <button type="button" className={!scanMode ? "selected" : ""} onClick={() => { setScanMode(false); scanRef.current?.focus(); }}>Manual</button>
+        </div>
         <form className="pos-scan" onSubmit={handleScan}>
           <input
             ref={scanRef}
             className="pos-scan-input"
             value={scan}
             onChange={(event) => setScan(event.target.value)}
-            placeholder="Scan or type a barcode / SKU, then Enter"
+            placeholder={scanMode ? "Scan a barcode — it adds automatically" : "Type SKU / barcode, then press Enter"}
             inputMode="text"
             autoComplete="off"
             spellCheck={false}
           />
-          <button className="primary-button" type="submit">Add</button>
+          {!scanMode ? <button className="primary-button" type="submit">Add</button> : null}
         </form>
         {message ? (
           <p className={`pos-message ${message.includes("Added") || message.includes("Ready") ? "pos-message-ok" : ""}`}>
@@ -3268,10 +3472,11 @@ function PosPage({ products, activeEmployee, activeLocation, activeDeviceId, act
           <div className="form-grid">
             <label className="field">
               <span>Customer phone (optional)</span>
-              <input
-                inputMode="tel"
+              <CustomerPhoneInput
                 value={customerPhone}
-                onChange={(event) => setCustomerPhone(event.target.value)}
+                onChange={setCustomerPhone}
+                customers={customers}
+                onSelectCustomer={(customer) => setCustomerPhone(customer.phone)}
                 placeholder="For receipt / follow-up"
               />
             </label>
@@ -3589,6 +3794,7 @@ function SaleReceiptDialog({ sale, onClose }) {
 function ImeiLotCapture({ imeis, target, onChangeImeis, blocked = [] }) {
   const [entry, setEntry] = useState("");
   const [error, setError] = useState("");
+  const [scanMode, setScanMode] = useState(true);
   const inputRef = useRef(null);
 
   const targetNum = Number(target) || 0;
@@ -3635,29 +3841,35 @@ function ImeiLotCapture({ imeis, target, onChangeImeis, blocked = [] }) {
         Scan an IMEI for each unit
         {targetNum > 0 ? ` (${targetNum} needed to match stock quantity)` : ""}
       </span>
+      <div className="segmented-control scan-mode" role="tablist" aria-label="IMEI entry mode">
+        <button type="button" className={scanMode ? "selected" : ""} onClick={() => { setScanMode(true); inputRef.current?.focus(); }}>Scan</button>
+        <button type="button" className={!scanMode ? "selected" : ""} onClick={() => { setScanMode(false); inputRef.current?.focus(); }}>Manual</button>
+      </div>
       <div className="imei-lot-scan">
         <label className="field">
-          <span>Scan IMEI one at a time</span>
+          <span>{scanMode ? "Scan an IMEI — it adds automatically" : "Type a 15-digit IMEI, then press Enter"}</span>
           <input
             ref={inputRef}
             value={entry}
             onChange={(event) => setEntry(event.target.value)}
             onKeyDown={handleEntryKeyDown}
-            placeholder="Scan or type 15-digit IMEI, then Enter"
+            placeholder={scanMode ? "Scan IMEI" : "Type 15-digit IMEI, then Enter"}
             inputMode="numeric"
             autoComplete="off"
             spellCheck={false}
             disabled={reachedTarget}
           />
         </label>
-        <button
-          className="secondary-button align-end"
-          type="button"
-          onClick={addImei}
-          disabled={reachedTarget}
-        >
-          Add IMEI
-        </button>
+        {!scanMode ? (
+          <button
+            className="secondary-button align-end"
+            type="button"
+            onClick={addImei}
+            disabled={reachedTarget}
+          >
+            Add IMEI
+          </button>
+        ) : null}
       </div>
       <p className="imei-lot-progress">
         {imeis.length} scanned{targetNum > 0 ? ` / ${targetNum}` : ""}
@@ -4695,6 +4907,158 @@ function ReturnDialog({ report, onClose, onSubmit }) {
 
 function friendlyCallError(error) {
   return error?.message || "Action failed. Make sure you are signed in as an admin and Functions are deployed.";
+}
+
+// Phone input with a CRM type-ahead. As digits are typed, matching customers
+// appear; picking one fills the customer's other details via onSelectCustomer.
+function CustomerPhoneInput({ value, onChange, customers, onSelectCustomer, placeholder, required, name, autoFocus }) {
+  const [open, setOpen] = useState(false);
+  const digits = digitsOnly(value);
+  const matches = digits.length >= 2
+    ? (customers || []).filter((customer) => (customer.phoneDigits || "").includes(digits)).slice(0, 8)
+    : [];
+
+  return (
+    <div className="phone-autocomplete">
+      <input
+        name={name}
+        value={value}
+        inputMode="tel"
+        autoComplete="off"
+        required={required}
+        autoFocus={autoFocus}
+        placeholder={placeholder}
+        onChange={(event) => {
+          onChange(event.target.value);
+          setOpen(true);
+        }}
+        onFocus={() => setOpen(true)}
+        onBlur={() => window.setTimeout(() => setOpen(false), 150)}
+      />
+      {open && matches.length ? (
+        <div className="phone-autocomplete-menu">
+          {matches.map((customer) => (
+            <button
+              type="button"
+              className="phone-autocomplete-item"
+              key={customer.id}
+              onMouseDown={(event) => {
+                event.preventDefault();
+                onSelectCustomer?.(customer);
+                setOpen(false);
+              }}
+            >
+              <strong>{customer.name || "(no name)"}</strong>
+              <span>{customer.phone}</span>
+              {customer.address ? <small>{customer.address}</small> : null}
+            </button>
+          ))}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function CustomersPage({ customers, sessionRole, onSave, onRemove, onSync }) {
+  const emptyCustomer = { id: "", name: "", phone: "", address: "", email: "", contactDetails: "", notes: "" };
+  const [form, setForm] = useState(emptyCustomer);
+  const [search, setSearch] = useState("");
+  const isAdmin = sessionRole === "admin";
+
+  function update(field, value) {
+    setForm((current) => ({ ...current, [field]: value }));
+  }
+
+  function submit(event) {
+    event.preventDefault();
+    if (!form.phone.trim() && !form.name.trim()) return;
+    onSave(form);
+    setForm(emptyCustomer);
+  }
+
+  function editCustomer(customer) {
+    setForm({ ...emptyCustomer, ...customer });
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  }
+
+  const filtered = useMemo(() => {
+    const query = search.trim().toLowerCase();
+    const queryDigits = digitsOnly(query);
+    return [...customers]
+      .filter((customer) => {
+        if (!query) return true;
+        const text = [customer.name, customer.phone, customer.address, customer.email, customer.contactDetails]
+          .filter(Boolean)
+          .join(" ")
+          .toLowerCase();
+        return text.includes(query) || (queryDigits && (customer.phoneDigits || "").includes(queryDigits));
+      })
+      .sort((a, b) => String(a.name || a.phone || "").localeCompare(String(b.name || b.phone || "")));
+  }, [customers, search]);
+
+  return (
+    <>
+      <section className="workspace">
+        <div className="workspace-header">
+          <div>
+            <p className="eyebrow">CRM</p>
+            <h2>{form.id ? "Edit customer" : "Add customer"}</h2>
+          </div>
+        </div>
+        <form className="form-grid inventory-form" onSubmit={submit}>
+          <label className="field"><span>Name</span><input value={form.name} onChange={(event) => update("name", event.target.value)} /></label>
+          <label className="field"><span>Phone</span><input inputMode="tel" value={form.phone} onChange={(event) => update("phone", event.target.value)} /></label>
+          <label className="field"><span>Email</span><input type="email" value={form.email} onChange={(event) => update("email", event.target.value)} /></label>
+          <label className="field"><span>Address</span><input value={form.address} onChange={(event) => update("address", event.target.value)} /></label>
+          <label className="field"><span>Contact details</span><input value={form.contactDetails} onChange={(event) => update("contactDetails", event.target.value)} placeholder="Email, WhatsApp, alt phone" /></label>
+          <label className="field full"><span>Notes</span><textarea rows="2" value={form.notes} onChange={(event) => update("notes", event.target.value)} /></label>
+          <div className="pos-form-actions form-actions-row">
+            <button className="primary-button" type="submit">{form.id ? "Save changes" : "Add customer"}</button>
+            {form.id ? <button className="secondary-button" type="button" onClick={() => setForm(emptyCustomer)}>Cancel</button> : null}
+          </div>
+        </form>
+      </section>
+
+      <section className="history">
+        <div className="history-header">
+          <div>
+            <p className="eyebrow">Customers</p>
+            <h2>{customers.length} total</h2>
+          </div>
+          <div className="history-actions">
+            <input className="pos-search" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search name, phone, address" />
+            {isAdmin ? <button className="secondary-button" type="button" onClick={onSync}>Sync from reports</button> : null}
+          </div>
+        </div>
+        <div className="table-wrap">
+          <table>
+            <thead>
+              <tr><th>Name</th><th>Phone</th><th>Address</th><th>Email</th><th>Notes</th><th></th></tr>
+            </thead>
+            <tbody>
+              {filtered.length ? (
+                filtered.map((customer) => (
+                  <tr key={customer.id}>
+                    <td><strong>{customer.name || "-"}</strong></td>
+                    <td>{customer.phone || "-"}</td>
+                    <td>{customer.address || "-"}</td>
+                    <td>{customer.email || "-"}</td>
+                    <td className="muted">{customer.notes || ""}</td>
+                    <td className="pos-row-actions">
+                      <button className="secondary-button compact-button" type="button" onClick={() => editCustomer(customer)}>Edit</button>
+                      {isAdmin ? <button className="secondary-button compact-button" type="button" onClick={() => onRemove(customer.id)}>Delete</button> : null}
+                    </td>
+                  </tr>
+                ))
+              ) : (
+                <tr><td colSpan="6" className="empty-state">No customers yet.</td></tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      </section>
+    </>
+  );
 }
 
 function EmployeeDialog({ onClose, onSyncName, onUnsyncName, storeLocations, employeeLocations, onSetLocation }) {
