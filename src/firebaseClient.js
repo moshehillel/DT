@@ -9,7 +9,7 @@ import {
 import {
   collection,
   doc,
-  getFirestore,
+  initializeFirestore,
   onSnapshot,
   setDoc,
   writeBatch,
@@ -47,7 +47,9 @@ async function getFirebase() {
         const app = initializeApp(firebaseConfig);
         return {
           auth: getAuth(app),
-          db: getFirestore(app),
+          // Auto-detect long-polling so the database still works on networks /
+          // filters that break Firestore's streaming (WebChannel) connection.
+          db: initializeFirestore(app, { experimentalAutoDetectLongPolling: true }),
           functions: getFunctions(app),
         };
       });
