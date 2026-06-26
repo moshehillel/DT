@@ -2499,10 +2499,11 @@ tr:last-child td {
 }
 
 .powered-footer img {
-  width: 22px;
-  height: 22px;
-  border-radius: 6px;
+  width: 34px;
+  height: 34px;
+  border-radius: 8px;
   object-fit: cover;
+  box-shadow: 0 2px 6px rgba(18, 26, 35, 0.18);
 }
 
 .login-panel .powered-footer {
