@@ -2378,3 +2378,97 @@ tr:last-child td {
     padding: 0 22px;
   }
 }
+
+/* ---- POS bold branded look ---- */
+.pos-hero {
+  background: linear-gradient(135deg, var(--brand-dark) 0%, var(--brand) 55%, #14a597 100%);
+  color: #ffffff;
+  border: none;
+  border-radius: 18px;
+  box-shadow: 0 20px 44px rgba(15, 118, 110, 0.30);
+  padding: 24px;
+}
+
+.pos-hero .eyebrow,
+.pos-hero .workspace-header h2 {
+  color: #ffffff;
+}
+
+.pos-hero .summary-strip .metric {
+  background: rgba(255, 255, 255, 0.16);
+  border: 1px solid rgba(255, 255, 255, 0.25);
+  color: #eafaf6;
+}
+
+.pos-hero .summary-strip .metric strong {
+  color: #ffffff;
+}
+
+.pos-hero .scan-mode {
+  background: rgba(255, 255, 255, 0.18);
+}
+
+.pos-hero .scan-mode button {
+  color: #eafaf6;
+}
+
+.pos-hero .scan-mode button.selected {
+  background: #ffffff;
+  color: var(--brand-dark);
+}
+
+.pos-scan-input {
+  border: none;
+  box-shadow: 0 10px 24px rgba(8, 47, 43, 0.22);
+}
+
+.pos-scan .primary-button {
+  background: #ffffff;
+  color: var(--brand-dark);
+}
+
+.pos-scan .primary-button:hover {
+  background: #f1fbf9;
+}
+
+.pos-message {
+  background: rgba(255, 255, 255, 0.16);
+  border-color: rgba(255, 255, 255, 0.25);
+  color: #ffffff;
+}
+
+.pos-message-ok {
+  background: rgba(255, 255, 255, 0.22);
+  color: #ffffff;
+  border-color: rgba(255, 255, 255, 0.3);
+}
+
+/* Cart + checkout cards lift */
+.pos-cart,
+.pos-checkout {
+  border-radius: 18px;
+}
+
+.pos-checkout {
+  background: linear-gradient(180deg, #ffffff, #f6fbfa);
+  border: 1px solid #cfe9e3;
+  box-shadow: var(--shadow);
+}
+
+.pos-checkout .workspace-header h2 {
+  font-size: 36px;
+}
+
+/* Action bar emphasis */
+.pos-action-bar {
+  background: rgba(255, 255, 255, 0.96);
+}
+
+.pos-action-bar .primary-button {
+  min-height: 58px;
+  font-size: 18px;
+}
+
+.pos-checkout-hint {
+  display: none;
+}

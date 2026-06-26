@@ -3591,22 +3591,20 @@ function PosPage({ products, activeEmployee, activeLocation, activeDeviceId, act
         </div>
       </section>
 
-      {cart.length ? <div className="pos-action-spacer" /> : null}
-      {cart.length ? (
-        <div className="pos-action-bar">
-          <div className="pos-action-bar-info">
-            <span>{itemCount} item{itemCount === 1 ? "" : "s"} · {activeLocation || "Store"}</span>
-            <strong>{formatMoney(total)}</strong>
-          </div>
-          <div className="pos-action-bar-cta">
-            {imeiIssue ? <span className="pos-action-warn">{imeiIssue}</span> : null}
-            {!imeiIssue && requiresCardCharge && !cardChargeComplete ? <span className="pos-action-warn">Charge the card first</span> : null}
-            <button className="primary-button" type="button" disabled={!canCheckout} onClick={handleCheckout}>
-              Complete sale · {formatMoney(total)}
-            </button>
-          </div>
+      <div className="pos-action-spacer" />
+      <div className="pos-action-bar">
+        <div className="pos-action-bar-info">
+          <span>{itemCount} item{itemCount === 1 ? "" : "s"} · {activeLocation || "Store"}</span>
+          <strong>{formatMoney(total)}</strong>
         </div>
-      ) : null}
+        <div className="pos-action-bar-cta">
+          {imeiIssue ? <span className="pos-action-warn">{imeiIssue}</span> : null}
+          {!imeiIssue && requiresCardCharge && !cardChargeComplete ? <span className="pos-action-warn">Charge the card first</span> : null}
+          <button className="primary-button pos-complete-button" type="button" disabled={!canCheckout} onClick={handleCheckout}>
+            {cart.length ? `Complete sale · ${formatMoney(total)}` : "Scan items to start"}
+          </button>
+        </div>
+      </div>
 
       {completedSale ? (
         <SaleReceiptDialog sale={completedSale} onClose={startNewSale} />
