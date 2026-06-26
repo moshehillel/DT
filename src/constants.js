@@ -13,6 +13,45 @@ export const STORE_TAX_KEY = "diamant-telecom-store-tax-v1";
 export const CUSTOMERS_KEY = "diamant-telecom-customers-v1";
 export const FUNCTIONS_BASE_URL = import.meta.env.VITE_FUNCTIONS_BASE_URL || "";
 
+// Company-wide contact details shown on every receipt (same for all stores).
+export const COMPANY = {
+  phone: "1 (347) 388-7467",
+  web: "diamanttelecom.com",
+  email: "diamanttelecom@gmail.com",
+};
+
+// Per-store address + hours. Matched against the sale's store name by keyword,
+// so it works even if the store is named slightly differently in the app.
+export const STORE_DETAILS = [
+  {
+    keywords: ["brooklyn", "bedford"],
+    name: "Brooklyn Store",
+    address: "803 Bedford Ave Suite 104, Brooklyn, NY 11205",
+    phone: "(347) 388-7467",
+    hours: "Sun 12PM-6:30PM · Mon-Thu 10:30AM-6:30PM",
+  },
+  {
+    keywords: ["upstate", "monroe", "maglenitz"],
+    name: "Upstate Store",
+    address: "1 Maglenitz St #001, Monroe, NY 10950",
+    phone: "(347) 388-7467",
+    hours: "Sun 12PM-6:30PM · Mon-Thu 10:30AM-6:30PM",
+  },
+  {
+    keywords: ["catskill", "monticello", "broadway", "home square"],
+    name: "Catskills Store",
+    address: "Home Square — 335 E Broadway, Monticello, NY 12701",
+    phone: "(845) 685-6000",
+    hours: "",
+  },
+];
+
+export function resolveStoreDetails(location) {
+  const text = String(location || "").toLowerCase();
+  if (!text) return null;
+  return STORE_DETAILS.find((store) => store.keywords.some((keyword) => text.includes(keyword))) || null;
+}
+
 export const defaultEmployees = [];
 export const defaultOrderHandlers = [
   { id: "handler-default", name: "Moshe", phone: "", location: "Main store" },

@@ -2,8 +2,10 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
   ACTIVE_EMPLOYEE_KEY,
+  COMPANY,
   CUSTOMERS_KEY,
   defaultEmployees,
+  resolveStoreDetails,
   defaultManualReportType,
   defaultOrderHandlers,
   defaultStoreLocations,
@@ -3550,9 +3552,7 @@ function PosPage({ products, activeEmployee, activeLocation, activeDeviceId, act
           {requiresCardCharge && !cardChargeComplete && !imeiIssue ? (
             <p className="muted pos-warning">Charge the card before completing the sale.</p>
           ) : null}
-          <button className="primary-button" type="button" disabled={!canCheckout} onClick={handleCheckout}>
-            Complete sale - {formatMoney(total)}
-          </button>
+          <p className="muted pos-checkout-hint">Use the Complete sale bar at the bottom of the screen.</p>
         </section>
       </div>
 
@@ -3591,6 +3591,23 @@ function PosPage({ products, activeEmployee, activeLocation, activeDeviceId, act
         </div>
       </section>
 
+      {cart.length ? <div className="pos-action-spacer" /> : null}
+      {cart.length ? (
+        <div className="pos-action-bar">
+          <div className="pos-action-bar-info">
+            <span>{itemCount} item{itemCount === 1 ? "" : "s"} · {activeLocation || "Store"}</span>
+            <strong>{formatMoney(total)}</strong>
+          </div>
+          <div className="pos-action-bar-cta">
+            {imeiIssue ? <span className="pos-action-warn">{imeiIssue}</span> : null}
+            {!imeiIssue && requiresCardCharge && !cardChargeComplete ? <span className="pos-action-warn">Charge the card first</span> : null}
+            <button className="primary-button" type="button" disabled={!canCheckout} onClick={handleCheckout}>
+              Complete sale · {formatMoney(total)}
+            </button>
+          </div>
+        </div>
+      ) : null}
+
       {completedSale ? (
         <SaleReceiptDialog sale={completedSale} onClose={startNewSale} />
       ) : null}
@@ -3611,9 +3628,40 @@ const THERMAL_BASE_CSS = `
   td { padding: 4px 0; vertical-align: top; }
   .meta { font-size: 11.5px; text-align: center; }
   .divider { border-top: 1px dashed #000; margin: 7px 0; }
-  .thanks { text-align: center; margin-top: 12px; font-weight: 600; }
+  .contact { text-align: center; font-size: 11px; }
+  .store-name { text-align: center; font-weight: 800; margin-top: 6px; }
+  .store-addr { text-align: center; font-size: 11px; }
+  .hours { text-align: center; font-size: 11px; margin-bottom: 4px; }
+  .thanks { text-align: center; margin-top: 10px; font-weight: 700; }
+  .feedback { text-align: center; font-size: 10.5px; margin-top: 4px; }
   small { color: #000; }
 `;
+
+// Shared receipt header: logo, company-wide contact, and the store's address.
+function receiptHeaderHtml(location) {
+  const store = resolveStoreDetails(location);
+  const logoUrl = `${window.location.origin}/logo.webp`;
+  const storeBlock = store
+    ? `<div class="store-name">${escapeHtml(store.name)}</div>
+       <div class="store-addr">${escapeHtml(store.address)}${store.phone ? `<br/>${escapeHtml(store.phone)}` : ""}</div>`
+    : location
+      ? `<div class="store-name">${escapeHtml(location)}</div>`
+      : "";
+  return `
+    <img class="receipt-logo" src="${logoUrl}" alt="Diamant Telecom" onerror="this.style.display='none'" />
+    <div class="contact">${escapeHtml(COMPANY.phone)} &middot; ${escapeHtml(COMPANY.web)}<br/>${escapeHtml(COMPANY.email)}</div>
+    ${storeBlock}`;
+}
+
+// Shared receipt footer: store hours, thank-you, and feedback line.
+function receiptFooterHtml(location) {
+  const store = resolveStoreDetails(location);
+  const hours = store?.hours ? `<div class="hours">Hours: ${escapeHtml(store.hours)}</div>` : "";
+  return `
+    ${hours}
+    <div class="thanks">Thank you for choosing Diamant Telecom!</div>
+    <div class="feedback">Questions or feedback? Call our direct line ${escapeHtml(COMPANY.phone)} ext 9</div>`;
+}
 
 // Opens a hidden 80mm print window that prints immediately and closes itself.
 // With the browser's default printer set to the thermal printer (and Chrome
@@ -3644,7 +3692,7 @@ function printSaleReceipt(sale) {
   const lines = details.lineItems || [];
   const total = Number(sale.paymentAmount) || 0;
   const soldAt = toJsDate(sale.createdAt) || new Date();
-  const logoUrl = `${window.location.origin}/logo.webp`;
+  const location = details.location || sale.location || "";
 
   const rows = lines
     .map(
@@ -3676,12 +3724,9 @@ function printSaleReceipt(sale) {
     .barcode svg { max-width: 100%; height: 56px; }
     .barcode-text { font-size: 11px; letter-spacing: 2px; margin-top: 2px; }`;
   const body = `
-    <img class="receipt-logo" src="${logoUrl}" alt="Diamant Telecom" onerror="this.style.display='none'" />
-    <div class="meta">
-      ${details.location ? `${escapeHtml(details.location)}<br/>` : ""}
-      ${escapeHtml(soldAt.toLocaleString())}<br/>
-      Cashier: ${escapeHtml(sale.servedBy || "-")}${sale.customerPhone ? `<br/>Customer: ${escapeHtml(sale.customerPhone)}` : ""}
-    </div>
+    ${receiptHeaderHtml(location)}
+    <div class="divider"></div>
+    <div class="meta">${escapeHtml(soldAt.toLocaleString())} &middot; Cashier: ${escapeHtml(sale.servedBy || "-")}${sale.customerPhone ? `<br/>Customer: ${escapeHtml(sale.customerPhone)}` : ""}</div>
     <div class="divider"></div>
     <table>${rows}</table>
     <div class="divider"></div>
@@ -3689,7 +3734,8 @@ function printSaleReceipt(sale) {
     <div class="total"><span>Total</span><span>${formatMoney(total)}</span></div>
     <div class="paid">Paid by ${escapeHtml(sale.paymentMethod || "-")}</div>
     ${barcodeBlock}
-    <div class="thanks">Thank you!</div>`;
+    <div class="divider"></div>
+    ${receiptFooterHtml(location)}`;
 
   openThermalReceipt("Receipt", css, body);
 }
@@ -3698,7 +3744,7 @@ function printSaleReceipt(sale) {
 function printRepairTicket(report) {
   const details = report.details || {};
   const createdAt = (toJsDate(report.createdAt) || new Date()).toLocaleString();
-  const logoUrl = `${window.location.origin}/logo.webp`;
+  const location = report.location || details.location || "";
 
   const rowsSource = [
     ["Phone", report.customerPhone],
@@ -3719,7 +3765,8 @@ function printRepairTicket(report) {
     .ticket { text-align: center; font-size: 24px; font-weight: 800; margin: 6px 0; letter-spacing: 1px; }
     .notes { font-size: 11.5px; margin-top: 10px; }`;
   const body = `
-    <img class="receipt-logo" src="${logoUrl}" alt="Diamant Telecom" onerror="this.style.display='none'" />
+    ${receiptHeaderHtml(location)}
+    <div class="divider"></div>
     <div class="eyebrow">Repair ticket</div>
     <div class="ticket">${escapeHtml(details.ticketNumber || "")}</div>
     <div class="meta">${escapeHtml(createdAt)}</div>
@@ -3727,7 +3774,8 @@ function printRepairTicket(report) {
     <table>${rows}</table>
     ${report.notes ? `<div class="notes">Notes: ${escapeHtml(report.notes)}</div>` : ""}
     <div class="divider"></div>
-    <div class="thanks">Keep this ticket for pickup. Thank you!</div>`;
+    <div class="thanks">Keep this ticket for pickup.</div>
+    ${receiptFooterHtml(location)}`;
 
   openThermalReceipt(`Repair ticket ${details.ticketNumber || ""}`, css, body);
 }
