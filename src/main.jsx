@@ -3641,6 +3641,7 @@ const THERMAL_BASE_CSS = `
   .hours { text-align: center; font-size: 11px; margin-bottom: 4px; }
   .thanks { text-align: center; margin-top: 10px; font-weight: 700; }
   .feedback { text-align: center; font-size: 10.5px; margin-top: 4px; }
+  .powered { text-align: center; font-size: 9.5px; margin-top: 8px; color: #333; }
   small { color: #000; }
 `;
 
@@ -3667,7 +3668,8 @@ function receiptFooterHtml(location) {
   return `
     ${hours}
     <div class="thanks">Thank you for choosing Diamant Telecom!</div>
-    <div class="feedback">Questions or feedback? Call our direct line ${escapeHtml(COMPANY.phone)} ext 9</div>`;
+    <div class="feedback">Questions or feedback? Call our direct line ${escapeHtml(COMPANY.phone)} ext 9</div>
+    <div class="powered">Powered by Advanced Automations · info@advancedautomations.net</div>`;
 }
 
 // Opens a hidden 80mm print window that prints immediately and closes itself.
