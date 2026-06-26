@@ -1070,6 +1070,8 @@ function Workspace({ currentUser, isAdmin }) {
             onRemoveOrderHandler={removeOrderHandler}
           />
         )}
+
+        <PoweredByFooter />
       </main>
 
       {dialogOpen && sessionRole === "admin" && (
@@ -1198,6 +1200,7 @@ function LoginPage({ authError }) {
             {message ? <p className="summary-error">{message}</p> : null}
             {authError ? <p className="summary-error">Could not reach the sign-in service. Check your connection.</p> : null}
           </form>
+          <PoweredByFooter />
         </div>
       </section>
     </main>
@@ -1216,6 +1219,20 @@ function friendlyAuthError(error) {
     return "Network error. Check your connection.";
   }
   return error?.message || "Sign-in failed. Please try again.";
+}
+
+function PoweredByFooter() {
+  return (
+    <a
+      className="powered-footer"
+      href="https://www.advancedautomations.net"
+      target="_blank"
+      rel="noopener noreferrer"
+    >
+      <img src="/aa-logo.png" alt="Advanced Automations" />
+      <span>Powered by Advanced Automations</span>
+    </a>
+  );
 }
 
 function Sidebar({

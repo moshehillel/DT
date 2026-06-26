@@ -2472,3 +2472,39 @@ tr:last-child td {
 .pos-checkout-hint {
   display: none;
 }
+
+/* ---- Powered by Advanced Automations footer ---- */
+.powered-footer {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  margin: 28px auto 8px;
+  padding: 8px 14px;
+  width: fit-content;
+  border-radius: 999px;
+  text-decoration: none;
+  color: var(--muted);
+  font-size: 12.5px;
+  font-weight: 600;
+  border: 1px solid var(--line);
+  background: var(--panel);
+  transition: box-shadow 0.15s ease, transform 0.15s ease, color 0.15s ease;
+}
+
+.powered-footer:hover {
+  color: var(--ink);
+  box-shadow: var(--shadow-soft);
+  transform: translateY(-1px);
+}
+
+.powered-footer img {
+  width: 22px;
+  height: 22px;
+  border-radius: 6px;
+  object-fit: cover;
+}
+
+.login-panel .powered-footer {
+  margin-top: 18px;
+}
