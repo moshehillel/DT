@@ -983,54 +983,52 @@ function Workspace({ currentUser, isAdmin }) {
             onSync={syncCustomersFromReports}
           />
         ) : activeView === "reports" ? (
-          <>
-            {activeType === "rental" ? (
-              <RentalReportForm
-                key={`${activeType}-${formNonce}`}
-                activeEmployee={activeEmployee}
-                customers={customers}
-                onSave={saveReport}
-              />
-            ) : activeType === "phoneOrder" ? (
-              <PhoneOrderPage
-                key={`${activeType}-${formNonce}`}
-                activeEmployee={activeEmployee}
-                sessionRole={sessionRole}
-                phoneOrders={phoneOrders}
-                orderHandlers={orderHandlers}
-                storeTax={storeTax}
-                customers={customers}
-                onCreate={createPhoneOrder}
-                onDelivered={completePhoneOrder}
-              />
-            ) : (
-              <ReportForm
-                key={`${activeType}-${formNonce}`}
-                activeType={activeType}
-                activeEmployee={activeEmployee}
-                reports={reports}
-                customers={customers}
-                onSave={saveReport}
-              />
-            )}
-
-            <ReportHistory
-              employees={visibleEmployees}
-              storeLocations={storeLocations}
-              reports={filteredReports}
-              filters={filters}
-              onFiltersChange={setFilters}
-              onClearFilters={() => setFilters(createEmptyFilters())}
-              onStatusChange={updateRepairStatus}
-              onExport={() => exportCsv(filteredReports)}
-              onExportAll={() => exportCsv(visibleReports)}
-              onClearReports={clearReports}
-              onDeleteReport={sessionRole === "admin" ? deleteReport : null}
-              onReturn={setReturnTarget}
-              onScanReturn={returnByCode}
-              notifications={visibleNotifications}
+          activeType === "rental" ? (
+            <RentalReportForm
+              key={`${activeType}-${formNonce}`}
+              activeEmployee={activeEmployee}
+              customers={customers}
+              onSave={saveReport}
             />
-          </>
+          ) : activeType === "phoneOrder" ? (
+            <PhoneOrderPage
+              key={`${activeType}-${formNonce}`}
+              activeEmployee={activeEmployee}
+              sessionRole={sessionRole}
+              phoneOrders={phoneOrders}
+              orderHandlers={orderHandlers}
+              storeTax={storeTax}
+              customers={customers}
+              onCreate={createPhoneOrder}
+              onDelivered={completePhoneOrder}
+            />
+          ) : (
+            <ReportForm
+              key={`${activeType}-${formNonce}`}
+              activeType={activeType}
+              activeEmployee={activeEmployee}
+              reports={reports}
+              customers={customers}
+              onSave={saveReport}
+            />
+          )
+        ) : activeView === "reportsLog" ? (
+          <ReportHistory
+            employees={visibleEmployees}
+            storeLocations={storeLocations}
+            reports={filteredReports}
+            filters={filters}
+            onFiltersChange={setFilters}
+            onClearFilters={() => setFilters(createEmptyFilters())}
+            onStatusChange={updateRepairStatus}
+            onExport={() => exportCsv(filteredReports)}
+            onExportAll={() => exportCsv(visibleReports)}
+            onClearReports={clearReports}
+            onDeleteReport={sessionRole === "admin" ? deleteReport : null}
+            onReturn={setReturnTarget}
+            onScanReturn={returnByCode}
+            notifications={visibleNotifications}
+          />
         ) : activeView === "pos" ? (
           <PosPage
             key={`pos-${formNonce}`}
@@ -1267,14 +1265,14 @@ function Sidebar({
           </span>
         </button>
         <button
-          className={`tab ${activeView === "customers" ? "active" : ""}`}
+          className={`tab ${activeView === "reportsLog" ? "active" : ""}`}
           type="button"
-          onClick={() => onViewChange("customers")}
+          onClick={() => onViewChange("reportsLog")}
         >
-          <span className="tab-mark">C</span>
+          <span className="tab-mark">R</span>
           <span>
-            <strong>Customers</strong>
-            <small>CRM &amp; contacts</small>
+            <strong>Reports</strong>
+            <small>Look up, returns & complaints</small>
           </span>
         </button>
 
@@ -1323,6 +1321,17 @@ function Sidebar({
               <span>
                 <strong>Inventory</strong>
                 <small>Catalog, stock & stores</small>
+              </span>
+            </button>
+            <button
+              className={`tab ${activeView === "customers" ? "active" : ""}`}
+              type="button"
+              onClick={() => onViewChange("customers")}
+            >
+              <span className="tab-mark">C</span>
+              <span>
+                <strong>Customers</strong>
+                <small>CRM &amp; contacts</small>
               </span>
             </button>
             <button
