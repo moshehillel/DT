@@ -135,6 +135,7 @@ function buildTelebroadPendingReport(payload) {
       direction,
       handledBy: employeeName,
       telebroadCallId: callId,
+      telebroadUniqueId: payload.UniqueId || "",
       callDuration: payload.callDuration ?? "",
       talkDuration: payload.talkDuration ?? "",
     },

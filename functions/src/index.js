@@ -133,6 +133,65 @@ function sendJson(res, status, body) {
   res.status(status).set("Content-Type", "application/json").send(body);
 }
 
+// Fetches a Telebroad call recording (by callid + uniqueid from the webhook) and
+// serves it. Opening this URL in the browser plays/downloads the recording; the
+// account credentials stay server-side.
+exports.telebroadCallRecording = onRequest(HTTP_OPTIONS, async (req, res) => {
+  if (handleCors(req, res)) return;
+
+  const payload = getPayload(req);
+  const callid = String(payload.callid || payload.callId || "").trim();
+  const uniqueid = String(payload.uniqueid || payload.uniqueId || payload.UniqueId || "").trim();
+  if (!callid || !uniqueid) {
+    sendJson(res, 400, { ok: false, message: "callid and uniqueid are required." });
+    return;
+  }
+  if (!TELEBROAD_USERNAME || !TELEBROAD_PASSWORD) {
+    sendJson(res, 501, { ok: false, message: "Telebroad credentials are not configured." });
+    return;
+  }
+
+  try {
+    const credentials = Buffer.from(`${TELEBROAD_USERNAME}:${TELEBROAD_PASSWORD}`).toString("base64");
+    const url = `${TELEBROAD_API_BASE_URL}/call/recording?callid=${encodeURIComponent(callid)}&uniqueid=${encodeURIComponent(uniqueid)}`;
+    const tbResponse = await fetch(url, { headers: { Authorization: `Basic ${credentials}` } });
+    const contentType = tbResponse.headers.get("content-type") || "";
+
+    // JSON response: either an error, or a link to the recording.
+    if (contentType.includes("application/json")) {
+      const data = await tbResponse.json().catch(() => ({}));
+      if (data.error) {
+        sendJson(res, 400, { ok: false, message: data.error.message || "Recording not available." });
+        return;
+      }
+      const recordingUrl = data.url || data.recording || data.recordingUrl || data.link || data.path || "";
+      if (recordingUrl) {
+        if (payload.json === "1") {
+          sendJson(res, 200, { ok: true, url: recordingUrl });
+        } else {
+          res.redirect(recordingUrl);
+        }
+        return;
+      }
+      sendJson(res, 200, { ok: true, ...data });
+      return;
+    }
+
+    // Otherwise the body is the audio itself — stream it back.
+    if (!tbResponse.ok) {
+      sendJson(res, 400, { ok: false, message: `Telebroad returned ${tbResponse.status}.` });
+      return;
+    }
+    const audio = Buffer.from(await tbResponse.arrayBuffer());
+    res.set("Content-Type", contentType || "audio/mpeg");
+    res.set("Content-Disposition", `inline; filename="recording-${callid}.mp3"`);
+    res.status(200).send(audio);
+  } catch (error) {
+    logger.error("telebroadCallRecording failed", error);
+    sendJson(res, 500, { ok: false, message: error.message || "Could not get the recording." });
+  }
+});
+
 function handleCors(req, res) {
   res.set("Access-Control-Allow-Origin", process.env.ALLOWED_WEB_ORIGIN || "*");
   res.set("Access-Control-Allow-Headers", "Content-Type, Authorization");

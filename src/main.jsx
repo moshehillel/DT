@@ -2430,6 +2430,7 @@ function PendingReportCard({ pendingReport, activeEmployee, onClaim, onSave }) {
           direction: imported.direction || pendingReport.details?.direction || "",
           handledBy: imported.employeeName || pendingReport.details?.handledBy || "",
           telebroadCallId: imported.callId || pendingReport.details?.telebroadCallId || "",
+          telebroadUniqueId: imported.uniqueId || pendingReport.details?.telebroadUniqueId || "",
           callDuration: imported.callDuration ?? pendingReport.details?.callDuration ?? "",
           talkDuration: imported.talkDuration ?? pendingReport.details?.talkDuration ?? "",
         },
@@ -2491,6 +2492,11 @@ function PendingReportCard({ pendingReport, activeEmployee, onClaim, onSave }) {
             <span><strong>Handled by:</strong> {importedAgentName || "-"}</span>
             <span><strong>Talk time:</strong> {imported.talkDuration !== "" && imported.talkDuration !== undefined ? `${imported.talkDuration}s` : "-"}</span>
             <span><strong>Imported:</strong> {pendingReport.createdAt ? formatShortDate(pendingReport.createdAt) : "-"}</span>
+            {callRecordingUrl(imported.callId, imported.uniqueId) ? (
+              <a className="secondary-button compact-button" href={callRecordingUrl(imported.callId, imported.uniqueId)} target="_blank" rel="noopener noreferrer">
+                ▶ Call recording
+              </a>
+            ) : null}
           </>
         ) : (
           <>
@@ -4469,6 +4475,10 @@ function ReportDetails({ report }) {
     ],
   }[report.type];
 
+  const recordingUrl = report.type === "call"
+    ? callRecordingUrl(details.telebroadCallId, details.telebroadUniqueId)
+    : "";
+
   return (
     <div className="details">
       {lines.filter(([, value]) => value).length ? (
@@ -4480,9 +4490,20 @@ function ReportDetails({ report }) {
       ) : (
         <span>-</span>
       )}
+      {recordingUrl ? (
+        <a className="secondary-button compact-button" href={recordingUrl} target="_blank" rel="noopener noreferrer">
+          ▶ Call recording
+        </a>
+      ) : null}
       {report.notes ? <span className="muted">{report.notes}</span> : null}
     </div>
   );
+}
+
+// Builds a URL that serves the Telebroad call recording for a call report.
+function callRecordingUrl(callId, uniqueId) {
+  if (!FUNCTIONS_BASE_URL || !callId || !uniqueId) return "";
+  return `${FUNCTIONS_BASE_URL}/telebroadCallRecording?callid=${encodeURIComponent(callId)}&uniqueid=${encodeURIComponent(uniqueId)}`;
 }
 
 function ReturnDialog({ report, onClose, onSubmit }) {
