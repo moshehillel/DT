@@ -248,23 +248,6 @@ function Workspace({ currentUser, isAdmin }) {
     return buildAppNotifications(availableReports);
   }, [employeeCanSeeReport, reports, sessionRole]);
 
-  // Look up the combined sales-tax rate (decimal) for an address via the backend.
-  async function lookupTaxRate(address) {
-    if (!FUNCTIONS_BASE_URL || !address?.zip) return null;
-    try {
-      const response = await fetch(`${FUNCTIONS_BASE_URL}/getTaxRate`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(address),
-      });
-      const data = await response.json();
-      if (!response.ok || !data.ok) return null;
-      return Number(data.rate) || 0;
-    } catch {
-      return null;
-    }
-  }
-
   function addStoreLocation(store) {
     const name = String((typeof store === "string" ? store : store?.name) || "").trim();
     if (!name || storeLocations.includes(name)) return;
@@ -297,17 +280,6 @@ function Workspace({ currentUser, isAdmin }) {
     setStoreTax((current) =>
       current.map((entry) => (entry?.name === name ? { ...entry, rate: Number.isFinite(value) ? value : 0 } : entry)),
     );
-  }
-
-  async function refreshStoreTaxRate(name) {
-    const entry = (storeTax || []).find((item) => item?.name === name);
-    if (!entry) return;
-    const decimal = await lookupTaxRate(entry);
-    if (decimal === null) {
-      window.alert("Could not look up the tax rate. Check the address and that TAXJAR_API_KEY is set, or enter it manually.");
-      return;
-    }
-    setStoreTaxRate(name, Math.round(decimal * 1000000) / 10000);
   }
 
   function setEmployeeLocation(name, location) {
@@ -937,7 +909,6 @@ function Workspace({ currentUser, isAdmin }) {
             onSetEmployeeLocation={setEmployeeLocation}
             onSetStoreDevice={setStoreDevice}
             onSetStoreTaxRate={setStoreTaxRate}
-            onRefreshTaxRate={refreshStoreTaxRate}
           />
         ) : (
           <AdminPage
@@ -3786,7 +3757,6 @@ function InventoryPage({
   onSetEmployeeLocation,
   onSetStoreDevice,
   onSetStoreTaxRate,
-  onRefreshTaxRate,
 }) {
   const isAdmin = sessionRole === "admin";
   const emptyForm = {
@@ -4075,7 +4045,7 @@ function InventoryPage({
           </label>
           <button className="primary-button align-end" type="submit">Add store</button>
         </form>
-        <p className="muted">Enter each store's sales-tax rate below. (If a tax API is configured, "Refresh rate" can auto-fill it from the address — optional.)</p>
+        <p className="muted">Enter each store's sales-tax rate below.</p>
         <div className="request-list">
           {storeLocations.map((location) => {
             const tax = taxFor(location);
@@ -4109,9 +4079,6 @@ function InventoryPage({
                   />
                 </label>
                 <div className="store-row-actions">
-                  <button className="secondary-button compact-button" type="button" onClick={() => onRefreshTaxRate(location)}>
-                    Refresh rate
-                  </button>
                   <button className="secondary-button compact-button" type="button" onClick={() => onRemoveStoreLocation(location)}>
                     Remove
                   </button>

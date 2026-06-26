@@ -49,8 +49,6 @@ const SOLA_CREATE_CHARGE_PATH = process.env.SOLA_CREATE_CHARGE_PATH || "/gateway
 const SOLA_DEVICE_API_BASE_URL = process.env.SOLA_DEVICE_API_BASE_URL || "https://device.cardknox.com/v2";
 const SOLA_DEFAULT_DEVICE_ID = process.env.SOLA_DEFAULT_DEVICE_ID || "";
 const RENTAL_REMINDER_TIME_ZONE = process.env.RENTAL_REMINDER_TIME_ZONE || "America/New_York";
-const TAXJAR_API_KEY = process.env.TAXJAR_API_KEY || "";
-const TAXJAR_API_BASE_URL = process.env.TAXJAR_API_BASE_URL || "https://api.taxjar.com/v2";
 
 function getPayload(req) {
   return {
@@ -134,60 +132,6 @@ exports.deleteEmployee = onCall({ region: REGION }, async (request) => {
 function sendJson(res, status, body) {
   res.status(status).set("Content-Type", "application/json").send(body);
 }
-
-// Looks up the combined sales-tax rate for a store address via TaxJar.
-// Returns the rate as a decimal (e.g. 0.08875 for 8.875%).
-exports.getTaxRate = onRequest(HTTP_OPTIONS, async (req, res) => {
-  if (handleCors(req, res)) return;
-  if (req.method !== "POST") {
-    sendJson(res, 405, { ok: false, message: "POST required" });
-    return;
-  }
-  if (!TAXJAR_API_KEY) {
-    sendJson(res, 501, {
-      ok: false,
-      message: "Tax lookup is not configured. Set TAXJAR_API_KEY, or enter the store's rate manually.",
-    });
-    return;
-  }
-
-  const payload = getPayload(req);
-  const zip = String(payload.zip || "").trim();
-  if (!zip) {
-    sendJson(res, 400, { ok: false, message: "A ZIP code is required to look up the tax rate." });
-    return;
-  }
-
-  try {
-    const params = new URLSearchParams({ country: payload.country || "US" });
-    if (payload.state) params.append("state", String(payload.state));
-    if (payload.city) params.append("city", String(payload.city));
-    if (payload.street) params.append("street", String(payload.street));
-
-    const response = await fetch(`${TAXJAR_API_BASE_URL}/rates/${encodeURIComponent(zip)}?${params.toString()}`, {
-      headers: { Authorization: `Bearer ${TAXJAR_API_KEY}` },
-    });
-    const data = await response.json().catch(() => ({}));
-
-    if (!response.ok || !data.rate) {
-      sendJson(res, 400, {
-        ok: false,
-        message: data.error || data.detail || "Could not look up the tax rate for that address.",
-      });
-      return;
-    }
-
-    const combined = Number(data.rate.combined_rate);
-    sendJson(res, 200, {
-      ok: true,
-      rate: Number.isFinite(combined) ? combined : 0,
-      raw: data.rate,
-    });
-  } catch (error) {
-    logger.error("getTaxRate failed", error);
-    sendJson(res, 500, { ok: false, message: error.message || "Tax lookup failed." });
-  }
-});
 
 function handleCors(req, res) {
   res.set("Access-Control-Allow-Origin", process.env.ALLOWED_WEB_ORIGIN || "*");
