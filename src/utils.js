@@ -299,6 +299,58 @@ export function isSolaPaidStatus(status) {
   return ["paid", "approved", "captured", "succeeded", "success"].includes(String(status || "").toLowerCase());
 }
 
+// Short, human-friendly code printed (and barcoded) on receipts for returns.
+export function generateReceiptCode() {
+  return crypto.randomUUID().replace(/-/g, "").slice(0, 8).toUpperCase();
+}
+
+// Minimal Code128-B barcode renderer (no dependencies). Returns an SVG string
+// that scans with a standard 1D laser scanner.
+const CODE128_PATTERNS = [
+  "212222", "222122", "222221", "121223", "121322", "131222", "122213", "122312", "132212", "221213",
+  "221312", "231212", "112232", "122132", "122231", "113222", "123122", "123221", "223211", "221132",
+  "221231", "213212", "223112", "312131", "311222", "321122", "321221", "312212", "322112", "322211",
+  "212123", "212321", "232121", "111323", "131123", "131321", "112313", "132113", "132311", "211313",
+  "231113", "231311", "112133", "112331", "132131", "113123", "113321", "133121", "313121", "211331",
+  "231131", "213113", "213311", "213131", "311123", "311321", "331121", "312113", "312311", "332111",
+  "314111", "221411", "431111", "111224", "111422", "121124", "121421", "141122", "141221", "112214",
+  "112412", "122114", "122411", "142112", "142211", "241211", "221114", "413111", "241112", "134111",
+  "111242", "121142", "121241", "114212", "124112", "124211", "411212", "421112", "421211", "212141",
+  "214121", "412121", "111143", "111341", "131141", "114113", "114311", "411113", "411311", "113141",
+  "114131", "311141", "411131", "211412", "211214", "211232", "233111",
+];
+
+export function code128Svg(text, { moduleWidth = 2, height = 60 } = {}) {
+  const value = String(text || "");
+  if (!value) return "";
+  const codes = [104]; // Start Code B
+  let checksum = 104;
+  for (let i = 0; i < value.length; i += 1) {
+    const code = value.charCodeAt(i) - 32;
+    if (code < 0 || code > 94) continue; // skip chars outside Code128-B
+    codes.push(code);
+    checksum += code * (codes.length - 1);
+  }
+  codes.push(checksum % 103);
+  codes.push(106); // Stop
+
+  let modules = "";
+  codes.forEach((code, index) => {
+    modules += index === codes.length - 1 ? "2331112" : CODE128_PATTERNS[code];
+  });
+
+  let x = 0;
+  let rects = "";
+  for (let i = 0; i < modules.length; i += 1) {
+    const width = Number(modules[i]) * moduleWidth;
+    if (i % 2 === 0) {
+      rects += `<rect x="${x}" y="0" width="${width}" height="${height}"/>`;
+    }
+    x += width;
+  }
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="${x}" height="${height}" viewBox="0 0 ${x} ${height}" fill="#000">${rects}</svg>`;
+}
+
 export function startOfDay(date) {
   const copy = new Date(date);
   copy.setHours(0, 0, 0, 0);
@@ -316,11 +368,19 @@ export function buildAppNotifications(reports) {
       const due = startOfDay(new Date(`${dueDate}T00:00:00`));
       if (due >= today) return null;
 
+      const daysLate = Math.max(0, Math.round((today - due) / 86400000));
+      const weeklyFee = Number(report.details?.lateFeeWeekly) || 0;
+      const accruedLateFee = weeklyFee > 0 ? (weeklyFee / 7) * daysLate : 0;
+      const device = report.details?.model || report.details?.rentalType || "rental";
+      const lateFeePart = accruedLateFee > 0
+        ? ` Late fee so far: ${formatMoney(accruedLateFee)} (${daysLate} day${daysLate === 1 ? "" : "s"} × ${formatMoney(weeklyFee / 7)}/day).`
+        : "";
+
       return {
         id: `rental-overdue-${report.id}`,
         severity: "urgent",
         title: "Rental past due",
-        message: `${report.customerPhone || "Customer"} should have returned ${report.details?.model || report.details?.rentalType || "rental"} by ${dueDate}.`,
+        message: `${report.customerPhone || "Customer"} should have returned ${device} by ${dueDate}.${lateFeePart}`,
       };
     })
     .filter(Boolean);

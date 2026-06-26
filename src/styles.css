@@ -1820,6 +1820,61 @@ tr:last-child td {
   flex-wrap: wrap;
 }
 
+.scan-return {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+
+.scan-return input {
+  min-height: 40px;
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  min-width: 180px;
+}
+
+.pos-totals {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 12px 0;
+  border-top: 1px solid var(--line);
+  margin-top: 4px;
+}
+
+.pos-totals-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.pos-totals-grand {
+  font-size: 18px;
+  font-weight: 700;
+  border-top: 1px solid var(--line);
+  padding-top: 8px;
+}
+
+.pos-out-of-state {
+  margin: 2px 0;
+}
+
+.store-row {
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 10px;
+}
+
+.store-row-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.tax-rate-field {
+  max-width: 120px;
+}
+
 @media (max-width: 720px) {
   .order-item-row {
     flex-wrap: wrap;

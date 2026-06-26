@@ -22,6 +22,7 @@ import {
   STORAGE_KEY,
   STORE_DEVICES_KEY,
   STORE_LOCATIONS_KEY,
+  STORE_TAX_KEY,
 } from "./constants";
 import { useCloudCollectionState, useCloudDocumentState } from "./hooks/useCloudState";
 import {
@@ -39,9 +40,11 @@ import {
   calculateInclusiveDays,
   calculateRentalPrice,
   calculateReturnDueDate,
+  code128Svg,
   createEmptyFilters,
   digitsOnly,
   escapeHtml,
+  generateReceiptCode,
   exportCsv,
   formatDateTime,
   formatMoney,
@@ -104,6 +107,7 @@ function Workspace({ currentUser, isAdmin }) {
   const [storeLocations, setStoreLocations] = useCloudDocumentState("storeLocations", STORE_LOCATIONS_KEY, defaultStoreLocations);
   const [employeeLocations, setEmployeeLocations] = useCloudDocumentState("employeeLocations", EMPLOYEE_LOCATIONS_KEY, []);
   const [storeDevices, setStoreDevices] = useCloudDocumentState("storeDevices", STORE_DEVICES_KEY, []);
+  const [storeTax, setStoreTax] = useCloudDocumentState("storeTax", STORE_TAX_KEY, []);
   // Employees are locked to their own identity; admins can file/view as any
   // employee in the list.
   const [activeEmployee, setActiveEmployee] = useState(
@@ -147,6 +151,12 @@ function Workspace({ currentUser, isAdmin }) {
     return match?.deviceId || "";
   }, [storeDevices, activeLocation]);
 
+  // Store sales-tax rate as a percent (e.g. 8.875).
+  const activeTaxRate = useMemo(() => {
+    const match = (storeTax || []).find((entry) => entry?.name === activeLocation);
+    return Number(match?.rate) || 0;
+  }, [storeTax, activeLocation]);
+
   const employeeCanSeeReport = useMemo(() => {
     return (report) => {
       const store = report.location || report.details?.location || "";
@@ -173,6 +183,7 @@ function Workspace({ currentUser, isAdmin }) {
       const searchable = [
         report.type,
         reportTypes[report.type]?.label,
+        report.receiptCode,
         report.customerPhone,
         report.paymentAmount,
         report.paymentMethod,
@@ -237,10 +248,39 @@ function Workspace({ currentUser, isAdmin }) {
     return buildAppNotifications(availableReports);
   }, [employeeCanSeeReport, reports, sessionRole]);
 
-  function addStoreLocation(name) {
-    const cleanName = String(name || "").trim();
-    if (!cleanName || storeLocations.includes(cleanName)) return;
-    setStoreLocations((current) => [...current, cleanName]);
+  // Look up the combined sales-tax rate (decimal) for an address via the backend.
+  async function lookupTaxRate(address) {
+    if (!FUNCTIONS_BASE_URL || !address?.zip) return null;
+    try {
+      const response = await fetch(`${FUNCTIONS_BASE_URL}/getTaxRate`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(address),
+      });
+      const data = await response.json();
+      if (!response.ok || !data.ok) return null;
+      return Number(data.rate) || 0;
+    } catch {
+      return null;
+    }
+  }
+
+  function addStoreLocation(store) {
+    const name = String((typeof store === "string" ? store : store?.name) || "").trim();
+    if (!name || storeLocations.includes(name)) return;
+    const address = typeof store === "string" ? {} : store || {};
+    setStoreLocations((current) => [...current, name]);
+    setStoreTax((current) => [
+      ...current.filter((entry) => entry?.name !== name),
+      {
+        name,
+        street: String(address.street || "").trim(),
+        city: String(address.city || "").trim(),
+        state: String(address.state || "").trim(),
+        zip: String(address.zip || "").trim(),
+        rate: 0,
+      },
+    ]);
   }
 
   function removeStoreLocation(name) {
@@ -249,6 +289,25 @@ function Workspace({ currentUser, isAdmin }) {
       return;
     }
     setStoreLocations((current) => current.filter((location) => location !== name));
+    setStoreTax((current) => current.filter((entry) => entry?.name !== name));
+  }
+
+  function setStoreTaxRate(name, rate) {
+    const value = Number.parseFloat(rate);
+    setStoreTax((current) =>
+      current.map((entry) => (entry?.name === name ? { ...entry, rate: Number.isFinite(value) ? value : 0 } : entry)),
+    );
+  }
+
+  async function refreshStoreTaxRate(name) {
+    const entry = (storeTax || []).find((item) => item?.name === name);
+    if (!entry) return;
+    const decimal = await lookupTaxRate(entry);
+    if (decimal === null) {
+      window.alert("Could not look up the tax rate. Check the address and that TAXJAR_API_KEY is set, or enter it manually.");
+      return;
+    }
+    setStoreTaxRate(name, Math.round(decimal * 1000000) / 10000);
   }
 
   function setEmployeeLocation(name, location) {
@@ -438,6 +497,10 @@ function Workspace({ currentUser, isAdmin }) {
         model: order.model,
         itemsText: order.itemsText || order.model,
         lineItems: order.lineItems || [],
+        subtotal: order.subtotal,
+        taxRate: order.taxRate,
+        taxAmount: order.taxAmount,
+        outOfState: order.outOfState,
         orderTotal: order.orderTotal,
         paymentStatus: order.paymentStatus,
         createdBy: order.createdBy,
@@ -618,6 +681,31 @@ function Workspace({ currentUser, isAdmin }) {
     setReports((current) => current.filter((item) => item.id !== reportId));
   }
 
+  // Find a sale by scanned receipt barcode (or id) and open its return dialog.
+  function returnByCode(code) {
+    const clean = String(code || "").trim().toLowerCase();
+    if (!clean) return;
+    const match = reports.find(
+      (item) =>
+        (item.receiptCode && item.receiptCode.toLowerCase() === clean) ||
+        String(item.id).toLowerCase() === clean,
+    );
+    if (!match) {
+      window.alert(`No sale found for receipt "${code}".`);
+      return;
+    }
+    const lineItems = match.details?.lineItems || [];
+    if (!(match.type === "sale" || match.type === "phoneOrder") || !lineItems.length) {
+      window.alert("That receipt has no returnable items.");
+      return;
+    }
+    if (match.details?.returnStatus === "Fully returned") {
+      window.alert("That sale has already been fully returned.");
+      return;
+    }
+    setReturnTarget(match);
+  }
+
   async function processReturn(original, selection) {
     const returnLines = (selection.returnLines || []).filter((line) => Number(line.returnQty) > 0);
     if (!returnLines.length) return;
@@ -792,6 +880,7 @@ function Workspace({ currentUser, isAdmin }) {
                 sessionRole={sessionRole}
                 phoneOrders={phoneOrders}
                 orderHandlers={orderHandlers}
+                storeTax={storeTax}
                 onCreate={createPhoneOrder}
                 onDelivered={completePhoneOrder}
               />
@@ -818,6 +907,7 @@ function Workspace({ currentUser, isAdmin }) {
               onClearReports={clearReports}
               onDeleteReport={sessionRole === "admin" ? deleteReport : null}
               onReturn={setReturnTarget}
+              onScanReturn={returnByCode}
               notifications={visibleNotifications}
             />
           </>
@@ -828,6 +918,7 @@ function Workspace({ currentUser, isAdmin }) {
             activeEmployee={activeEmployee}
             activeLocation={activeLocation}
             activeDeviceId={activeDeviceId}
+            activeTaxRate={activeTaxRate}
             onCompleteSale={savePosSale}
           />
         ) : activeView === "inventory" ? (
@@ -837,6 +928,7 @@ function Workspace({ currentUser, isAdmin }) {
             storeLocations={storeLocations}
             employeeLocations={employeeLocations}
             storeDevices={storeDevices}
+            storeTax={storeTax}
             sessionRole={sessionRole}
             onSaveProduct={saveProduct}
             onRemoveProduct={removeProduct}
@@ -844,6 +936,8 @@ function Workspace({ currentUser, isAdmin }) {
             onRemoveStoreLocation={removeStoreLocation}
             onSetEmployeeLocation={setEmployeeLocation}
             onSetStoreDevice={setStoreDevice}
+            onSetStoreTaxRate={setStoreTaxRate}
+            onRefreshTaxRate={refreshStoreTaxRate}
           />
         ) : (
           <AdminPage
@@ -1315,6 +1409,7 @@ function RentalReportForm({ activeEmployee, onSave }) {
     returnDays: "",
     paymentMethod: "Cash",
     returnReminderPreference: "Text message",
+    lateFeeWeekly: "",
     customerPhone: "",
     notes: "",
   });
@@ -1697,6 +1792,7 @@ function RentalReportForm({ activeEmployee, onSave }) {
         returnTime: `${form.returnDays || 0} days`,
         returnDueDate: calculateReturnDueDate(form.endDate, form.returnDays),
         returnReminderPreference: form.returnReminderPreference,
+        lateFeeWeekly: Number.parseFloat(form.lateFeeWeekly) || 0,
         totalDays,
         ukDays: numberValue(form.ukDays),
         euDays: numberValue(form.euDays),
@@ -1837,6 +1933,18 @@ function RentalReportForm({ activeEmployee, onSave }) {
               </select>
             </label>
             <label className="field">
+              <span>Late fee per week (if overdue)</span>
+              <input
+                inputMode="decimal"
+                value={form.lateFeeWeekly}
+                onChange={(event) => updateField("lateFeeWeekly", event.target.value)}
+                placeholder="0.00"
+              />
+              {(Number.parseFloat(form.lateFeeWeekly) || 0) > 0 ? (
+                <small className="muted">{formatMoney((Number.parseFloat(form.lateFeeWeekly) || 0) / 7)}/day after the return date</small>
+              ) : null}
+            </label>
+            <label className="field">
               <span>Served by</span>
               <input value={activeEmployee} disabled readOnly />
             </label>
@@ -1941,10 +2049,20 @@ function ReportHistory({
   onClearReports,
   onDeleteReport,
   onReturn,
+  onScanReturn,
   notifications,
 }) {
   const hasActions = Boolean(onDeleteReport || onReturn);
   const columnCount = hasActions ? 9 : 8;
+  const [returnScan, setReturnScan] = useState("");
+
+  function handleReturnScan(event) {
+    event.preventDefault();
+    const code = returnScan.trim();
+    if (!code) return;
+    onScanReturn?.(code);
+    setReturnScan("");
+  }
 
   const MAX_RANGE_DAYS = 30;
   const hasRange = Boolean(filters.dateFrom && filters.dateTo);
@@ -1977,6 +2095,19 @@ function ReportHistory({
           <h2>Reports</h2>
         </div>
         <div className="history-actions">
+          {onScanReturn ? (
+            <form className="scan-return" onSubmit={handleReturnScan}>
+              <input
+                value={returnScan}
+                onChange={(event) => setReturnScan(event.target.value)}
+                placeholder="Scan receipt to return"
+                inputMode="text"
+                autoComplete="off"
+                spellCheck={false}
+              />
+              <button className="secondary-button" type="submit">Return</button>
+            </form>
+          ) : null}
           <button className="secondary-button" type="button" onClick={onExport} disabled={!rangeValid}>Export view (CSV)</button>
           {onExportAll ? (
             <button className="secondary-button" type="button" onClick={onExportAll}>Export all (CSV)</button>
@@ -2499,8 +2630,9 @@ function PendingReportCard({ pendingReport, activeEmployee, onClaim, onSave }) {
   );
 }
 
-function PhoneOrderPage({ activeEmployee, sessionRole, phoneOrders, orderHandlers, onCreate, onDelivered }) {
+function PhoneOrderPage({ activeEmployee, sessionRole, phoneOrders, orderHandlers, storeTax, onCreate, onDelivered }) {
   const [now, setNow] = useState(new Date());
+  const [outOfState, setOutOfState] = useState(false);
   const [form, setForm] = useState({
     location: orderHandlers[0]?.location || "",
     assignedTo: orderHandlers[0]?.name || "",
@@ -2551,10 +2683,14 @@ function PhoneOrderPage({ activeEmployee, sessionRole, phoneOrders, orderHandler
     ? phoneOrders
     : phoneOrders.filter((order) => order.assignedTo === activeEmployee);
   const validItems = items.filter((item) => item.name.trim());
-  const orderTotal = validItems.reduce(
+  const subtotal = validItems.reduce(
     (sum, item) => sum + (Number(item.price) || 0) * (Number(item.qty) || 1),
     0,
   );
+  const taxRate = Number((storeTax || []).find((entry) => entry?.name === form.location)?.rate) || 0;
+  const taxApplies = !outOfState && taxRate > 0;
+  const taxAmount = taxApplies ? subtotal * (taxRate / 100) : 0;
+  const orderTotal = subtotal + taxAmount;
   const itemsText = validItems
     .map((item) => `${Number(item.qty) || 1}x ${item.name.trim()}`)
     .join(", ");
@@ -2601,6 +2737,10 @@ function PhoneOrderPage({ activeEmployee, sessionRole, phoneOrders, orderHandler
         qty: Number(item.qty) || 1,
         price: Number(item.price) || 0,
       })),
+      subtotal: subtotal.toFixed(2),
+      taxRate,
+      taxAmount: taxAmount.toFixed(2),
+      outOfState: outOfState ? "Yes" : "No",
       orderTotal: orderTotal.toFixed(2),
       paymentStatus: form.paymentStatus,
       paymentMethod: form.paymentMethod,
@@ -2707,6 +2847,15 @@ function PhoneOrderPage({ activeEmployee, sessionRole, phoneOrders, orderHandler
               </button>
             </div>
           ))}
+          <div className="pos-totals-row"><span>Subtotal</span><span>{formatMoney(subtotal)}</span></div>
+          <label className="checkbox-field pos-out-of-state">
+            <input type="checkbox" checked={outOfState} onChange={(event) => setOutOfState(event.target.checked)} />
+            <span>Out of state (no sales tax)</span>
+          </label>
+          <div className="pos-totals-row">
+            <span>Tax{taxApplies ? ` (${taxRate}%)` : ""}</span>
+            <span>{formatMoney(taxAmount)}</span>
+          </div>
           <div className="order-items-total">
             <span>Order total</span>
             <strong>{formatMoney(orderTotal)}</strong>
@@ -2795,11 +2944,12 @@ function OpenPhoneOrders({ orders, activeEmployee, sessionRole, onDelivered }) {
   );
 }
 
-function PosPage({ products, activeEmployee, activeLocation, activeDeviceId, onCompleteSale }) {
+function PosPage({ products, activeEmployee, activeLocation, activeDeviceId, activeTaxRate, onCompleteSale }) {
   const [cart, setCart] = useState([]);
   const [scan, setScan] = useState("");
   const [customerPhone, setCustomerPhone] = useState("");
   const [paymentMethod, setPaymentMethod] = useState(paymentMethods[0]);
+  const [outOfState, setOutOfState] = useState(false);
   const [notes, setNotes] = useState("");
   const [message, setMessage] = useState("");
   const [completedSale, setCompletedSale] = useState(null);
@@ -2905,7 +3055,11 @@ function PosPage({ products, activeEmployee, activeLocation, activeDeviceId, onC
     setCart((current) => current.filter((line) => line.lineId !== lineId));
   }
 
-  const total = cart.reduce((sum, line) => sum + line.price * line.qty, 0);
+  const subtotal = cart.reduce((sum, line) => sum + line.price * line.qty, 0);
+  const taxRate = Number(activeTaxRate) || 0;
+  const taxApplies = !outOfState && taxRate > 0;
+  const taxAmount = taxApplies ? subtotal * (taxRate / 100) : 0;
+  const total = subtotal + taxAmount;
   const itemCount = cart.reduce((sum, line) => sum + line.qty, 0);
   const requiresCardCharge = ["CC", "Card"].includes(paymentMethod);
   const cardChargeComplete = !requiresCardCharge || card.status === "paid";
@@ -2974,6 +3128,7 @@ function PosPage({ products, activeEmployee, activeLocation, activeDeviceId, onC
     const phoneLine = cart.find((line) => line.requiresImei && line.imei);
     const sale = {
       id: crypto.randomUUID(),
+      receiptCode: generateReceiptCode(),
       type: "sale",
       source: "pos",
       servedBy: activeEmployee,
@@ -2992,6 +3147,10 @@ function PosPage({ products, activeEmployee, activeLocation, activeDeviceId, onC
         imei: phoneLine?.imei || "",
         itemCount,
         lineItems,
+        subtotal: subtotal.toFixed(2),
+        taxRate,
+        taxAmount: taxAmount.toFixed(2),
+        outOfState: outOfState ? "Yes" : "No",
         cardStatus: requiresCardCharge ? card.status : "",
         solaRefNum: requiresCardCharge ? card.refNum : "",
       },
@@ -3003,6 +3162,7 @@ function PosPage({ products, activeEmployee, activeLocation, activeDeviceId, onC
     setCustomerPhone("");
     setNotes("");
     setPaymentMethod(paymentMethods[0]);
+    setOutOfState(false);
     setCard({ status: "idle", message: "", refNum: "" });
     setMessage("");
   }
@@ -3151,6 +3311,23 @@ function PosPage({ products, activeEmployee, activeLocation, activeDeviceId, onC
               <textarea value={notes} onChange={(event) => setNotes(event.target.value)} rows={2} />
             </label>
           </div>
+
+          <div className="pos-totals">
+            <div className="pos-totals-row"><span>Subtotal</span><span>{formatMoney(subtotal)}</span></div>
+            <label className="checkbox-field pos-out-of-state">
+              <input type="checkbox" checked={outOfState} onChange={(event) => setOutOfState(event.target.checked)} />
+              <span>Out of state (no sales tax)</span>
+            </label>
+            <div className="pos-totals-row">
+              <span>Tax{taxApplies ? ` (${taxRate}%)` : ""}</span>
+              <span>{formatMoney(taxAmount)}</span>
+            </div>
+            {!outOfState && taxRate === 0 ? (
+              <p className="muted">No tax rate set for this store. Add the store address in Inventory.</p>
+            ) : null}
+            <div className="pos-totals-row pos-totals-grand"><span>Total</span><strong>{formatMoney(total)}</strong></div>
+          </div>
+
           {requiresCardCharge ? (
             <div className="payment-panel payment-panel-stack">
               <div>
@@ -3239,8 +3416,47 @@ function PosPage({ products, activeEmployee, activeLocation, activeDeviceId, onC
   );
 }
 
-// Opens a print window and prints an 80mm-style sale receipt. Reused for both
-// the manual "Print receipt" button and the automatic print on checkout.
+// Shared 80mm thermal receipt styling.
+const THERMAL_BASE_CSS = `
+  @page { size: 80mm auto; margin: 0; }
+  html, body { margin: 0; }
+  body { width: 80mm; box-sizing: border-box; padding: 8px 9px 14px; color: #000;
+    font-family: ui-sans-serif, system-ui, "Segoe UI", sans-serif; font-size: 12.5px; line-height: 1.38; }
+  /* Thermal printers are monochrome — render the wordmark logo as crisp black. */
+  .receipt-logo { display: block; max-width: 72mm; max-height: 64px; margin: 0 auto 6px; object-fit: contain;
+    filter: grayscale(1) brightness(0); }
+  table { width: 100%; border-collapse: collapse; }
+  td { padding: 4px 0; vertical-align: top; }
+  .meta { font-size: 11.5px; text-align: center; }
+  .divider { border-top: 1px dashed #000; margin: 7px 0; }
+  .thanks { text-align: center; margin-top: 12px; font-weight: 600; }
+  small { color: #000; }
+`;
+
+// Opens a hidden 80mm print window that prints immediately and closes itself.
+// With the browser's default printer set to the thermal printer (and Chrome
+// kiosk printing for no dialog at all), this is a true one-click receipt.
+function openThermalReceipt(title, css, bodyHtml) {
+  const printWindow = window.open("", "_blank", "width=360,height=640");
+  if (!printWindow) {
+    window.print();
+    return;
+  }
+  printWindow.document.write(`<!doctype html><html><head><meta charset="utf-8" />
+    <title>${escapeHtml(title)}</title>
+    <style>${THERMAL_BASE_CSS}${css || ""}</style>
+    </head>
+    <body>${bodyHtml}
+    <script>
+      function closeReceipt(){ try { window.close(); } catch (e) {} }
+      window.onafterprint = closeReceipt;
+      window.onload = function () { window.focus(); window.print(); setTimeout(closeReceipt, 60000); };
+    <\/script>
+    </body></html>`);
+  printWindow.document.close();
+}
+
+// Prints the sale receipt. Reused by the manual button and the auto-print on checkout.
 function printSaleReceipt(sale) {
   const details = sale.details || {};
   const lines = details.lineItems || [];
@@ -3248,11 +3464,6 @@ function printSaleReceipt(sale) {
   const soldAt = toJsDate(sale.createdAt) || new Date();
   const logoUrl = `${window.location.origin}/logo.webp`;
 
-  const printWindow = window.open("", "_blank", "width=380,height=640");
-  if (!printWindow) {
-    window.print();
-    return;
-  }
   const rows = lines
     .map(
       (line) => `
@@ -3262,52 +3473,51 @@ function printSaleReceipt(sale) {
         </tr>`,
     )
     .join("");
-  printWindow.document.write(`
-    <html>
-      <head>
-        <title>Receipt</title>
-        <style>
-          body { font-family: ui-sans-serif, system-ui, sans-serif; padding: 16px; color: #111; }
-          h2 { margin: 0 0 2px; }
-          .receipt-logo { display: block; max-width: 180px; max-height: 70px; margin: 0 auto 8px; object-fit: contain; }
-          .meta { font-size: 12px; color: #555; margin-bottom: 12px; }
-          table { width: 100%; border-collapse: collapse; font-size: 13px; }
-          td { padding: 6px 0; border-bottom: 1px dashed #ccc; vertical-align: top; }
-          .total { font-size: 16px; font-weight: 700; margin-top: 12px; display: flex; justify-content: space-between; }
-          .thanks { text-align: center; margin-top: 16px; font-size: 12px; color: #555; }
-        </style>
-      </head>
-      <body>
-        <img class="receipt-logo" src="${logoUrl}" alt="Diamant Telecom" onerror="this.style.display='none'" />
-        <h2>Diamant Telecom</h2>
-        <div class="meta">
-          ${escapeHtml(details.location || "")}<br/>
-          ${soldAt.toLocaleString()}<br/>
-          Cashier: ${escapeHtml(sale.servedBy || "")}${sale.customerPhone ? `<br/>Customer: ${escapeHtml(sale.customerPhone)}` : ""}
-        </div>
-        <table>${rows}</table>
-        <div class="total"><span>Total</span><span>${formatMoney(total)}</span></div>
-        <div class="meta" style="margin-top:6px">Paid by ${escapeHtml(sale.paymentMethod || "")}</div>
-        <div class="thanks">Thank you!</div>
-      </body>
-    </html>`);
-  printWindow.document.close();
-  printWindow.focus();
-  printWindow.print();
+
+  const receiptCode = sale.receiptCode || "";
+  const barcodeBlock = receiptCode
+    ? `<div class="barcode">${code128Svg(receiptCode, { moduleWidth: 2, height: 56 })}<div class="barcode-text">${escapeHtml(receiptCode)}</div></div>`
+    : "";
+
+  const taxAmount = Number(details.taxAmount) || 0;
+  const taxBlock = taxAmount > 0 || Number(details.subtotal) > 0
+    ? `
+    <div class="line"><span>Subtotal</span><span>${formatMoney(Number(details.subtotal) || 0)}</span></div>
+    <div class="line"><span>Tax${details.taxRate ? ` (${details.taxRate}%)` : ""}</span><span>${formatMoney(taxAmount)}</span></div>`
+    : "";
+
+  const css = `
+    .line { display: flex; justify-content: space-between; font-size: 12px; }
+    .total { font-size: 15px; font-weight: 800; display: flex; justify-content: space-between; margin-top: 4px; }
+    .paid { font-size: 11.5px; text-align: center; margin-top: 6px; }
+    .barcode { text-align: center; margin-top: 12px; }
+    .barcode svg { max-width: 100%; height: 56px; }
+    .barcode-text { font-size: 11px; letter-spacing: 2px; margin-top: 2px; }`;
+  const body = `
+    <img class="receipt-logo" src="${logoUrl}" alt="Diamant Telecom" onerror="this.style.display='none'" />
+    <div class="meta">
+      ${details.location ? `${escapeHtml(details.location)}<br/>` : ""}
+      ${escapeHtml(soldAt.toLocaleString())}<br/>
+      Cashier: ${escapeHtml(sale.servedBy || "-")}${sale.customerPhone ? `<br/>Customer: ${escapeHtml(sale.customerPhone)}` : ""}
+    </div>
+    <div class="divider"></div>
+    <table>${rows}</table>
+    <div class="divider"></div>
+    ${taxBlock}
+    <div class="total"><span>Total</span><span>${formatMoney(total)}</span></div>
+    <div class="paid">Paid by ${escapeHtml(sale.paymentMethod || "-")}</div>
+    ${barcodeBlock}
+    <div class="thanks">Thank you!</div>`;
+
+  openThermalReceipt("Receipt", css, body);
 }
 
-// Prints a repair drop-off ticket with the generated ticket number so the
-// customer has a claim slip for pickup.
+// Prints a repair drop-off ticket with the generated ticket number.
 function printRepairTicket(report) {
   const details = report.details || {};
   const createdAt = (toJsDate(report.createdAt) || new Date()).toLocaleString();
   const logoUrl = `${window.location.origin}/logo.webp`;
 
-  const printWindow = window.open("", "_blank", "width=380,height=640");
-  if (!printWindow) {
-    window.print();
-    return;
-  }
   const rowsSource = [
     ["Phone", report.customerPhone],
     ["Model", details.model],
@@ -3321,37 +3531,23 @@ function printRepairTicket(report) {
     .filter(([, value]) => value)
     .map(([label, value]) => `<tr><td>${escapeHtml(label)}</td><td style="text-align:right">${escapeHtml(String(value))}</td></tr>`)
     .join("");
-  printWindow.document.write(`
-    <html>
-      <head>
-        <title>Repair ticket ${escapeHtml(details.ticketNumber || "")}</title>
-        <style>
-          body { font-family: ui-sans-serif, system-ui, sans-serif; padding: 16px; color: #111; }
-          h2 { margin: 0 0 2px; text-align: center; }
-          .receipt-logo { display: block; max-width: 180px; max-height: 70px; margin: 0 auto 8px; object-fit: contain; }
-          .eyebrow { text-align: center; font-size: 12px; color: #555; text-transform: uppercase; letter-spacing: 1px; }
-          .ticket { text-align: center; font-size: 26px; font-weight: 800; margin: 10px 0; letter-spacing: 1px; }
-          .meta { font-size: 12px; color: #555; text-align: center; margin-bottom: 12px; }
-          table { width: 100%; border-collapse: collapse; font-size: 13px; }
-          td { padding: 6px 0; border-bottom: 1px dashed #ccc; vertical-align: top; }
-          .notes { font-size: 12px; color: #555; margin-top: 10px; }
-          .thanks { text-align: center; margin-top: 16px; font-size: 12px; color: #555; }
-        </style>
-      </head>
-      <body>
-        <img class="receipt-logo" src="${logoUrl}" alt="Diamant Telecom" onerror="this.style.display='none'" />
-        <h2>Diamant Telecom</h2>
-        <div class="eyebrow">Repair ticket</div>
-        <div class="ticket">${escapeHtml(details.ticketNumber || "")}</div>
-        <div class="meta">${createdAt}</div>
-        <table>${rows}</table>
-        ${report.notes ? `<div class="notes">Notes: ${escapeHtml(report.notes)}</div>` : ""}
-        <div class="thanks">Keep this ticket for pickup. Thank you!</div>
-      </body>
-    </html>`);
-  printWindow.document.close();
-  printWindow.focus();
-  printWindow.print();
+
+  const css = `
+    .eyebrow { text-align: center; font-size: 11px; text-transform: uppercase; letter-spacing: 1px; }
+    .ticket { text-align: center; font-size: 24px; font-weight: 800; margin: 6px 0; letter-spacing: 1px; }
+    .notes { font-size: 11.5px; margin-top: 10px; }`;
+  const body = `
+    <img class="receipt-logo" src="${logoUrl}" alt="Diamant Telecom" onerror="this.style.display='none'" />
+    <div class="eyebrow">Repair ticket</div>
+    <div class="ticket">${escapeHtml(details.ticketNumber || "")}</div>
+    <div class="meta">${escapeHtml(createdAt)}</div>
+    <div class="divider"></div>
+    <table>${rows}</table>
+    ${report.notes ? `<div class="notes">Notes: ${escapeHtml(report.notes)}</div>` : ""}
+    <div class="divider"></div>
+    <div class="thanks">Keep this ticket for pickup. Thank you!</div>`;
+
+  openThermalReceipt(`Repair ticket ${details.ticketNumber || ""}`, css, body);
 }
 
 function SaleReceiptDialog({ sale, onClose }) {
@@ -3581,6 +3777,7 @@ function InventoryPage({
   storeLocations,
   employeeLocations,
   storeDevices,
+  storeTax,
   sessionRole,
   onSaveProduct,
   onRemoveProduct,
@@ -3588,6 +3785,8 @@ function InventoryPage({
   onRemoveStoreLocation,
   onSetEmployeeLocation,
   onSetStoreDevice,
+  onSetStoreTaxRate,
+  onRefreshTaxRate,
 }) {
   const isAdmin = sessionRole === "admin";
   const emptyForm = {
@@ -3601,10 +3800,15 @@ function InventoryPage({
     quantity: "0",
     imeis: [],
   };
+  const emptyStore = { name: "", street: "", city: "", state: "", zip: "" };
   const [form, setForm] = useState(emptyForm);
-  const [newStore, setNewStore] = useState("");
+  const [newStore, setNewStore] = useState(emptyStore);
   const [search, setSearch] = useState("");
   const [restock, setRestock] = useState(null);
+
+  function taxFor(name) {
+    return (storeTax || []).find((entry) => entry?.name === name) || null;
+  }
 
   function updateField(name, value) {
     setForm((current) => ({ ...current, [name]: value }));
@@ -3842,42 +4046,79 @@ function InventoryPage({
           </div>
         </div>
         <form
-          className="handler-form"
+          className="form-grid inventory-form"
           onSubmit={(event) => {
             event.preventDefault();
             onAddStoreLocation(newStore);
-            setNewStore("");
+            setNewStore(emptyStore);
           }}
         >
           <label className="field">
-            <span>New store name</span>
-            <input value={newStore} onChange={(event) => setNewStore(event.target.value)} required />
+            <span>Store name</span>
+            <input value={newStore.name} onChange={(event) => setNewStore((s) => ({ ...s, name: event.target.value }))} required />
+          </label>
+          <label className="field">
+            <span>Street</span>
+            <input value={newStore.street} onChange={(event) => setNewStore((s) => ({ ...s, street: event.target.value }))} />
+          </label>
+          <label className="field">
+            <span>City</span>
+            <input value={newStore.city} onChange={(event) => setNewStore((s) => ({ ...s, city: event.target.value }))} />
+          </label>
+          <label className="field">
+            <span>State</span>
+            <input value={newStore.state} onChange={(event) => setNewStore((s) => ({ ...s, state: event.target.value }))} placeholder="NY" />
+          </label>
+          <label className="field">
+            <span>ZIP (for tax rate)</span>
+            <input value={newStore.zip} onChange={(event) => setNewStore((s) => ({ ...s, zip: event.target.value }))} inputMode="numeric" />
           </label>
           <button className="primary-button align-end" type="submit">Add store</button>
         </form>
+        <p className="muted">Enter each store's sales-tax rate below. (If a tax API is configured, "Refresh rate" can auto-fill it from the address — optional.)</p>
         <div className="request-list">
-          {storeLocations.map((location) => (
-            <div className="request-row" key={location}>
-              <div>
-                <strong>{location}</strong>
-                <p className="muted">Sola terminal device ID for card payments at this store</p>
+          {storeLocations.map((location) => {
+            const tax = taxFor(location);
+            const address = tax ? [tax.street, tax.city, tax.state, tax.zip].filter(Boolean).join(", ") : "";
+            return (
+              <div className="request-row store-row" key={location}>
+                <div>
+                  <strong>{location}</strong>
+                  <p className="muted">{address || "No address on file"}</p>
+                </div>
+                <label className="field">
+                  <span>Sola device ID</span>
+                  <input
+                    key={`device-${location}-${deviceFor(location)}`}
+                    defaultValue={deviceFor(location)}
+                    placeholder="CloudIM device ID"
+                    autoComplete="off"
+                    spellCheck={false}
+                    onBlur={(event) => onSetStoreDevice(location, event.target.value)}
+                  />
+                </label>
+                <label className="field tax-rate-field">
+                  <span>Tax rate %</span>
+                  <input
+                    key={`tax-${location}-${tax?.rate ?? ""}`}
+                    type="number"
+                    step="0.001"
+                    min="0"
+                    defaultValue={tax?.rate ?? 0}
+                    onBlur={(event) => onSetStoreTaxRate(location, event.target.value)}
+                  />
+                </label>
+                <div className="store-row-actions">
+                  <button className="secondary-button compact-button" type="button" onClick={() => onRefreshTaxRate(location)}>
+                    Refresh rate
+                  </button>
+                  <button className="secondary-button compact-button" type="button" onClick={() => onRemoveStoreLocation(location)}>
+                    Remove
+                  </button>
+                </div>
               </div>
-              <label className="field">
-                <span>Sola device ID</span>
-                <input
-                  key={`device-${location}-${deviceFor(location)}`}
-                  defaultValue={deviceFor(location)}
-                  placeholder="CloudIM device ID"
-                  autoComplete="off"
-                  spellCheck={false}
-                  onBlur={(event) => onSetStoreDevice(location, event.target.value)}
-                />
-              </label>
-              <button className="secondary-button" type="button" onClick={() => onRemoveStoreLocation(location)}>
-                Remove
-              </button>
-            </div>
-          ))}
+            );
+          })}
         </div>
       </section>
 
@@ -4189,6 +4430,9 @@ function ReportDetails({ report }) {
       ["Items", details.itemsText],
       ["Model", details.model],
       ["IMEI", details.imei],
+      ["Subtotal", Number(details.taxAmount) > 0 && details.subtotal ? formatMoney(Number(details.subtotal)) : ""],
+      ["Tax", Number(details.taxAmount) > 0 ? `${formatMoney(Number(details.taxAmount))}${details.taxRate ? ` (${details.taxRate}%)` : ""}` : ""],
+      ["Out of state", details.outOfState === "Yes" ? "Yes" : ""],
       ["Card txn", details.solaRefNum || details.stripePaymentIntentId || details.solaTransactionId],
       ["Returned", details.returnStatus],
     ],
@@ -4223,6 +4467,9 @@ function ReportDetails({ report }) {
       ["Return time", details.returnTime],
       ["Return due", details.returnDueDate],
       ["Reminder", details.returnReminderPreference],
+      ["Late fee", Number(details.lateFeeWeekly) > 0
+        ? `${formatMoney(Number(details.lateFeeWeekly))}/wk (${formatMoney(Number(details.lateFeeWeekly) / 7)}/day overdue)`
+        : ""],
       ["Total days", details.totalDays],
       ["UK/EU/WTS", `${details.ukDays || 0}/${details.euDays || 0}/${details.wtsDays || 0}`],
       ["SMS", details.addSms],
@@ -4241,6 +4488,7 @@ function ReportDetails({ report }) {
       ["Address", details.address],
       ["Contact", details.contactDetails],
       ["Payment", details.paymentStatus],
+      ["Tax", Number(details.taxAmount) > 0 ? `${formatMoney(Number(details.taxAmount))}${details.taxRate ? ` (${details.taxRate}%)` : ""}` : ""],
       ["Delivered", details.deliveredAt ? formatShortDate(details.deliveredAt) : ""],
       ["Returned", details.returnStatus],
     ],
