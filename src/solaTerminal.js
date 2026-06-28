@@ -29,6 +29,7 @@ export async function chargeOnDevice({
   location,
   customerPhone,
   externalRequestId,
+  manualEntry = false,
   onStatus,
   pollIntervalMs = 2500,
   timeoutMs = 120000,
@@ -48,10 +49,13 @@ export async function chargeOnDevice({
     location,
     customerPhone,
     externalRequestId: requestId,
+    manualEntry,
   });
 
   const sessionId = started.sessionId || "";
-  onStatus?.("Follow the terminal: tap, insert, or swipe the card.");
+  onStatus?.(manualEntry
+    ? "Follow the terminal: key in the card number by hand."
+    : "Follow the terminal: tap, insert, or swipe the card.");
 
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {

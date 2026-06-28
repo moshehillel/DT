@@ -20,8 +20,7 @@ Set `VITE_FUNCTIONS_BASE_URL` to your deployed Functions base URL (for example `
 Set these on Firebase Functions (`firebase functions:secrets:set` or `.env`):
 
 - `SOLA_API_KEY` — Sola / Cardknox API key (used for both online charges and the in-person terminal).
-- `SOLA_DEFAULT_DEVICE_ID` — fallback CloudIM terminal device ID. Per-store device IDs are set in the app under Inventory → Stores.
-- `SOLA_DEVICE_API_BASE_URL` — optional, defaults to `https://device.cardknox.com/v2`.
+- `SOLA_DEVICE_API_BASE_URL` — optional, defaults to `https://device.cardknox.com/v2`. Each store's CloudIM terminal device ID is set in the app under Inventory → Stores; there is no global fallback.
 - `TELEBROAD_USERNAME`, `TELEBROAD_PASSWORD` — Telebroad TeleConsole account credentials for sending SMS.
 - `TELEBROAD_SMS_LINE` — the Telebroad line / DID texts are sent from (defaults to `13473887467`, the "Diamant Telecom" SMS line; override only if it changes). Look it up anytime with `GET /sms/lines`.
 - `TELEBROAD_API_BASE_URL` — optional, defaults to `https://webserv.telebroad.com/api/teleconsole/rest`.
@@ -77,7 +76,7 @@ Before going live:
 
 1. **Frontend env** — set `VITE_ADMIN_PIN` (don't ship the dev default) and `VITE_FUNCTIONS_BASE_URL` at build time. See `.env.example`.
 2. **Functions secrets** — set on Firebase Functions:
-   - `SOLA_API_KEY`, `SOLA_DEFAULT_DEVICE_ID` (Sola/Cardknox CloudIM terminal)
+   - `SOLA_API_KEY` (Sola/Cardknox CloudIM terminal; per-store device IDs are set in-app under Inventory → Stores)
    - `TELEBROAD_USERNAME`, `TELEBROAD_PASSWORD` (SMS; `TELEBROAD_SMS_LINE` defaults to the Diamant line)
    - `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_FROM_NUMBER` (outgoing voice notifications)
    - `RCUK_API_KEY` (rentals), `SHOPIFY_WEBHOOK_SECRET` (Shopify import verification)

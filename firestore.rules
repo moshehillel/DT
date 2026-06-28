@@ -57,6 +57,11 @@ service cloud.firestore {
       allow read, create, update, delete: if signedIn();
     }
 
+    match /customers/{customerId} {
+      allow read, create, update: if signedIn();
+      allow delete: if isAdmin();
+    }
+
     match /notificationLogs/{logId} {
       allow read, create: if signedIn();
       allow update, delete: if isAdmin();

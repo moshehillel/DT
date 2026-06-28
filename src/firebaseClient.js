@@ -11,6 +11,8 @@ import {
   doc,
   initializeFirestore,
   onSnapshot,
+  persistentLocalCache,
+  persistentMultipleTabManager,
   setDoc,
   writeBatch,
 } from "firebase/firestore";
@@ -49,7 +51,15 @@ async function getFirebase() {
           auth: getAuth(app),
           // Auto-detect long-polling so the database still works on networks /
           // filters that break Firestore's streaming (WebChannel) connection.
-          db: initializeFirestore(app, { experimentalAutoDetectLongPolling: true }),
+          // Persist the cache to IndexedDB so a hard refresh resumes from the
+          // last sync (reading only changed docs) instead of re-reading every
+          // document. The multi-tab manager shares one cache across open tabs.
+          db: initializeFirestore(app, {
+            experimentalAutoDetectLongPolling: true,
+            localCache: persistentLocalCache({
+              tabManager: persistentMultipleTabManager(),
+            }),
+          }),
           functions: getFunctions(app),
         };
       });
@@ -224,15 +234,35 @@ export async function upsertCollectionItems(collectionName, items) {
   );
 }
 
+// Stable JSON for change detection: sort object keys so two equal objects with a
+// different key order aren't treated as "changed" and don't trigger a write.
+function stableStringify(value) {
+  if (Array.isArray(value)) return `[${value.map(stableStringify).join(",")}]`;
+  if (value && typeof value === "object") {
+    return `{${Object.keys(value)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${stableStringify(value[key])}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
 export async function syncCollectionItems(collectionName, previousItems, nextItems) {
   await ensureFirebaseAuth();
   const { db } = await getFirebase();
   const collectionRef = collection(db, collectionName);
-  const previousIds = new Set(previousItems.map((item) => item.id));
+  const previousById = new Map(previousItems.map((item) => [item.id, item]));
   const nextIds = new Set(nextItems.map((item) => item.id));
   const operations = [
-    ...nextItems.map((item) => (batch) => batch.set(doc(collectionRef, item.id), item)),
-    ...[...previousIds]
+    // Only write docs that are new or whose contents actually changed, so editing
+    // one item in a large collection doesn't rewrite every document.
+    ...nextItems
+      .filter((item) => {
+        const previous = previousById.get(item.id);
+        return !previous || stableStringify(previous) !== stableStringify(item);
+      })
+      .map((item) => (batch) => batch.set(doc(collectionRef, item.id), item)),
+    ...[...previousById.keys()]
       .filter((id) => !nextIds.has(id))
       .map((id) => (batch) => batch.delete(doc(collectionRef, id))),
   ];

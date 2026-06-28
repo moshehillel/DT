@@ -48,6 +48,7 @@ import {
   escapeHtml,
   generateReceiptCode,
   exportCsv,
+  localPhoneDigits,
   formatDateTime,
   formatMoney,
   formatPayment,
@@ -143,6 +144,27 @@ function Workspace({ currentUser, isAdmin }) {
   useEffect(() => {
     if (isAdmin) localStorage.setItem(ACTIVE_EMPLOYEE_KEY, activeEmployee);
   }, [activeEmployee, isAdmin]);
+
+  // Warn before a manual refresh: a cold reload re-reads data from the database,
+  // and refreshing often adds up to extra read charges. The app already syncs
+  // live, so a refresh is rarely needed. Custom wording is only possible for the
+  // keyboard refresh (F5 / Ctrl+R / Cmd+R); the browser's own reload button can't
+  // show custom text.
+  useEffect(() => {
+    function onKeyDown(event) {
+      const isRefreshKey = event.key === "F5"
+        || ((event.ctrlKey || event.metaKey) && (event.key === "r" || event.key === "R"));
+      if (!isRefreshKey) return;
+      event.preventDefault();
+      const reload = window.confirm(
+        "Reloading re-reads data from the database and refreshing often can incur extra charges.\n\n"
+        + "The app updates automatically, so you usually don't need to refresh.\n\nReload anyway?",
+      );
+      if (reload) window.location.reload();
+    }
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, []);
 
   const activeLocation = useMemo(() => {
     const match = (employeeLocations || []).find((entry) => entry?.name === activeEmployee);
@@ -301,7 +323,7 @@ function Workspace({ currentUser, isAdmin }) {
   // blank fields on an existing customer — never overwrites entered details.
   function upsertCustomer(info) {
     const phone = String(info?.phone || "").trim();
-    const digits = digitsOnly(phone);
+    const digits = localPhoneDigits(phone);
     if (!digits) return;
     setCustomers((current) => {
       const index = current.findIndex((entry) => entry.phoneDigits === digits);
@@ -351,14 +373,14 @@ function Workspace({ currentUser, isAdmin }) {
   // Manual create/edit from the CRM page.
   function saveCustomer(customer) {
     const phone = String(customer.phone || "").trim();
-    const digits = digitsOnly(phone);
+    const digits = localPhoneDigits(phone);
     const now = new Date().toISOString();
     const mobile = String(customer.mobile || "").trim();
     const normalized = {
       phone,
       phoneDigits: digits,
       mobile,
-      mobileDigits: digitsOnly(mobile),
+      mobileDigits: localPhoneDigits(mobile),
       name: String(customer.name || "").trim(),
       address: String(customer.address || "").trim(),
       email: String(customer.email || "").trim(),
@@ -597,10 +619,28 @@ function Workspace({ currentUser, isAdmin }) {
     upsertCustomer({
       phone: order.customerPhone,
       name: order.customerName,
+      // Keep the customer's on-file address — never the one-off delivery address.
       address: order.address,
       contactDetails: order.contactDetails,
     });
     setPhoneOrders((current) => [enrichedOrder, ...current]);
+    // Scanned products are now sold/committed, so draw them down from inventory
+    // exactly like a POS sale (remove sold IMEIs, decrement plain stock).
+    setProducts((current) =>
+      current.map((product) => {
+        const lines = (order.lineItems || []).filter((line) => line.productId === product.id);
+        if (!lines.length) return product;
+        if (product.requiresImei) {
+          const soldImeis = new Set(lines.map((line) => line.imei).filter(Boolean));
+          if (!soldImeis.size) return product;
+          const remaining = (product.imeis || []).filter((imei) => !soldImeis.has(imei));
+          return { ...product, imeis: remaining, quantity: remaining.length, updatedAt: new Date().toISOString() };
+        }
+        const soldQty = lines.reduce((total, line) => total + (Number(line.qty) || 0), 0);
+        const nextQuantity = Math.max(0, (Number(product.quantity) || 0) - soldQty);
+        return { ...product, quantity: nextQuantity, updatedAt: new Date().toISOString() };
+      }),
+    );
     queuePhoneOrderAssignedNotifications(enrichedOrder);
     setFormNonce((value) => value + 1);
   }
@@ -1027,8 +1067,11 @@ function Workspace({ currentUser, isAdmin }) {
               phoneOrders={phoneOrders}
               orderHandlers={orderHandlers}
               storeTax={storeTax}
+              storeDevices={storeDevices}
+              products={products}
               customers={customers}
               onSaveCustomerName={saveCustomerName}
+              onSaveCustomer={saveCustomer}
               onCreate={createPhoneOrder}
               onDelivered={completePhoneOrder}
             />
@@ -1072,6 +1115,7 @@ function Workspace({ currentUser, isAdmin }) {
             activeStoreInfo={activeStoreInfo}
             customers={customers}
             onSaveCustomerName={saveCustomerName}
+            onSaveCustomer={saveCustomer}
             onCompleteSale={savePosSale}
           />
         ) : activeView === "inventory" ? (
@@ -1458,7 +1502,7 @@ function ReportForm({ activeType, activeEmployee, reports, customers, activeStor
     }
 
     // Snapshot store + customer details so the printed ticket is self-contained.
-    const phoneDigits = digitsOnly(formData.get("customerPhone"));
+    const phoneDigits = localPhoneDigits(formData.get("customerPhone"));
     const matchedCustomer = phoneDigits
       ? (customers || []).find((entry) => entry.phoneDigits === phoneDigits || entry.mobileDigits === phoneDigits)
       : null;
@@ -2874,46 +2918,39 @@ function PendingReportCard({ pendingReport, activeEmployee, customers, onSaveCus
   );
 }
 
-function PhoneOrderPage({ activeEmployee, sessionRole, phoneOrders, orderHandlers, storeTax, customers, onSaveCustomerName, onCreate, onDelivered }) {
-  const [now, setNow] = useState(new Date());
+function PhoneOrderPage({ activeEmployee, sessionRole, phoneOrders, orderHandlers, storeTax, storeDevices, products, customers, onSaveCustomerName, onSaveCustomer, onCreate, onDelivered }) {
   const [outOfState, setOutOfState] = useState(false);
-
-  function fillFromCustomer(customer) {
-    setForm((current) => ({
-      ...current,
-      customerPhone: customer.phone || current.customerPhone,
-      customerName: customer.name || current.customerName,
-      address: customer.address || current.address,
-      contactDetails: customer.contactDetails || current.contactDetails,
-    }));
-  }
   const [form, setForm] = useState({
     location: orderHandlers[0]?.location || "",
     assignedTo: orderHandlers[0]?.name || "",
     customerName: "",
     customerPhone: "",
     contactDetails: "",
-    address: "",
+    deliveryAddress: "",
     paymentStatus: "Paid",
     paymentMethod: "Cash",
     notes: "",
   });
-  const [items, setItems] = useState([{ id: crypto.randomUUID(), name: "", qty: "1", price: "" }]);
+  const [cart, setCart] = useState([]);
+  const [scan, setScan] = useState("");
+  const [scanMode, setScanMode] = useState(true);
+  const [message, setMessage] = useState("");
+  const [cardEntryMode, setCardEntryMode] = useState("terminal");
+  const [card, setCard] = useState({ status: "idle", message: "", refNum: "" });
+  const [customerPrompt, setCustomerPrompt] = useState(null);
+  const scanRef = useRef(null);
 
-  function updateItem(id, patch) {
-    setItems((current) => current.map((item) => (item.id === id ? { ...item, ...patch } : item)));
+  function fillFromCustomer(customer) {
+    setForm((current) => ({
+      ...current,
+      customerPhone: customer.phone || current.customerPhone,
+      customerName: customer.name || current.customerName,
+      contactDetails: customer.contactDetails || current.contactDetails,
+      // Pre-fill delivery with the on-file address as a convenience; the employee
+      // can change it if this order ships somewhere else.
+      deliveryAddress: current.deliveryAddress || customer.address || "",
+    }));
   }
-  function addItem() {
-    setItems((current) => [...current, { id: crypto.randomUUID(), name: "", qty: "1", price: "" }]);
-  }
-  function removeItem(id) {
-    setItems((current) => (current.length > 1 ? current.filter((item) => item.id !== id) : current));
-  }
-
-  useEffect(() => {
-    const timer = window.setInterval(() => setNow(new Date()), 30000);
-    return () => window.clearInterval(timer);
-  }, []);
 
   useEffect(() => {
     if (!orderHandlers.length) return;
@@ -2936,24 +2973,116 @@ function PhoneOrderPage({ activeEmployee, sessionRole, phoneOrders, orderHandler
   const visibleOrders = sessionRole === "admin"
     ? phoneOrders
     : phoneOrders.filter((order) => order.assignedTo === activeEmployee);
-  const validItems = items.filter((item) => item.name.trim());
-  const subtotal = validItems.reduce(
-    (sum, item) => sum + (Number(item.price) || 0) * (Number(item.qty) || 1),
-    0,
+
+  const deviceId = (storeDevices || []).find((entry) => entry?.name === form.location)?.deviceId || "";
+  const availableProducts = useMemo(
+    () => products
+      .filter((product) => !form.location || !product.location || product.location === form.location)
+      .sort((a, b) => String(a.name || "").localeCompare(String(b.name || ""))),
+    [products, form.location],
   );
+  const productsById = useMemo(
+    () => Object.fromEntries(products.map((product) => [product.id, product])),
+    [products],
+  );
+
+  function imeiLineStatus(line) {
+    if (!line.requiresImei) return "ok";
+    if (!line.imei) return "missing";
+    const duplicate = cart.filter((other) => other.requiresImei && other.imei === line.imei).length > 1;
+    if (duplicate) return "duplicate";
+    const stock = productsById[line.productId]?.imeis || [];
+    if (stock.length > 0 && !stock.includes(line.imei)) return "notstock";
+    return "ok";
+  }
+
+  function makeLine(product) {
+    return {
+      lineId: crypto.randomUUID(),
+      productId: product.id,
+      sku: product.sku,
+      name: product.name,
+      price: Number(product.price) || 0,
+      qty: 1,
+      requiresImei: Boolean(product.requiresImei),
+      imei: "",
+      category: product.category || "",
+    };
+  }
+
+  function addProductToCart(product) {
+    setCart((current) => {
+      if (!product.requiresImei) {
+        const existing = current.find((line) => line.productId === product.id && !line.requiresImei);
+        if (existing) {
+          return current.map((line) => (line.lineId === existing.lineId ? { ...line, qty: line.qty + 1 } : line));
+        }
+      }
+      return [...current, makeLine(product)];
+    });
+  }
+
+  function findProductBySku(sku) {
+    const clean = String(sku || "").trim().toLowerCase();
+    if (!clean) return null;
+    const matches = products.filter((product) => String(product.sku || "").trim().toLowerCase() === clean);
+    if (!matches.length) return null;
+    return matches.find((product) => product.location === form.location) || matches.find((product) => !product.location) || matches[0];
+  }
+
+  function handleScan(event) {
+    event.preventDefault();
+    const product = findProductBySku(scan);
+    if (!product) {
+      setMessage(`No product matches "${scan.trim()}".`);
+      return;
+    }
+    addProductToCart(product);
+    setMessage(`Added ${product.name}.`);
+    setScan("");
+    scanRef.current?.focus();
+  }
+
+  function updateQty(lineId, value) {
+    const qty = Math.max(1, Number.parseInt(value, 10) || 1);
+    setCart((current) => current.map((line) => (line.lineId === lineId ? { ...line, qty } : line)));
+  }
+  function updateImei(lineId, value) {
+    setCart((current) => current.map((line) => (line.lineId === lineId ? { ...line, imei: value.trim() } : line)));
+  }
+  function removeLine(lineId) {
+    setCart((current) => current.filter((line) => line.lineId !== lineId));
+  }
+
+  const subtotal = cart.reduce((sum, line) => sum + line.price * line.qty, 0);
   const taxRate = Number((storeTax || []).find((entry) => entry?.name === form.location)?.rate) || 0;
   const taxApplies = !outOfState && taxRate > 0;
   const taxAmount = taxApplies ? subtotal * (taxRate / 100) : 0;
   const orderTotal = subtotal + taxAmount;
-  const itemsText = validItems
-    .map((item) => `${Number(item.qty) || 1}x ${item.name.trim()}`)
-    .join(", ");
-  const canCreate = form.location.trim()
-    && form.assignedTo.trim()
-    && form.customerPhone.trim()
-    && form.address.trim()
-    && validItems.length > 0
-    && form.paymentStatus.trim();
+  const itemCount = cart.reduce((sum, line) => sum + line.qty, 0);
+  const itemsText = cart.map((line) => `${line.qty}x ${line.name}${line.imei ? ` (IMEI ${line.imei})` : ""}`).join(", ");
+
+  // Card is collected up front only when the order is marked Paid now.
+  const requiresCardCharge = form.paymentStatus === "Paid" && ["CC", "Card"].includes(form.paymentMethod);
+  const cardChargeComplete = !requiresCardCharge || card.status === "paid";
+  const imeiIssue = (() => {
+    if (cart.some((line) => imeiLineStatus(line) === "missing")) return "Scan an IMEI for every phone before creating the order.";
+    if (cart.some((line) => imeiLineStatus(line) === "duplicate")) return "The same IMEI is on two lines. Each phone needs its own unique IMEI.";
+    if (cart.some((line) => imeiLineStatus(line) === "notstock")) return "An IMEI is not in this product's inventory. Scan a phone that is in stock.";
+    return "";
+  })();
+
+  useEffect(() => {
+    setCard((current) => (current.status === "idle" ? current : { status: "idle", message: "", refNum: "" }));
+  }, [orderTotal, form.paymentMethod, form.paymentStatus]);
+
+  const canCreate = Boolean(form.location.trim())
+    && Boolean(selectedHandler)
+    && localPhoneDigits(form.customerPhone).length >= 6
+    && Boolean(form.deliveryAddress.trim())
+    && cart.length > 0
+    && !imeiIssue
+    && cardChargeComplete;
 
   function updateField(name, value) {
     setForm((current) => {
@@ -2966,14 +3095,52 @@ function PhoneOrderPage({ activeEmployee, sessionRole, phoneOrders, orderHandler
     });
   }
 
+  async function chargeCard() {
+    if (!requiresCardCharge || !orderTotal) return;
+    try {
+      setCard({ status: "charging", message: "Sending sale to the terminal...", refNum: "" });
+      const result = await chargeOnDevice({
+        amount: orderTotal.toFixed(2),
+        deviceId,
+        location: form.location,
+        customerPhone: form.customerPhone.trim(),
+        manualEntry: cardEntryMode === "manual",
+        onStatus: (text) => setCard((current) => ({ ...current, message: text })),
+      });
+      setCard({
+        status: "paid",
+        message: result.maskedCardNumber
+          ? `Card approved (${result.cardType || "card"} ${result.maskedCardNumber}).`
+          : "Card approved.",
+        refNum: result.refNum || "",
+      });
+    } catch (error) {
+      setCard({ status: "error", message: error.message || "Card payment failed.", refNum: "" });
+    }
+  }
+
   function submitOrder(event) {
     event.preventDefault();
     if (!canCreate || !selectedHandler) return;
+    const matched = (customers || []).find(
+      (entry) => entry.phoneDigits === localPhoneDigits(form.customerPhone) || entry.mobileDigits === localPhoneDigits(form.customerPhone),
+    ) || null;
+    // Prompt for a new/incomplete customer, just like POS, before creating.
+    if (!matched || !matched.name) {
+      setCustomerPrompt({ phone: form.customerPhone.trim(), customer: matched });
+      return;
+    }
+    createOrder(matched);
+  }
 
-    onCreate({
+  function createOrder(matchedCustomer) {
+    const phoneLine = cart.find((line) => line.requiresImei && line.imei);
+    const onFileAddress = matchedCustomer?.address || form.deliveryAddress.trim();
+    const order = {
       id: crypto.randomUUID(),
       type: "phoneOrder",
       status: "Assigned",
+      receiptCode: generateReceiptCode(),
       createdAt: new Date().toISOString(),
       createdBy: activeEmployee,
       location: form.location.trim(),
@@ -2981,15 +3148,22 @@ function PhoneOrderPage({ activeEmployee, sessionRole, phoneOrders, orderHandler
       assignedPhone: selectedHandler.phone || "",
       customerName: form.customerName.trim(),
       customerPhone: form.customerPhone.trim(),
-      customerPhoneDigits: digitsOnly(form.customerPhone),
+      customerPhoneDigits: localPhoneDigits(form.customerPhone),
       contactDetails: form.contactDetails.trim(),
-      address: form.address.trim(),
-      model: itemsText,
+      address: onFileAddress,
+      deliveryAddress: form.deliveryAddress.trim(),
+      model: cart.length === 1 ? cart[0].name : itemsText,
       itemsText,
-      lineItems: validItems.map((item) => ({
-        name: item.name.trim(),
-        qty: Number(item.qty) || 1,
-        price: Number(item.price) || 0,
+      imei: phoneLine?.imei || "",
+      lineItems: cart.map((line) => ({
+        productId: line.productId,
+        sku: line.sku,
+        name: line.name,
+        price: line.price,
+        qty: line.qty,
+        imei: line.imei,
+        requiresImei: line.requiresImei,
+        category: line.category,
       })),
       subtotal: subtotal.toFixed(2),
       taxRate,
@@ -2998,18 +3172,62 @@ function PhoneOrderPage({ activeEmployee, sessionRole, phoneOrders, orderHandler
       orderTotal: orderTotal.toFixed(2),
       paymentStatus: form.paymentStatus,
       paymentMethod: form.paymentMethod,
+      cardStatus: requiresCardCharge ? card.status : "",
+      solaRefNum: requiresCardCharge ? card.refNum : "",
+      storeAddress: formatStoreAddress((storeTax || []).find((entry) => entry?.name === form.location)),
+      storeHours: (storeTax || []).find((entry) => entry?.name === form.location)?.hours || "",
       notes: form.notes.trim(),
+    };
+    onCreate(order);
+    printPhoneOrderReceipt(order);
+    setCart([]);
+    setCustomerPrompt(null);
+    setCard({ status: "idle", message: "", refNum: "" });
+    setForm((current) => ({
+      ...current,
+      customerName: "",
+      customerPhone: "",
+      contactDetails: "",
+      deliveryAddress: "",
+      notes: "",
+    }));
+    setMessage("Order created, receipt printed, and the handler was notified.");
+  }
+
+  function handleCustomerPromptSave(values) {
+    if (!customerPrompt) return;
+    onSaveCustomer?.({
+      id: customerPrompt.customer?.id || "",
+      phone: customerPrompt.phone,
+      name: values.name.trim(),
+      mobile: values.mobile.trim(),
+      address: values.address.trim(),
     });
+    const merged = {
+      ...(customerPrompt.customer || {}),
+      name: values.name.trim(),
+      address: values.address.trim() || customerPrompt.customer?.address || "",
+    };
+    if (values.name.trim()) updateField("customerName", values.name.trim());
+    createOrder(merged);
+  }
+
+  function handleCustomerPromptSkip() {
+    const customer = customerPrompt?.customer || null;
+    createOrder(customer);
   }
 
   return (
     <section className="workspace">
       <div className="workspace-header">
         <div>
-          <p className="eyebrow">Manual order</p>
-          <h2>Phone order</h2>
+          <p className="eyebrow">Phone order</p>
+          <h2>Scan items and create the order</h2>
         </div>
-        <div className="clock-pill">{formatDateTime(now)}</div>
+        <div className="summary-strip">
+          <span className="metric">Store <strong>{form.location || "Unassigned"}</strong></span>
+          <span className="metric">Total <strong>{formatMoney(orderTotal)}</strong></span>
+        </div>
       </div>
 
       <form className="report-form" onSubmit={submitOrder}>
@@ -3059,68 +3277,87 @@ function PhoneOrderPage({ activeEmployee, sessionRole, phoneOrders, orderHandler
             <input value={form.contactDetails} onChange={(event) => updateField("contactDetails", event.target.value)} placeholder="Email, WhatsApp, alternate phone" />
           </label>
           <label className="field">
-            <span>Address</span>
-            <input value={form.address} onChange={(event) => updateField("address", event.target.value)} required />
+            <span>Delivery address</span>
+            <input value={form.deliveryAddress} onChange={(event) => updateField("deliveryAddress", event.target.value)} placeholder="Where to deliver this order" required />
           </label>
         </div>
 
-        <div className="order-items">
-          <div className="order-items-head">
-            <p className="form-section-title">Items</p>
-            <button className="secondary-button compact-button" type="button" onClick={addItem}>Add item</button>
+        <div className="segmented-control scan-mode" role="tablist" aria-label="Entry mode">
+          <button type="button" className={scanMode ? "selected" : ""} onClick={() => { setScanMode(true); scanRef.current?.focus(); }}>Scan</button>
+          <button type="button" className={!scanMode ? "selected" : ""} onClick={() => { setScanMode(false); scanRef.current?.focus(); }}>Manual</button>
+        </div>
+        <div className="pos-scan">
+          <input
+            ref={scanRef}
+            className="pos-scan-input"
+            value={scan}
+            onChange={(event) => setScan(event.target.value)}
+            onKeyDown={(event) => { if (event.key === "Enter") handleScan(event); }}
+            placeholder={scanMode ? "Scan a barcode — it adds automatically" : "Type SKU / barcode, then press Enter"}
+            inputMode="text"
+            autoComplete="off"
+            spellCheck={false}
+          />
+          {!scanMode ? <button className="primary-button" type="button" onClick={handleScan}>Add</button> : null}
+        </div>
+        {message ? <p className="pos-message">{message}</p> : null}
+
+        {cart.length ? (
+          <div className="table-wrap">
+            <table>
+              <thead>
+                <tr><th>Item</th><th>Price</th><th>Qty</th><th>IMEI</th><th>Line</th><th></th></tr>
+              </thead>
+              <tbody>
+                {cart.map((line) => (
+                  <tr key={line.lineId}>
+                    <td><strong>{line.name}</strong><p className="muted">{line.sku}</p></td>
+                    <td>{formatMoney(line.price)}</td>
+                    <td>
+                      {line.requiresImei ? <span className="muted">1</span> : (
+                        <input className="pos-qty" type="number" min="1" value={line.qty} onChange={(event) => updateQty(line.lineId, event.target.value)} />
+                      )}
+                    </td>
+                    <td>
+                      {line.requiresImei ? (
+                        <input
+                          className={`pos-imei ${imeiLineStatus(line) === "ok" ? "" : "pos-imei-missing"}`}
+                          value={line.imei}
+                          onChange={(event) => updateImei(line.lineId, event.target.value)}
+                          placeholder="Scan IMEI"
+                          inputMode="numeric"
+                          autoComplete="off"
+                          spellCheck={false}
+                        />
+                      ) : <span className="muted">-</span>}
+                    </td>
+                    <td>{formatMoney(line.price * line.qty)}</td>
+                    <td><button className="secondary-button" type="button" onClick={() => removeLine(line.lineId)}>Remove</button></td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
           </div>
-          {items.map((item, index) => (
-            <div className="order-item-row" key={item.id}>
-              <label className="field">
-                {index === 0 ? <span>Item / model</span> : null}
-                <input
-                  value={item.name}
-                  onChange={(event) => updateItem(item.id, { name: event.target.value })}
-                  placeholder="iPhone 15, case, charger..."
-                />
-              </label>
-              <label className="field order-item-qty">
-                {index === 0 ? <span>Qty</span> : null}
-                <input
-                  type="number"
-                  min="1"
-                  value={item.qty}
-                  onChange={(event) => updateItem(item.id, { qty: event.target.value })}
-                />
-              </label>
-              <label className="field order-item-price">
-                {index === 0 ? <span>Unit price</span> : null}
-                <input
-                  inputMode="decimal"
-                  value={item.price}
-                  onChange={(event) => updateItem(item.id, { price: event.target.value })}
-                  placeholder="0.00"
-                />
-              </label>
-              <button
-                className="secondary-button compact-button order-item-remove"
-                type="button"
-                onClick={() => removeItem(item.id)}
-                disabled={items.length === 1}
-                aria-label="Remove item"
-              >
-                ×
-              </button>
-            </div>
+        ) : <p className="empty-state">Scan a product to start the order.</p>}
+
+        <div className="pos-product-grid">
+          {availableProducts.map((product) => (
+            <button className="pos-product" type="button" key={product.id} onClick={() => { addProductToCart(product); setMessage(`Added ${product.name}.`); }}>
+              <strong>{product.name}</strong>
+              <span>{formatMoney(Number(product.price) || 0)}</span>
+              <small className="muted">{product.requiresImei ? `In stock ${product.imeis?.length || 0} - IMEI` : `Stock ${Number(product.quantity) || 0}`}</small>
+            </button>
           ))}
+        </div>
+
+        <div className="pos-totals">
           <div className="pos-totals-row"><span>Subtotal</span><span>{formatMoney(subtotal)}</span></div>
           <label className="checkbox-field pos-out-of-state">
             <input type="checkbox" checked={outOfState} onChange={(event) => setOutOfState(event.target.checked)} />
             <span>Out of state (no sales tax)</span>
           </label>
-          <div className="pos-totals-row">
-            <span>Tax{taxApplies ? ` (${taxRate}%)` : ""}</span>
-            <span>{formatMoney(taxAmount)}</span>
-          </div>
-          <div className="order-items-total">
-            <span>Order total</span>
-            <strong>{formatMoney(orderTotal)}</strong>
-          </div>
+          <div className="pos-totals-row"><span>Tax{taxApplies ? ` (${taxRate}%)` : ""}</span><span>{formatMoney(taxAmount)}</span></div>
+          <div className="pos-totals-row pos-totals-grand"><span>Order total</span><strong>{formatMoney(orderTotal)}</strong></div>
         </div>
 
         <div className="form-grid">
@@ -3128,7 +3365,7 @@ function PhoneOrderPage({ activeEmployee, sessionRole, phoneOrders, orderHandler
             <span>Payment status</span>
             <select value={form.paymentStatus} onChange={(event) => updateField("paymentStatus", event.target.value)}>
               <option>Paid</option>
-              <option>Collect payment</option>
+              <option>Collect on delivery</option>
             </select>
           </label>
           <label className="field">
@@ -3139,15 +3376,48 @@ function PhoneOrderPage({ activeEmployee, sessionRole, phoneOrders, orderHandler
           </label>
         </div>
 
+        {requiresCardCharge ? (
+          <div className="payment-panel payment-panel-stack">
+            <div>
+              <p className="eyebrow">Card payment (Sola terminal)</p>
+              <h3>Charge {formatMoney(orderTotal)} on the terminal</h3>
+            </div>
+            <div className="card-reader-row">
+              <span className={`reader-dot ${deviceId ? "connected" : "disconnected"}`} aria-hidden="true" />
+              <span className="muted">{deviceId ? `Terminal: ${deviceId}` : "No terminal assigned to this location"}</span>
+            </div>
+            <div className="segmented-control" role="tablist" aria-label="Card entry mode">
+              <button type="button" className={cardEntryMode === "terminal" ? "selected" : ""} onClick={() => setCardEntryMode("terminal")} disabled={card.status === "charging" || card.status === "paid"}>Tap / dip / swipe</button>
+              <button type="button" className={cardEntryMode === "manual" ? "selected" : ""} onClick={() => setCardEntryMode("manual")} disabled={card.status === "charging" || card.status === "paid"}>Manual entry</button>
+            </div>
+            <button className="secondary-button" type="button" onClick={chargeCard} disabled={!orderTotal || !deviceId || card.status === "charging" || card.status === "paid"}>
+              {card.status === "paid" ? "Card charged" : card.status === "charging" ? "Waiting for card..." : cardEntryMode === "manual" ? "Charge card (manual entry)" : "Charge card (tap / dip / swipe)"}
+            </button>
+            {!deviceId ? <p className="summary-error">Assign a Sola device ID to this location in Inventory before taking card payments.</p> : null}
+            {card.message ? <p className={card.status === "error" ? "summary-error" : "muted"}>{card.message}</p> : null}
+          </div>
+        ) : null}
+
         <label className="field full">
           <span>Notes</span>
-          <textarea rows="4" value={form.notes} onChange={(event) => updateField("notes", event.target.value)} />
+          <textarea rows="3" value={form.notes} onChange={(event) => updateField("notes", event.target.value)} />
         </label>
 
+        {imeiIssue ? <p className="muted pos-warning">{imeiIssue}</p> : null}
         <div className="form-actions">
-          <button className="primary-button" type="submit" disabled={!canCreate || !selectedHandler}>Create and notify</button>
+          <button className="primary-button" type="submit" disabled={!canCreate}>Create order · {formatMoney(orderTotal)}</button>
         </div>
       </form>
+
+      {customerPrompt ? (
+        <CustomerInfoDialog
+          phone={customerPrompt.phone}
+          customer={customerPrompt.customer}
+          onSave={handleCustomerPromptSave}
+          onSkip={handleCustomerPromptSkip}
+          onClose={() => setCustomerPrompt(null)}
+        />
+      ) : null}
 
       <OpenPhoneOrders
         orders={visibleOrders}
@@ -3188,7 +3458,10 @@ function OpenPhoneOrders({ orders, activeEmployee, sessionRole, onDelivered }) {
                 <span><strong>Assigned:</strong> {order.assignedTo}</span>
               </div>
               <div className="details">
-                <span><strong>Address:</strong> {order.address}</span>
+                <span><strong>Deliver to:</strong> {order.deliveryAddress || order.address}</span>
+                {order.deliveryAddress && order.address && order.deliveryAddress !== order.address ? (
+                  <span className="muted">Customer address on file: {order.address}</span>
+                ) : null}
                 {order.contactDetails ? <span><strong>Contact:</strong> {order.contactDetails}</span> : null}
                 {order.notes ? <span className="muted">{order.notes}</span> : null}
               </div>
@@ -3205,7 +3478,7 @@ function OpenPhoneOrders({ orders, activeEmployee, sessionRole, onDelivered }) {
   );
 }
 
-function PosPage({ products, activeEmployee, activeLocation, activeDeviceId, activeTaxRate, activeStoreInfo, customers, onSaveCustomerName, onCompleteSale }) {
+function PosPage({ products, activeEmployee, activeLocation, activeDeviceId, activeTaxRate, activeStoreInfo, customers, onSaveCustomerName, onSaveCustomer, onCompleteSale }) {
   const [cart, setCart] = useState([]);
   const [scan, setScan] = useState("");
   const [scanMode, setScanMode] = useState(true);
@@ -3215,6 +3488,8 @@ function PosPage({ products, activeEmployee, activeLocation, activeDeviceId, act
   const [notes, setNotes] = useState("");
   const [message, setMessage] = useState("");
   const [completedSale, setCompletedSale] = useState(null);
+  const [customerPrompt, setCustomerPrompt] = useState(null);
+  const [cardEntryMode, setCardEntryMode] = useState("terminal");
   const [card, setCard] = useState({ status: "idle", message: "", refNum: "" });
   const scanRef = useRef(null);
 
@@ -3354,6 +3629,7 @@ function PosPage({ products, activeEmployee, activeLocation, activeDeviceId, act
         deviceId: activeDeviceId,
         location: activeLocation,
         customerPhone: customerPhone.trim(),
+        manualEntry: cardEntryMode === "manual",
         onStatus: (text) => setCard((current) => ({ ...current, message: text })),
       });
       setCard({
@@ -3368,12 +3644,32 @@ function PosPage({ products, activeEmployee, activeLocation, activeDeviceId, act
     }
   }
 
+  function findSaleCustomer() {
+    const localDigits = localPhoneDigits(customerPhone);
+    if (localDigits.length < 6) return null;
+    return (customers || []).find(
+      (entry) => entry.phoneDigits === localDigits || entry.mobileDigits === localDigits,
+    ) || null;
+  }
+
   function handleCheckout() {
     if (!canCheckout) {
       if (imeiIssue) setMessage(imeiIssue);
       else if (!cardChargeComplete) setMessage("Charge the card before completing the sale.");
       return;
     }
+    const localDigits = localPhoneDigits(customerPhone);
+    const saleCustomer = findSaleCustomer();
+    // If a real phone was entered but the customer is new or missing a name /
+    // address, prompt for those before finishing so the receipt + CRM are filled.
+    if (localDigits.length >= 6 && (!saleCustomer || !saleCustomer.name || !saleCustomer.address)) {
+      setCustomerPrompt({ phone: customerPhone.trim(), customer: saleCustomer });
+      return;
+    }
+    completeSale(saleCustomer);
+  }
+
+  function completeSale(customerInfo) {
     const lineItems = cart.map((line) => ({
       productId: line.productId,
       sku: line.sku,
@@ -3388,10 +3684,6 @@ function PosPage({ products, activeEmployee, activeLocation, activeDeviceId, act
       .map((line) => `${line.qty}x ${line.name}${line.imei ? ` (IMEI ${line.imei})` : ""}`)
       .join(", ");
     const phoneLine = cart.find((line) => line.requiresImei && line.imei);
-    const phoneDigits = digitsOnly(customerPhone);
-    const saleCustomer = phoneDigits
-      ? (customers || []).find((entry) => entry.phoneDigits === phoneDigits || entry.mobileDigits === phoneDigits)
-      : null;
     const sale = {
       id: crypto.randomUUID(),
       receiptCode: generateReceiptCode(),
@@ -3419,9 +3711,9 @@ function PosPage({ products, activeEmployee, activeLocation, activeDeviceId, act
         outOfState: outOfState ? "Yes" : "No",
         storeAddress: activeStoreInfo?.address || "",
         storeHours: activeStoreInfo?.hours || "",
-        customerName: saleCustomer?.name || "",
-        customerMobile: saleCustomer?.mobile || "",
-        customerAddress: saleCustomer?.address || "",
+        customerName: customerInfo?.name || "",
+        customerMobile: customerInfo?.mobile || "",
+        customerAddress: customerInfo?.address || "",
         cardStatus: requiresCardCharge ? card.status : "",
         solaRefNum: requiresCardCharge ? card.refNum : "",
       },
@@ -3436,6 +3728,33 @@ function PosPage({ products, activeEmployee, activeLocation, activeDeviceId, act
     setOutOfState(false);
     setCard({ status: "idle", message: "", refNum: "" });
     setMessage("");
+  }
+
+  // Saves the entered/updated customer to the CRM, then finishes the sale with
+  // those details on the receipt.
+  function handleCustomerPromptSave(values) {
+    if (!customerPrompt) return;
+    const info = {
+      name: values.name.trim(),
+      mobile: values.mobile.trim(),
+      address: values.address.trim(),
+    };
+    onSaveCustomer?.({
+      id: customerPrompt.customer?.id || "",
+      phone: customerPrompt.phone,
+      mobile: info.mobile,
+      name: info.name,
+      address: info.address,
+    });
+    setCustomerPrompt(null);
+    completeSale(info);
+  }
+
+  // Cashier chose not to add details — finish with whatever the CRM already has.
+  function handleCustomerPromptSkip() {
+    const customer = customerPrompt?.customer || null;
+    setCustomerPrompt(null);
+    completeSale(customer);
   }
 
   function startNewSale() {
@@ -3619,6 +3938,10 @@ function PosPage({ products, activeEmployee, activeLocation, activeDeviceId, act
                     : "No terminal assigned to this store"}
                 </span>
               </div>
+              <div className="segmented-control" role="tablist" aria-label="Card entry mode">
+                <button type="button" className={cardEntryMode === "terminal" ? "selected" : ""} onClick={() => setCardEntryMode("terminal")} disabled={card.status === "charging" || card.status === "paid"}>Tap / dip / swipe</button>
+                <button type="button" className={cardEntryMode === "manual" ? "selected" : ""} onClick={() => setCardEntryMode("manual")} disabled={card.status === "charging" || card.status === "paid"}>Manual entry</button>
+              </div>
               <button
                 className="secondary-button"
                 type="button"
@@ -3629,7 +3952,9 @@ function PosPage({ products, activeEmployee, activeLocation, activeDeviceId, act
                   ? "Card charged"
                   : card.status === "charging"
                     ? "Waiting for card..."
-                    : "Charge card (tap / dip / swipe)"}
+                    : cardEntryMode === "manual"
+                      ? "Charge card (manual entry)"
+                      : "Charge card (tap / dip / swipe)"}
               </button>
               {!activeDeviceId ? (
                 <p className="summary-error">Assign a Sola device ID to this store in Inventory before taking card payments.</p>
@@ -3699,10 +4024,57 @@ function PosPage({ products, activeEmployee, activeLocation, activeDeviceId, act
         </div>
       </div>
 
+      {customerPrompt ? (
+        <CustomerInfoDialog
+          phone={customerPrompt.phone}
+          customer={customerPrompt.customer}
+          onSave={handleCustomerPromptSave}
+          onSkip={handleCustomerPromptSkip}
+          onClose={() => setCustomerPrompt(null)}
+        />
+      ) : null}
+
       {completedSale ? (
         <SaleReceiptDialog sale={completedSale} onClose={startNewSale} />
       ) : null}
     </>
+  );
+}
+
+// Prompt shown at checkout when the entered phone is a new customer or is missing
+// a name / address — captures those for the receipt and the CRM.
+function CustomerInfoDialog({ phone, customer, onSave, onSkip, onClose }) {
+  const isNew = !customer;
+  const [name, setName] = useState(customer?.name || "");
+  const [mobile, setMobile] = useState(customer?.mobile || "");
+  const [address, setAddress] = useState(customer?.address || "");
+
+  function submit(event) {
+    event.preventDefault();
+    onSave({ name, mobile, address });
+  }
+
+  return (
+    <div className="dialog-backdrop" role="presentation" onMouseDown={onClose}>
+      <div className="dialog-card" role="dialog" aria-modal="true" onMouseDown={(event) => event.stopPropagation()}>
+        <h2>{isNew ? "Add new customer" : "Complete customer details"}</h2>
+        <p className="muted">
+          {isNew
+            ? `${phone} isn't in the CRM yet. Add their details for the receipt and follow-up.`
+            : `${phone} is missing some details. Add them for the receipt and follow-up.`}
+        </p>
+        <form className="form-grid" onSubmit={submit}>
+          <label className="field"><span>Phone</span><input value={phone} disabled /></label>
+          <label className="field"><span>Name</span><input value={name} onChange={(event) => setName(event.target.value)} autoFocus /></label>
+          <label className="field"><span>Mobile (optional)</span><input value={mobile} inputMode="tel" onChange={(event) => setMobile(event.target.value)} /></label>
+          <label className="field full"><span>Address</span><input value={address} onChange={(event) => setAddress(event.target.value)} /></label>
+          <div className="pos-form-actions form-actions-row">
+            <button className="primary-button" type="submit">Save &amp; complete sale</button>
+            <button className="secondary-button" type="button" onClick={onSkip}>Skip</button>
+          </div>
+        </form>
+      </div>
+    </div>
   );
 }
 
@@ -3841,6 +4213,65 @@ function printSaleReceipt(sale) {
     ${receiptFooterHtml(details.storeHours)}`;
 
   openThermalReceipt("Receipt", css, body);
+}
+
+// Prints a phone-order receipt: items, totals, and a clear delivery block (the
+// delivery address, kept separate from the customer's on-file address).
+function printPhoneOrderReceipt(order) {
+  const lines = order.lineItems || [];
+  const total = Number(order.orderTotal) || 0;
+  const createdAt = (toJsDate(order.createdAt) || new Date()).toLocaleString();
+  const location = order.location || "";
+
+  const rows = lines
+    .map((line) => `
+      <tr>
+        <td>${line.qty}x ${escapeHtml(line.name)}${line.imei ? `<br/><small>IMEI ${escapeHtml(line.imei)}</small>` : ""}</td>
+        <td style="text-align:right">${formatMoney((Number(line.price) || 0) * (Number(line.qty) || 0))}</td>
+      </tr>`)
+    .join("");
+
+  const receiptCode = order.receiptCode || "";
+  const barcodeBlock = receiptCode
+    ? `<div class="barcode">${code128Svg(receiptCode, { moduleWidth: 2, height: 56 })}<div class="barcode-text">${escapeHtml(receiptCode)}</div></div>`
+    : "";
+
+  const taxAmount = Number(order.taxAmount) || 0;
+  const taxBlock = taxAmount > 0 || Number(order.subtotal) > 0
+    ? `
+    <div class="line"><span>Subtotal</span><span>${formatMoney(Number(order.subtotal) || 0)}</span></div>
+    <div class="line"><span>Tax${order.taxRate ? ` (${order.taxRate}%)` : ""}</span><span>${formatMoney(taxAmount)}</span></div>`
+    : "";
+
+  const css = `
+    .line { display: flex; justify-content: space-between; font-size: 12px; }
+    .total { font-size: 15px; font-weight: 800; display: flex; justify-content: space-between; margin-top: 4px; }
+    .paid { font-size: 11.5px; text-align: center; margin-top: 6px; }
+    .deliver { font-size: 12px; margin-top: 6px; }
+    .deliver strong { display: block; }
+    .barcode { text-align: center; margin-top: 12px; }
+    .barcode svg { max-width: 100%; height: 56px; }
+    .barcode-text { font-size: 11px; letter-spacing: 2px; margin-top: 2px; }`;
+  const customerBlock = receiptCustomerHtml(order.customerName, order.customerPhone, "", "");
+  const deliverBlock = `<div class="deliver"><strong>Deliver to:</strong>${escapeHtml(order.deliveryAddress || order.address || "-")}</div>`;
+  const body = `
+    ${receiptHeaderHtml(location, order.storeAddress)}
+    <div class="divider"></div>
+    <div class="meta">${escapeHtml(createdAt)} &middot; Phone order</div>
+    ${customerBlock}
+    ${deliverBlock}
+    <div class="meta">Handler: ${escapeHtml(order.assignedTo || "-")}</div>
+    <div class="divider"></div>
+    <table>${rows}</table>
+    <div class="divider"></div>
+    ${taxBlock}
+    <div class="total"><span>Total</span><span>${formatMoney(total)}</span></div>
+    <div class="paid">${escapeHtml(order.paymentStatus || "")}${order.paymentMethod ? ` · ${escapeHtml(order.paymentMethod)}` : ""}</div>
+    ${barcodeBlock}
+    <div class="divider"></div>
+    ${receiptFooterHtml(order.storeHours)}`;
+
+  openThermalReceipt(`Order ${receiptCode || ""}`, css, body);
 }
 
 // Prints a repair drop-off ticket with the generated ticket number.
@@ -5079,12 +5510,19 @@ function friendlyCallError(error) {
 // appear; picking one fills the customer's other details via onSelectCustomer.
 function CustomerPhoneInput({ value, onChange, customers, onSelectCustomer, onSaveCustomerName, placeholder, required, name, autoFocus }) {
   const [open, setOpen] = useState(false);
-  const digits = digitsOnly(value);
-  const matches = digits.length >= 2
+  // The leading US "1" is pre-filled and ignored: searching starts only after 6
+  // more digits, and matches compare against the 10-digit numbers in the CRM.
+  const localDigits = localPhoneDigits(value);
+  const matches = localDigits.length >= 6
     ? (customers || [])
-        .filter((customer) => (customer.phoneDigits || "").includes(digits) || (customer.mobileDigits || "").includes(digits))
+        .filter((customer) => (customer.phoneDigits || "").includes(localDigits) || (customer.mobileDigits || "").includes(localDigits))
         .slice(0, 8)
     : [];
+
+  function ensureCountryCode() {
+    setOpen(true);
+    if (!digitsOnly(value)) onChange("1");
+  }
 
   function pickCustomer(customer) {
     setOpen(false);
@@ -5114,7 +5552,7 @@ function CustomerPhoneInput({ value, onChange, customers, onSelectCustomer, onSa
           onChange(event.target.value);
           setOpen(true);
         }}
-        onFocus={() => setOpen(true)}
+        onFocus={ensureCountryCode}
         onBlur={() => window.setTimeout(() => setOpen(false), 150)}
       />
       {open && matches.length ? (

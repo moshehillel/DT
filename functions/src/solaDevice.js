@@ -14,7 +14,7 @@ function formatAmount(value) {
   return amount.toFixed(2);
 }
 
-function buildSaleSession({ apiKey, deviceId, amount, externalRequestId, tip, enableTipPrompt }) {
+function buildSaleSession({ apiKey, deviceId, amount, externalRequestId, tip, enableTipPrompt, manualEntry }) {
   const session = {
     xKey: apiKey,
     xDeviceId: deviceId,
@@ -28,6 +28,9 @@ function buildSaleSession({ apiKey, deviceId, amount, externalRequestId, tip, en
   const tipAmount = formatAmount(tip);
   if (tipAmount) session.xTip = tipAmount;
   if (enableTipPrompt) session.xEnableTipPrompt = true;
+  // Ask the terminal to prompt for a hand-keyed card number instead of
+  // tap/dip/swipe. The terminal still allows manual entry without this hint.
+  if (manualEntry) session.xManualEntry = true;
 
   return session;
 }

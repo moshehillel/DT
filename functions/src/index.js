@@ -47,7 +47,6 @@ const SOLA_API_BASE_URL = process.env.SOLA_API_BASE_URL || "https://x1.cardknox.
 const SOLA_CREATE_CHARGE_PATH = process.env.SOLA_CREATE_CHARGE_PATH || "/gatewayjson";
 // CloudIM cloud endpoint for card-present terminal payments (PAX A80, etc.).
 const SOLA_DEVICE_API_BASE_URL = process.env.SOLA_DEVICE_API_BASE_URL || "https://device.cardknox.com/v2";
-const SOLA_DEFAULT_DEVICE_ID = process.env.SOLA_DEFAULT_DEVICE_ID || "";
 const RENTAL_REMINDER_TIME_ZONE = process.env.RENTAL_REMINDER_TIME_ZONE || "America/New_York";
 
 function getPayload(req) {
@@ -1078,14 +1077,14 @@ exports.solaDeviceSale = onRequest(HTTP_OPTIONS, async (req, res) => {
 
   const payload = getPayload(req);
   const amount = formatAmount(payload.amount);
-  const deviceId = payload.deviceId || SOLA_DEFAULT_DEVICE_ID;
+  const deviceId = payload.deviceId;
 
   if (!amount) {
     sendJson(res, 400, { ok: false, message: "A valid amount is required." });
     return;
   }
   if (!deviceId) {
-    sendJson(res, 400, { ok: false, message: "A terminal deviceId is required. Set it for this store or SOLA_DEFAULT_DEVICE_ID." });
+    sendJson(res, 400, { ok: false, message: "A terminal deviceId is required. Set this store's Sola device ID in Inventory → Stores." });
     return;
   }
 
@@ -1097,6 +1096,7 @@ exports.solaDeviceSale = onRequest(HTTP_OPTIONS, async (req, res) => {
       externalRequestId: payload.externalRequestId || `pos-${Date.now()}`,
       tip: payload.tip,
       enableTipPrompt: payload.enableTipPrompt,
+      manualEntry: payload.manualEntry === true || payload.manualEntry === "true",
     });
     const result = await callSolaDevice("/session/async", session);
     const interpreted = interpretResult(result.data);
@@ -1234,10 +1234,15 @@ exports.sendRentalReturnReminders = onSchedule(
 );
 
 function buildPhoneOrderHandlerMessage(order) {
+  const deliverTo = order.deliveryAddress || order.address || "-";
+  const hasSeparateDelivery = order.deliveryAddress
+    && order.address
+    && order.deliveryAddress !== order.address;
   return [
     `Phone order assigned: ${order.model || "phone order"}.`,
     `Customer: ${order.customerName || "-"} ${order.customerPhone || ""}.`,
-    `Address: ${order.address || "-"}.`,
+    `Deliver to: ${deliverTo}.`,
+    hasSeparateDelivery ? `(Customer address on file: ${order.address}.)` : "",
     `Total: ${order.orderTotal || "0"}.`,
     `Payment: ${order.paymentStatus || "Collect payment"}.`,
     order.contactDetails ? `Contact: ${order.contactDetails}.` : "",
