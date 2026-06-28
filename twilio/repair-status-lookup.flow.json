@@ -1,5 +1,5 @@
 {
-  "description": "Diamant Telecom - customer repair status lookup by phone number or ticket number",
+  "description": "Diamant Telecom - customer repair status lookup by caller ID, phone number, or ticket number",
   "states": [
     {
       "name": "Trigger",
@@ -7,7 +7,7 @@
       "transitions": [
         {
           "event": "incomingCall",
-          "next": "gather_repair_lookup"
+          "next": "main_menu"
         }
       ],
       "properties": {
@@ -18,12 +18,118 @@
       }
     },
     {
-      "name": "gather_repair_lookup",
+      "name": "main_menu",
       "type": "gather-input-on-call",
       "transitions": [
         {
           "event": "keypress",
+          "next": "main_menu_split"
+        },
+        {
+          "event": "timeout",
+          "next": "say_no_selection"
+        }
+      ],
+      "properties": {
+        "voice": "Polly.Joanna",
+        "language": "en-US",
+        "say": "Welcome to Diamant Telecom. To check your repair or return status, press 1 to use the number you are calling from, press 2 to enter a phone number, or press 3 to enter your repair ticket number.",
+        "timeout": 8,
+        "num_digits": 1,
+        "offset": {
+          "x": 220,
+          "y": 80
+        }
+      }
+    },
+    {
+      "name": "main_menu_split",
+      "type": "split-based-on",
+      "transitions": [
+        {
+          "event": "match",
+          "next": "set_lookup_caller",
+          "conditions": [
+            {
+              "friendly_name": "Use caller ID",
+              "arguments": [
+                "{{widgets.main_menu.Digits}}"
+              ],
+              "type": "equal_to",
+              "value": "1"
+            }
+          ]
+        },
+        {
+          "event": "match",
+          "next": "gather_phone",
+          "conditions": [
+            {
+              "friendly_name": "Enter phone number",
+              "arguments": [
+                "{{widgets.main_menu.Digits}}"
+              ],
+              "type": "equal_to",
+              "value": "2"
+            }
+          ]
+        },
+        {
+          "event": "match",
+          "next": "gather_ticket",
+          "conditions": [
+            {
+              "friendly_name": "Enter ticket number",
+              "arguments": [
+                "{{widgets.main_menu.Digits}}"
+              ],
+              "type": "equal_to",
+              "value": "3"
+            }
+          ]
+        },
+        {
+          "event": "noMatch",
+          "next": "say_invalid_option"
+        }
+      ],
+      "properties": {
+        "input": "{{widgets.main_menu.Digits}}",
+        "offset": {
+          "x": 520,
+          "y": 80
+        }
+      }
+    },
+    {
+      "name": "set_lookup_caller",
+      "type": "set-variables",
+      "transitions": [
+        {
+          "event": "next",
           "next": "lookup_repair_status"
+        }
+      ],
+      "properties": {
+        "variables": [
+          {
+            "key": "lookup",
+            "value": "{{contact.channel.address}}"
+          }
+        ],
+        "offset": {
+          "x": 820,
+          "y": 0
+        }
+      }
+    },
+    {
+      "name": "gather_phone",
+      "type": "gather-input-on-call",
+      "transitions": [
+        {
+          "event": "keypress",
+          "next": "set_lookup_phone"
         },
         {
           "event": "timeout",
@@ -33,12 +139,81 @@
       "properties": {
         "voice": "Polly.Joanna",
         "language": "en-US",
-        "say": "Welcome to Diamant Telecom. To check your repair or return status, enter the customer phone number on file, or enter the numbers from your repair ticket, then press pound.",
+        "say": "Enter the customer phone number on file, then press pound.",
         "timeout": 8,
         "finish_on_key": "#",
         "offset": {
-          "x": 220,
-          "y": 80
+          "x": 820,
+          "y": 160
+        }
+      }
+    },
+    {
+      "name": "set_lookup_phone",
+      "type": "set-variables",
+      "transitions": [
+        {
+          "event": "next",
+          "next": "lookup_repair_status"
+        }
+      ],
+      "properties": {
+        "variables": [
+          {
+            "key": "lookup",
+            "value": "{{widgets.gather_phone.Digits}}"
+          }
+        ],
+        "offset": {
+          "x": 1120,
+          "y": 160
+        }
+      }
+    },
+    {
+      "name": "gather_ticket",
+      "type": "gather-input-on-call",
+      "transitions": [
+        {
+          "event": "keypress",
+          "next": "set_lookup_ticket"
+        },
+        {
+          "event": "timeout",
+          "next": "say_no_ticket_entered"
+        }
+      ],
+      "properties": {
+        "voice": "Polly.Joanna",
+        "language": "en-US",
+        "say": "Enter the numbers from your repair ticket, then press pound.",
+        "timeout": 8,
+        "finish_on_key": "#",
+        "offset": {
+          "x": 820,
+          "y": 320
+        }
+      }
+    },
+    {
+      "name": "set_lookup_ticket",
+      "type": "set-variables",
+      "transitions": [
+        {
+          "event": "next",
+          "next": "lookup_repair_status"
+        }
+      ],
+      "properties": {
+        "variables": [
+          {
+            "key": "lookup",
+            "value": "{{widgets.gather_ticket.Digits}}"
+          }
+        ],
+        "offset": {
+          "x": 1120,
+          "y": 320
         }
       }
     },
@@ -58,15 +233,11 @@
       "properties": {
         "method": "POST",
         "content_type": "application/json",
-        "url": "https://REGION-PROJECT_ID.cloudfunctions.net/repairStatus",
+        "url": "https://us-central1-diamant-telecom.cloudfunctions.net/repairStatus",
         "parameters": [
           {
-            "key": "phone",
-            "value": "{{widgets.gather_repair_lookup.Digits}}"
-          },
-          {
-            "key": "ticketLookup",
-            "value": "{{widgets.gather_repair_lookup.Digits}}"
+            "key": "lookup",
+            "value": "{{flow.variables.lookup}}"
           },
           {
             "key": "caller",
@@ -74,8 +245,8 @@
           }
         ],
         "offset": {
-          "x": 520,
-          "y": 80
+          "x": 1420,
+          "y": 160
         }
       }
     },
@@ -105,8 +276,8 @@
       "properties": {
         "input": "{{widgets.lookup_repair_status.parsed.found}}",
         "offset": {
-          "x": 820,
-          "y": 80
+          "x": 1720,
+          "y": 160
         }
       }
     },
@@ -122,10 +293,10 @@
       "properties": {
         "voice": "Polly.Joanna",
         "language": "en-US",
-        "say": "We found repair ticket {{widgets.lookup_repair_status.parsed.ticketNumber}} for {{widgets.lookup_repair_status.parsed.model}}. Current status is {{widgets.lookup_repair_status.parsed.status}}. {{widgets.lookup_repair_status.parsed.customerMessage}}",
+        "say": "{{widgets.lookup_repair_status.parsed.customerMessage}}",
         "offset": {
-          "x": 1120,
-          "y": 40
+          "x": 2020,
+          "y": 100
         }
       }
     },
@@ -141,10 +312,10 @@
       "properties": {
         "voice": "Polly.Joanna",
         "language": "en-US",
-        "say": "Sorry, we could not find a repair using that phone number or ticket number. You can try again or stay on the line for the store.",
+        "say": "Sorry, we could not find a repair using that number. You can try again or stay on the line for the store.",
         "offset": {
-          "x": 1120,
-          "y": 220
+          "x": 2020,
+          "y": 280
         }
       }
     },
@@ -164,12 +335,12 @@
       "properties": {
         "voice": "Polly.Joanna",
         "language": "en-US",
-        "say": "Press 1 to check another phone number or ticket. Press 2 to hear phones currently for sale. Press 3 to speak with the store.",
+        "say": "Press 1 to look up another repair. Press 2 to hear phones currently for sale. Press 3 to speak with the store.",
         "timeout": 6,
         "num_digits": 1,
         "offset": {
-          "x": 1420,
-          "y": 120
+          "x": 2320,
+          "y": 180
         }
       }
     },
@@ -179,10 +350,10 @@
       "transitions": [
         {
           "event": "match",
-          "next": "gather_repair_lookup",
+          "next": "main_menu",
           "conditions": [
             {
-              "friendly_name": "Check another number",
+              "friendly_name": "Look up another",
               "arguments": [
                 "{{widgets.gather_next_step.Digits}}"
               ],
@@ -227,8 +398,8 @@
       "properties": {
         "input": "{{widgets.gather_next_step.Digits}}",
         "offset": {
-          "x": 1720,
-          "y": 120
+          "x": 2620,
+          "y": 180
         }
       }
     },
@@ -248,8 +419,8 @@
         "to": "+15555555555",
         "caller_id": "{{contact.channel.address}}",
         "offset": {
-          "x": 2020,
-          "y": 40
+          "x": 2920,
+          "y": 100
         }
       }
     },
@@ -266,8 +437,46 @@
         "language": "en-US",
         "say": "Phones for sale are handled by the Diamant Telecom phones for sale flow. Assign another Twilio number to that flow, or connect this option to a subflow after publishing both flows.",
         "offset": {
-          "x": 2020,
-          "y": 160
+          "x": 2920,
+          "y": 280
+        }
+      }
+    },
+    {
+      "name": "say_no_selection",
+      "type": "say-play",
+      "transitions": [
+        {
+          "event": "audioComplete",
+          "next": "main_menu"
+        }
+      ],
+      "properties": {
+        "voice": "Polly.Joanna",
+        "language": "en-US",
+        "say": "I did not get a selection. Let's try again.",
+        "offset": {
+          "x": 220,
+          "y": 320
+        }
+      }
+    },
+    {
+      "name": "say_invalid_option",
+      "type": "say-play",
+      "transitions": [
+        {
+          "event": "audioComplete",
+          "next": "main_menu"
+        }
+      ],
+      "properties": {
+        "voice": "Polly.Joanna",
+        "language": "en-US",
+        "say": "That was not a valid option. Let's try again.",
+        "offset": {
+          "x": 520,
+          "y": 320
         }
       }
     },
@@ -277,16 +486,35 @@
       "transitions": [
         {
           "event": "audioComplete",
-          "next": "gather_repair_lookup"
+          "next": "main_menu"
         }
       ],
       "properties": {
         "voice": "Polly.Joanna",
         "language": "en-US",
-        "say": "I did not receive a phone number or ticket number. Let's try again.",
+        "say": "I did not receive a phone number. Let's try again.",
         "offset": {
-          "x": 520,
-          "y": 300
+          "x": 820,
+          "y": 480
+        }
+      }
+    },
+    {
+      "name": "say_no_ticket_entered",
+      "type": "say-play",
+      "transitions": [
+        {
+          "event": "audioComplete",
+          "next": "main_menu"
+        }
+      ],
+      "properties": {
+        "voice": "Polly.Joanna",
+        "language": "en-US",
+        "say": "I did not receive a ticket number. Let's try again.",
+        "offset": {
+          "x": 820,
+          "y": 620
         }
       }
     },
@@ -304,7 +532,7 @@
         "language": "en-US",
         "say": "Sorry, the lookup system is not available right now. Please stay on the line and we will connect you with the store.",
         "offset": {
-          "x": 820,
+          "x": 1720,
           "y": 360
         }
       }
@@ -322,8 +550,8 @@
         "language": "en-US",
         "say": "Thank you for calling Diamant Telecom. Goodbye.",
         "offset": {
-          "x": 1720,
-          "y": 360
+          "x": 2620,
+          "y": 420
         }
       }
     }

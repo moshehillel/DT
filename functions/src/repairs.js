@@ -34,14 +34,26 @@ function buildRepairMessage(report) {
   return `${ticketPart} status is ${status}. ${paidMessage}${dueDate}`;
 }
 
+function phoneLookupVariants(digits) {
+  const variants = new Set([digits]);
+  if (digits.length === 11 && digits.startsWith("1")) {
+    variants.add(digits.slice(1));
+  } else if (digits.length === 10) {
+    variants.add(`1${digits}`);
+  }
+  return Array.from(variants);
+}
+
 async function findRepairByLookup(db, lookupValue) {
   const lookupDigits = digitsOnly(lookupValue);
   if (!lookupDigits) return null;
 
+  const phoneCandidates = phoneLookupVariants(lookupDigits);
+
   const queries = [
     db.collection("reports")
       .where("type", "==", "repair")
-      .where("customerPhoneDigits", "==", lookupDigits)
+      .where("customerPhoneDigits", "in", phoneCandidates)
       .orderBy("createdAt", "desc")
       .limit(1),
     db.collection("reports")
