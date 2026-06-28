@@ -38,3 +38,6 @@ Thumbs.db
 
 # Accidental local scratch files
 PIPE
+
+# Temporary CRM import data
+temp-numbers
