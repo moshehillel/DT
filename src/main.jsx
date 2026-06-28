@@ -1034,6 +1034,7 @@ function Workspace({ currentUser, isAdmin }) {
             activeEmployee={activeEmployee}
             customers={customers}
             onSaveCustomerName={saveCustomerName}
+            onSaveCustomer={saveCustomer}
             onClaim={claimPendingReport}
             onSave={savePendingReport}
           />
@@ -1057,6 +1058,7 @@ function Workspace({ currentUser, isAdmin }) {
               activeEmployee={activeEmployee}
               customers={customers}
               onSaveCustomerName={saveCustomerName}
+              onSaveCustomer={saveCustomer}
               onSave={saveReport}
             />
           ) : activeType === "phoneOrder" ? (
@@ -1084,6 +1086,7 @@ function Workspace({ currentUser, isAdmin }) {
               customers={customers}
               activeStoreInfo={activeStoreInfo}
               onSaveCustomerName={saveCustomerName}
+              onSaveCustomer={saveCustomer}
               onSave={saveReport}
             />
           )
@@ -1477,7 +1480,7 @@ function Sidebar({
   );
 }
 
-function ReportForm({ activeType, activeEmployee, reports, customers, activeStoreInfo, onSaveCustomerName, onSave }) {
+function ReportForm({ activeType, activeEmployee, reports, customers, activeStoreInfo, onSaveCustomerName, onSaveCustomer, onSave }) {
   const [now, setNow] = useState(new Date());
   const [customerPhone, setCustomerPhone] = useState("");
   const config = reportTypes[activeType];
@@ -1555,6 +1558,7 @@ function ReportForm({ activeType, activeEmployee, reports, customers, activeStor
               onChange={setCustomerPhone}
               customers={customers}
               onSaveCustomerName={onSaveCustomerName}
+              onSaveCustomer={onSaveCustomer}
               onSelectCustomer={(customer) => setCustomerPhone(customer.phone)}
               placeholder="(555) 123-4567"
               required
@@ -1653,7 +1657,7 @@ function NotificationCenter({ notifications }) {
   );
 }
 
-function RentalReportForm({ activeEmployee, customers, onSaveCustomerName, onSave }) {
+function RentalReportForm({ activeEmployee, customers, onSaveCustomerName, onSaveCustomer, onSave }) {
   const [now, setNow] = useState(new Date());
   const [form, setForm] = useState({
     rentalRegion: "RCUK",
@@ -2181,6 +2185,7 @@ function RentalReportForm({ activeEmployee, customers, onSaveCustomerName, onSav
                 onChange={(value) => updateField("customerPhone", value)}
                 customers={customers}
                 onSaveCustomerName={onSaveCustomerName}
+                onSaveCustomer={onSaveCustomer}
                 onSelectCustomer={(customer) => updateField("customerPhone", customer.phone)}
                 required
               />
@@ -2624,7 +2629,7 @@ function OpenRepairsPage({ reports, onStatusChange }) {
   );
 }
 
-function PendingReportsPage({ pendingReports, activeEmployee, customers, onSaveCustomerName, onClaim, onSave }) {
+function PendingReportsPage({ pendingReports, activeEmployee, customers, onSaveCustomerName, onSaveCustomer, onClaim, onSave }) {
   return (
     <section className="history">
       <div className="history-header">
@@ -2644,6 +2649,7 @@ function PendingReportsPage({ pendingReports, activeEmployee, customers, onSaveC
               activeEmployee={activeEmployee}
               customers={customers}
               onSaveCustomerName={onSaveCustomerName}
+              onSaveCustomer={onSaveCustomer}
               onClaim={onClaim}
               onSave={onSave}
             />
@@ -2656,7 +2662,7 @@ function PendingReportsPage({ pendingReports, activeEmployee, customers, onSaveC
   );
 }
 
-function PendingReportCard({ pendingReport, activeEmployee, customers, onSaveCustomerName, onClaim, onSave }) {
+function PendingReportCard({ pendingReport, activeEmployee, customers, onSaveCustomerName, onSaveCustomer, onClaim, onSave }) {
   const imported = pendingReport.imported || {};
   const isCallReport = pendingReport.type === "call" || pendingReport.source === "telebroad";
   const isShopifySale = pendingReport.source === "shopify_pos";
@@ -2841,6 +2847,7 @@ function PendingReportCard({ pendingReport, activeEmployee, customers, onSaveCus
               onChange={(value) => updateField("customerPhone", value)}
               customers={customers}
               onSaveCustomerName={onSaveCustomerName}
+              onSaveCustomer={onSaveCustomer}
               onSelectCustomer={(customer) => setFields((current) => ({
                 ...current,
                 customerPhone: customer.phone || current.customerPhone,
@@ -3268,6 +3275,7 @@ function PhoneOrderPage({ activeEmployee, sessionRole, phoneOrders, orderHandler
               onChange={(value) => updateField("customerPhone", value)}
               customers={customers}
               onSaveCustomerName={onSaveCustomerName}
+              onSaveCustomer={onSaveCustomer}
               onSelectCustomer={fillFromCustomer}
               required
             />
@@ -3890,6 +3898,7 @@ function PosPage({ products, activeEmployee, activeLocation, activeDeviceId, act
                 onChange={setCustomerPhone}
                 customers={customers}
                 onSaveCustomerName={onSaveCustomerName}
+                onSaveCustomer={onSaveCustomer}
                 onSelectCustomer={(customer) => setCustomerPhone(customer.phone)}
                 placeholder="For receipt / follow-up"
               />
@@ -5508,12 +5517,13 @@ function friendlyCallError(error) {
 
 // Phone input with a CRM type-ahead. As digits are typed, matching customers
 // appear; picking one fills the customer's other details via onSelectCustomer.
-function CustomerPhoneInput({ value, onChange, customers, onSelectCustomer, onSaveCustomerName, placeholder, required, name, autoFocus }) {
+function CustomerPhoneInput({ value, onChange, customers, onSelectCustomer, onSaveCustomerName, onSaveCustomer, placeholder, required, name, autoFocus }) {
   const [open, setOpen] = useState(false);
-  // The leading US "1" is pre-filled and ignored: searching starts only after 6
-  // more digits, and matches compare against the 10-digit numbers in the CRM.
+  const [detailsPrompt, setDetailsPrompt] = useState(null);
+  // The leading US "1" is pre-filled and ignored. localDigits is the 10-digit
+  // local number (area code included); searching starts after 5 of those digits.
   const localDigits = localPhoneDigits(value);
-  const matches = localDigits.length >= 6
+  const matches = localDigits.length >= 5
     ? (customers || [])
         .filter((customer) => (customer.phoneDigits || "").includes(localDigits) || (customer.mobileDigits || "").includes(localDigits))
         .slice(0, 8)
@@ -5526,7 +5536,12 @@ function CustomerPhoneInput({ value, onChange, customers, onSelectCustomer, onSa
 
   function pickCustomer(customer) {
     setOpen(false);
-    // If this number has no name yet, ask for one and save it to the CRM.
+    // Missing a name or address? Open the full details dialog to fill both.
+    if (onSaveCustomer && (!customer.name || !customer.address)) {
+      setDetailsPrompt(customer);
+      return;
+    }
+    // Fallback when only the name-saver is available: quick name prompt.
     if (!customer.name && onSaveCustomerName) {
       const entered = window.prompt(`Add a name for ${customer.phone || "this number"}:`, "");
       if (entered && entered.trim()) {
@@ -5536,6 +5551,24 @@ function CustomerPhoneInput({ value, onChange, customers, onSelectCustomer, onSa
       }
     }
     onSelectCustomer?.(customer);
+  }
+
+  function saveDetails(values) {
+    const customer = detailsPrompt;
+    onSaveCustomer?.({
+      id: customer.id || "",
+      phone: customer.phone || value,
+      name: values.name.trim(),
+      mobile: values.mobile.trim(),
+      address: values.address.trim(),
+    });
+    setDetailsPrompt(null);
+    onSelectCustomer?.({
+      ...customer,
+      name: values.name.trim() || customer.name,
+      mobile: values.mobile.trim() || customer.mobile,
+      address: values.address.trim() || customer.address,
+    });
   }
 
   return (
@@ -5573,6 +5606,15 @@ function CustomerPhoneInput({ value, onChange, customers, onSelectCustomer, onSa
             </button>
           ))}
         </div>
+      ) : null}
+      {detailsPrompt ? (
+        <CustomerInfoDialog
+          phone={detailsPrompt.phone || value}
+          customer={detailsPrompt}
+          onSave={saveDetails}
+          onSkip={() => { const customer = detailsPrompt; setDetailsPrompt(null); onSelectCustomer?.(customer); }}
+          onClose={() => setDetailsPrompt(null)}
+        />
       ) : null}
     </div>
   );

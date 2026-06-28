@@ -250,6 +250,17 @@ button:active {
   color: #fff;
 }
 
+/* Keep the dark fill on hover/focus — the global light hover would make the
+   white text unreadable against a white background. */
+.sidebar select:hover,
+.sidebar input:hover,
+.sidebar select:focus,
+.sidebar input:focus {
+  background: #0f1820;
+  color: #fff;
+  border-color: #3a5163;
+}
+
 .report-tabs {
   display: grid;
   gap: 10px;
@@ -2499,6 +2510,7 @@ tr:last-child td {
 }
 
 .powered-footer img {
+  flex: 0 0 auto;
   width: 34px;
   height: 34px;
   border-radius: 8px;
@@ -2508,4 +2520,10 @@ tr:last-child td {
 
 .login-panel .powered-footer {
   margin-top: 18px;
+}
+
+/* On POS the fixed bottom action bar would cover the footer — give it
+   clearance so it stays visible above the bar. */
+.pos-action-bar ~ .powered-footer {
+  margin-bottom: 108px;
 }

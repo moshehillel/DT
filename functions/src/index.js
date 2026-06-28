@@ -1190,6 +1190,23 @@ function tomorrowDateString() {
   ].join("-");
 }
 
+function todayDateString() {
+  const date = new Date();
+  return [
+    date.getFullYear(),
+    String(date.getMonth() + 1).padStart(2, "0"),
+    String(date.getDate()).padStart(2, "0"),
+  ].join("-");
+}
+
+function buildSimExpiryMessage(cardLast4) {
+  const last4 = String(cardLast4 || "").replace(/\D/g, "").slice(-4);
+  const cardPart = last4
+    ? `We will charge the card ending in ${last4} to refill it.`
+    : "We will charge your card on file to refill it.";
+  return `Diamant Telecom: your SIM is about to expire. ${cardPart} If you do not want to refill, or you want to change the card on file, please give us a call.`;
+}
+
 exports.sendRentalReturnReminders = onSchedule(
   {
     region: REGION,
@@ -1228,6 +1245,50 @@ exports.sendRentalReturnReminders = onSchedule(
       } catch (error) {
         logger.error("sendRentalReturnReminders failed", error);
         await writeNotificationLog(logId, doc.id, report, method, "Failed", error.message, "rental-return-reminder");
+      }
+    }));
+  },
+);
+
+// On a SIM activation's chosen reminder date, text or call the customer that
+// their SIM is about to expire and the card on file will be charged to refill.
+exports.sendSimExpiryReminders = onSchedule(
+  {
+    region: REGION,
+    schedule: "every day 10:00",
+    timeZone: RENTAL_REMINDER_TIME_ZONE,
+  },
+  async () => {
+    const today = todayDateString();
+    const snapshot = await db
+      .collection("reports")
+      .where("type", "==", "sim")
+      .where("details.reminderDate", "==", today)
+      .limit(500)
+      .get();
+
+    await Promise.all(snapshot.docs.map(async (doc) => {
+      const report = doc.data() || {};
+      const logId = `sim-expiry-reminder-${doc.id}-${today}`;
+      const logRef = db.collection("notificationLogs").doc(logId);
+      const existingLog = await logRef.get();
+      if (existingLog.exists) return;
+
+      const method = report.details?.reminderPreference || "Text message";
+      const to = report.customerPhone || "";
+      if (!to) {
+        await writeNotificationLog(logId, doc.id, report, method, "Skipped", "No customer phone number", "sim-expiry-reminder");
+        return;
+      }
+
+      const body = buildSimExpiryMessage(report.details?.cardLast4);
+
+      try {
+        const result = await sendCustomerNotification({ to, method, body });
+        await writeNotificationLog(logId, doc.id, report, method, result.status, result.detail, "sim-expiry-reminder");
+      } catch (error) {
+        logger.error("sendSimExpiryReminders failed", error);
+        await writeNotificationLog(logId, doc.id, report, method, "Failed", error.message, "sim-expiry-reminder");
       }
     }));
   },

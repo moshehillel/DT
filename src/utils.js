@@ -62,11 +62,13 @@ export function digitsOnly(value) {
   return String(value || "").replace(/\D/g, "");
 }
 
-// US numbers: strip a leading country-code "1" so an 11-digit entry (e.g. with
-// the pre-filled "1") matches the 10-digit numbers stored in the CRM.
+// US numbers: strip a leading country-code "1" so entries match the 10-digit
+// numbers stored in the CRM. NANP 10-digit numbers never start with 1, so a
+// leading 1 is always the country code (incl. the pre-filled "1") — strip one
+// even mid-typing so the type-ahead matches from the first local digits.
 export function localPhoneDigits(value) {
   const digits = digitsOnly(value);
-  return digits.length === 11 && digits.startsWith("1") ? digits.slice(1) : digits;
+  return digits.startsWith("1") ? digits.slice(1) : digits;
 }
 
 export function escapeHtml(value) {

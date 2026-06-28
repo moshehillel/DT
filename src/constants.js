@@ -119,6 +119,9 @@ export const reportTypes = {
       { name: "simPhone", label: "SIM number", placeholder: "SIM / ICCID number" },
       { name: "plan", label: "Plan / activation notes", placeholder: "Monthly plan, port-in, new number" },
       { name: "accountPin", label: "PIN / account note", placeholder: "Optional" },
+      { name: "reminderDate", label: "Refill reminder date", type: "date" },
+      { name: "cardLast4", label: "Card last 4 digits", placeholder: "1234" },
+      { name: "reminderPreference", label: "Remind by", type: "select", options: ["Text message", "Phone call"] },
     ],
   },
   rental: {
