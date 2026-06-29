@@ -552,7 +552,10 @@ exports.notifyRepairDelivered = onDocumentUpdated(
 
     try {
       const result = await sendCustomerNotification({ to, method, body });
-      await logNotification(event.params.reportId, after, result.status, result.detail);
+      // Only log failures; a successful pickup text needs no record.
+      if (result.status !== "Sent") {
+        await logNotification(event.params.reportId, after, result.status, result.detail);
+      }
     } catch (error) {
       logger.error("notifyRepairDelivered failed", error);
       await logNotification(event.params.reportId, after, "Failed", error.message);
@@ -1365,15 +1368,20 @@ exports.notifyPhoneOrderAssigned = onRequest(HTTP_OPTIONS, async (req, res) => {
       });
     }
 
-    await db.collection("notificationLogs").add({
-      reportId: order.id || "",
-      type: "phone-order-assigned",
-      customerPhone: order.customerPhone || "",
-      assignedPhone: order.assignedPhone || "",
-      status: results.some((result) => result.status === "Sent") ? "Sent" : "Queued",
-      detail: JSON.stringify(results),
-      createdAt: admin.firestore.FieldValue.serverTimestamp(),
-    });
+    // Only record problems — successful sends are not logged to keep the
+    // notification log focused on what needs attention.
+    const failures = results.filter((result) => result.status !== "Sent");
+    if (failures.length) {
+      await db.collection("notificationLogs").add({
+        reportId: order.id || "",
+        type: "phone-order-assigned",
+        customerPhone: order.customerPhone || "",
+        assignedPhone: order.assignedPhone || "",
+        status: "Failed",
+        detail: JSON.stringify(failures),
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+    }
 
     sendJson(res, 200, { ok: true, results });
   } catch (error) {
@@ -1399,14 +1407,17 @@ exports.notifyPhoneOrderDelivered = onRequest(HTTP_OPTIONS, async (req, res) => 
     }
 
     const result = await sendCustomerNotification({ to: order.customerPhone, method: "Text message", body });
-    await db.collection("notificationLogs").add({
-      reportId: order.id || "",
-      type: "phone-order-delivered",
-      customerPhone: order.customerPhone || "",
-      status: result.status,
-      detail: result.detail,
-      createdAt: admin.firestore.FieldValue.serverTimestamp(),
-    });
+    // Log only when the send didn't succeed.
+    if (result.status !== "Sent") {
+      await db.collection("notificationLogs").add({
+        reportId: order.id || "",
+        type: "phone-order-delivered",
+        customerPhone: order.customerPhone || "",
+        status: result.status,
+        detail: result.detail,
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+    }
 
     sendJson(res, 200, { ok: true, result });
   } catch (error) {

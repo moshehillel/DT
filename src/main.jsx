@@ -697,12 +697,17 @@ function Workspace({ currentUser, isAdmin }) {
     const location = handler.location.trim();
     if (!name || !location) return;
 
+    // Store the SMS number with the US country code so texts always send
+    // (Telebroad needs the leading "1"; bare 10-digit numbers fail).
+    const phoneDigits = String(handler.phone || "").replace(/\D/g, "");
+    const phone = phoneDigits.length === 10 ? `1${phoneDigits}` : phoneDigits;
+
     setOrderHandlers((current) => [
       ...current,
       {
         id: crypto.randomUUID(),
         name,
-        phone: handler.phone.trim(),
+        phone,
         location,
       },
     ]);
@@ -3051,6 +3056,20 @@ function PhoneOrderPage({ activeEmployee, sessionRole, phoneOrders, orderHandler
   }
 
   function addProductToCart(product) {
+    const stock = product.requiresImei ? (product.imeis?.length || 0) : (Number(product.quantity) || 0);
+    const inCart = cart
+      .filter((line) => line.productId === product.id)
+      .reduce((sum, line) => sum + (Number(line.qty) || 0), 0);
+    if (stock <= 0) {
+      playScanError();
+      setMessage(`${product.name} is out of stock — can't add it to the order.`);
+      return false;
+    }
+    if (inCart >= stock) {
+      playScanError();
+      setMessage(`Only ${stock} of ${product.name} in stock.`);
+      return false;
+    }
     setCart((current) => {
       if (!product.requiresImei) {
         const existing = current.find((line) => line.productId === product.id && !line.requiresImei);
@@ -3060,6 +3079,7 @@ function PhoneOrderPage({ activeEmployee, sessionRole, phoneOrders, orderHandler
       }
       return [...current, makeLine(product)];
     });
+    return true;
   }
 
   function findProductBySku(sku) {
@@ -3078,9 +3098,10 @@ function PhoneOrderPage({ activeEmployee, sessionRole, phoneOrders, orderHandler
       setMessage(`No product matches "${scan.trim()}".`);
       return;
     }
-    playScanBeep();
-    addProductToCart(product);
-    setMessage(`Added ${product.name}.`);
+    if (addProductToCart(product)) {
+      playScanBeep();
+      setMessage(`Added ${product.name}.`);
+    }
     setScan("");
     scanRef.current?.focus();
   }
@@ -3391,7 +3412,7 @@ function PhoneOrderPage({ activeEmployee, sessionRole, phoneOrders, orderHandler
 
         <div className="pos-product-grid">
           {availableProducts.map((product) => (
-            <button className="pos-product" type="button" key={product.id} onClick={() => { addProductToCart(product); setMessage(`Added ${product.name}.`); }}>
+            <button className="pos-product" type="button" key={product.id} onClick={() => { if (addProductToCart(product)) setMessage(`Added ${product.name}.`); }}>
               <strong>{product.name}</strong>
               <span>{formatMoney(Number(product.price) || 0)}</span>
               <small className="muted">{product.requiresImei ? `In stock ${product.imeis?.length || 0} - IMEI` : `Stock ${Number(product.quantity) || 0}`}</small>
@@ -3598,6 +3619,20 @@ function PosPage({ products, activeEmployee, activeLocation, activeDeviceId, act
   }
 
   function addProductToCart(product) {
+    const stock = product.requiresImei ? (product.imeis?.length || 0) : (Number(product.quantity) || 0);
+    const inCart = cart
+      .filter((line) => line.productId === product.id)
+      .reduce((sum, line) => sum + (Number(line.qty) || 0), 0);
+    if (stock <= 0) {
+      playScanError();
+      setMessage(`${product.name} is out of stock — can't sell it.`);
+      return false;
+    }
+    if (inCart >= stock) {
+      playScanError();
+      setMessage(`Only ${stock} of ${product.name} in stock.`);
+      return false;
+    }
     setCart((current) => {
       if (product.requiresImei) {
         return [...current, makeLine(product)];
@@ -3610,6 +3645,7 @@ function PosPage({ products, activeEmployee, activeLocation, activeDeviceId, act
       }
       return [...current, makeLine(product)];
     });
+    return true;
   }
 
   function handleScan(event) {
@@ -3620,9 +3656,8 @@ function PosPage({ products, activeEmployee, activeLocation, activeDeviceId, act
     if (!product) {
       playScanError();
       setMessage(`No product found for "${term}".`);
-    } else {
+    } else if (addProductToCart(product)) {
       playScanBeep();
-      addProductToCart(product);
       setMessage(`Added ${product.name}.`);
     }
     setScan("");
@@ -4041,8 +4076,7 @@ function PosPage({ products, activeEmployee, activeLocation, activeDeviceId, act
                 type="button"
                 key={product.id}
                 onClick={() => {
-                  addProductToCart(product);
-                  setMessage(`Added ${product.name}.`);
+                  if (addProductToCart(product)) setMessage(`Added ${product.name}.`);
                   scanRef.current?.focus();
                 }}
               >
