@@ -118,6 +118,17 @@ export function localPhoneDigits(value) {
   return digits.startsWith("1") ? digits.slice(1) : digits;
 }
 
+// Title-case a person's name for storage/display: "moshe gluck" -> "Moshe
+// Gluck". Capitalizes after spaces, hyphens, and apostrophes (so "o'brien" ->
+// "O'Brien", "anne-marie" -> "Anne-Marie") and collapses runs of whitespace.
+export function titleCaseName(value) {
+  return String(value || "")
+    .trim()
+    .replace(/\s+/g, " ")
+    .toLowerCase()
+    .replace(/(^|[\s\-'])([a-z])/g, (_, sep, ch) => sep + ch.toUpperCase());
+}
+
 export function escapeHtml(value) {
   return String(value || "")
     .replaceAll("&", "&amp;")

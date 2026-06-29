@@ -63,6 +63,7 @@ import {
   numberValue,
   playScanBeep,
   playScanError,
+  titleCaseName,
   toJsDate,
   uniqueValues,
 } from "./utils";
@@ -385,7 +386,7 @@ function Workspace({ currentUser, isAdmin }) {
       phoneDigits: digits,
       mobile,
       mobileDigits: localPhoneDigits(mobile),
-      name: String(customer.name || "").trim(),
+      name: titleCaseName(customer.name),
       address: String(customer.address || "").trim(),
       email: String(customer.email || "").trim(),
       contactDetails: String(customer.contactDetails || "").trim(),
@@ -412,7 +413,7 @@ function Workspace({ currentUser, isAdmin }) {
 
   // Fill in a name for a customer that has none yet (prompted at point of sale).
   function saveCustomerName(customer, name) {
-    const cleanName = String(name || "").trim();
+    const cleanName = titleCaseName(name);
     if (!cleanName || !customer) return;
     setCustomers((current) =>
       current.map((entry) =>
@@ -436,7 +437,7 @@ function Workspace({ currentUser, isAdmin }) {
       const details = report.details || {};
       additions.push({
         id: crypto.randomUUID(),
-        name: String(details.customerName || details.callerName || "").trim(),
+        name: titleCaseName(details.customerName || details.callerName),
         phone: String(report.customerPhone || "").trim(),
         phoneDigits: digits,
         address: String(details.address || "").trim(),
@@ -1541,7 +1542,7 @@ function ReportForm({ activeType, activeEmployee, reports, customers, activeStor
       : null;
     details.storeAddress = activeStoreInfo?.address || "";
     details.storeHours = activeStoreInfo?.hours || "";
-    details.customerName = details.customerName || matchedCustomer?.name || "";
+    details.customerName = titleCaseName(details.customerName) || matchedCustomer?.name || "";
     details.customerMobile = matchedCustomer?.mobile || "";
     details.customerAddress = matchedCustomer?.address || "";
 
@@ -3212,7 +3213,7 @@ function PhoneOrderPage({ activeEmployee, sessionRole, phoneOrders, orderHandler
       location: form.location.trim(),
       assignedTo: selectedHandler.name,
       assignedPhone: selectedHandler.phone || "",
-      customerName: form.customerName.trim(),
+      customerName: titleCaseName(form.customerName),
       customerPhone: form.customerPhone.trim(),
       customerPhoneDigits: localPhoneDigits(form.customerPhone),
       contactDetails: form.contactDetails.trim(),
