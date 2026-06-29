@@ -1,6 +1,20 @@
 const { digitsOnly } = require("./rcuk");
 
-const ANSWERED_STATUSES = new Set(["ended", "answer"]);
+// Terminal statuses where the caller never reached a live agent. These must
+// never become call reports even though Telebroad still fires a webhook for
+// them (e.g. the caller hung up at the IVR or was sent to voicemail).
+const NO_AGENT_STATUSES = new Set([
+  "voicemail",
+  "missed",
+  "no-answer",
+  "noanswer",
+  "busy",
+  "failed",
+  "cancel",
+  "canceled",
+  "cancelled",
+  "rejected",
+]);
 
 function normalizeDirection(value) {
   return String(value || "").trim().toLowerCase();
@@ -10,13 +24,14 @@ function normalizeStatus(value) {
   return String(value || "").trim().toLowerCase();
 }
 
+// A call should only turn into a report when a live agent actually spoke with
+// the customer. Voicemail-only calls (no pickup, or rolled to voicemail) have
+// no agent talk time, so we require a positive talkDuration and reject known
+// no-agent statuses. Telebroad reports talkDuration on the call's final event
+// (the "User end call" webhook, and the real-time "ended" event).
 function isAnsweredCall(payload) {
-  const webhookType = String(payload.webhookType || "").toLowerCase();
-  if (webhookType === "userendedcalls") {
-    return Number(payload.talkDuration || 0) > 0;
-  }
-
-  return ANSWERED_STATUSES.has(normalizeStatus(payload.status));
+  if (NO_AGENT_STATUSES.has(normalizeStatus(payload.status))) return false;
+  return Number(payload.talkDuration || 0) > 0;
 }
 
 function shouldImportCall(payload) {

@@ -1146,6 +1146,7 @@ function Workspace({ currentUser, isAdmin }) {
             onAddStoreLocation={addStoreLocation}
             onRemoveStoreLocation={removeStoreLocation}
             onSetEmployeeLocation={setEmployeeLocation}
+            onRemoveEmployee={unsyncEmployeeName}
             onSetStoreDevice={setStoreDevice}
             onSetStoreTaxRate={setStoreTaxRate}
             onUpdateStoreInfo={updateStoreInfo}
@@ -1650,6 +1651,8 @@ function DynamicField({ field }) {
     );
   }
 
+  const listId = field.suggestions ? `${field.name}-suggestions` : undefined;
+
   return (
     <label className="field">
       <span>{field.label}</span>
@@ -1657,12 +1660,20 @@ function DynamicField({ field }) {
         name={field.name}
         type={field.type || "text"}
         placeholder={field.placeholder || ""}
+        list={listId}
         {...(field.name === "imei" ? {
           inputMode: "numeric",
           autoComplete: "off",
           spellCheck: false,
         } : {})}
       />
+      {field.suggestions ? (
+        <datalist id={listId}>
+          {field.suggestions.map((option) => (
+            <option key={option} value={option} />
+          ))}
+        </datalist>
+      ) : null}
     </label>
   );
 }
@@ -2713,9 +2724,21 @@ function PendingReportCard({ pendingReport, activeEmployee, customers, onSaveCus
   const claimedBySomeoneElse = !readyToComplete && pendingReport.claimedBy && pendingReport.claimedBy !== activeEmployee;
   const isClaimedByMe = readyToComplete || pendingReport.claimedBy === activeEmployee;
   const imeiInputRef = useRef(null);
+  // If the caller's number is already in the CRM, pull their saved name and
+  // address so the employee only has to add the call reason.
+  const crmMatch = useMemo(() => {
+    const digits = localPhoneDigits(
+      pendingReport.customerPhone || imported.customerPhone || imported.callerIdExternal || "",
+    );
+    if (!digits) return null;
+    return (customers || []).find(
+      (entry) => entry.phoneDigits === digits || entry.mobileDigits === digits,
+    ) || null;
+  }, [customers, pendingReport.customerPhone, imported.customerPhone, imported.callerIdExternal]);
   const [fields, setFields] = useState(() => ({
     customerPhone: pendingReport.customerPhone || imported.customerPhone || imported.callerIdExternal || "",
     callerName: pendingReport.details?.callerName || imported.callerNameExternal || "",
+    address: pendingReport.details?.customerAddress || "",
     reason: pendingReport.details?.reason || "",
     outcome: pendingReport.details?.outcome || "Answered",
     followUpDate: pendingReport.details?.followUpDate || "",
@@ -2735,6 +2758,17 @@ function PendingReportCard({ pendingReport, activeEmployee, customers, onSaveCus
   function updateField(name, value) {
     setFields((current) => ({ ...current, [name]: value }));
   }
+
+  // Backfill name/address from the CRM once customers finish syncing, without
+  // clobbering anything the employee has already typed.
+  useEffect(() => {
+    if (!crmMatch) return;
+    setFields((current) => ({
+      ...current,
+      callerName: current.callerName || crmMatch.name || "",
+      address: current.address || crmMatch.address || "",
+    }));
+  }, [crmMatch]);
 
   useEffect(() => {
     if (isClaimedByMe && isShopifySale && imeiInputRef.current) {
@@ -2769,6 +2803,8 @@ function PendingReportCard({ pendingReport, activeEmployee, customers, onSaveCus
         notes: fields.notes.trim(),
         details: {
           callerName: fields.callerName.trim(),
+          customerName: fields.callerName.trim(),
+          customerAddress: fields.address.trim(),
           reason: fields.reason.trim(),
           outcome: fields.outcome.trim(),
           followUpDate: fields.followUpDate.trim(),
@@ -2834,6 +2870,8 @@ function PendingReportCard({ pendingReport, activeEmployee, customers, onSaveCus
           <>
             <span><strong>Direction:</strong> {imported.direction || pendingReport.details?.direction || "-"}</span>
             <span><strong>Customer:</strong> {fields.customerPhone || "-"}</span>
+            {crmMatch ? <span><strong>Name:</strong> {crmMatch.name || "-"}</span> : null}
+            {crmMatch?.address ? <span><strong>Address:</strong> {crmMatch.address}</span> : null}
             <span><strong>Handled by:</strong> {importedAgentName || "-"}</span>
             <span><strong>Talk time:</strong> {imported.talkDuration !== "" && imported.talkDuration !== undefined ? `${imported.talkDuration}s` : "-"}</span>
             <span><strong>Imported:</strong> {pendingReport.createdAt ? formatShortDate(pendingReport.createdAt) : "-"}</span>
@@ -2899,9 +2937,17 @@ function PendingReportCard({ pendingReport, activeEmployee, customers, onSaveCus
                 <span>Caller name</span>
                 <input value={fields.callerName} onChange={(event) => updateField("callerName", event.target.value)} />
               </label>
+              <label className="field full">
+                <span>Customer address</span>
+                <input
+                  value={fields.address}
+                  onChange={(event) => updateField("address", event.target.value)}
+                  placeholder={crmMatch ? "" : "Not in CRM yet"}
+                />
+              </label>
               <label className="field">
                 <span>What does the caller want?</span>
-                <input value={fields.reason} onChange={(event) => updateField("reason", event.target.value)} required />
+                <input value={fields.reason} onChange={(event) => updateField("reason", event.target.value)} required autoFocus />
               </label>
               <label className="field">
                 <span>Call outcome</span>
@@ -4580,10 +4626,12 @@ function ImeiLotCapture({ imeis, target, onChangeImeis, blocked = [] }) {
   );
 }
 
-function RestockDialog({ product, onClose, onAddStock }) {
+function RestockDialog({ product, storeLocations, onClose, onAddStock }) {
   const requiresImei = Boolean(product.requiresImei);
   const [quantity, setQuantity] = useState("0");
   const [imeis, setImeis] = useState([]);
+  const [location, setLocation] = useState(product.location || "");
+  const stores = storeLocations || [];
   const currentStock = requiresImei ? product.imeis?.length || 0 : Number(product.quantity) || 0;
 
   function submit(event) {
@@ -4597,7 +4645,7 @@ function RestockDialog({ product, onClose, onAddStock }) {
       window.alert(`You are adding ${target} units but scanned ${imeis.length} IMEIs. Scan exactly ${target}.`);
       return;
     }
-    onAddStock({ addQuantity: target, newImeis: imeis });
+    onAddStock({ addQuantity: target, newImeis: imeis, location });
     onClose();
   }
 
@@ -4610,6 +4658,15 @@ function RestockDialog({ product, onClose, onAddStock }) {
           <p className="muted">In stock now: {currentStock}{requiresImei ? " IMEIs" : ""}</p>
         </div>
         <form className="form-grid dialog-form" onSubmit={submit}>
+          <label className="field">
+            <span>Add stock to store</span>
+            <select value={location} onChange={(event) => setLocation(event.target.value)}>
+              <option value="">All stores</option>
+              {stores.map((store) => (
+                <option key={store}>{store}</option>
+              ))}
+            </select>
+          </label>
           <label className="field">
             <span>Quantity to add</span>
             <input
@@ -4651,6 +4708,7 @@ function InventoryPage({
   onAddStoreLocation,
   onRemoveStoreLocation,
   onSetEmployeeLocation,
+  onRemoveEmployee,
   onSetStoreDevice,
   onSetStoreTaxRate,
   onUpdateStoreInfo,
@@ -4671,7 +4729,9 @@ function InventoryPage({
   const emptyStore = { name: "", street: "", city: "", state: "", zip: "", hours: "" };
   const [form, setForm] = useState(emptyForm);
   const [newStore, setNewStore] = useState(emptyStore);
+  const [editingStore, setEditingStore] = useState(null);
   const [search, setSearch] = useState("");
+  const [lookup, setLookup] = useState("");
   const [restock, setRestock] = useState(null);
 
   function taxFor(name) {
@@ -4682,11 +4742,12 @@ function InventoryPage({
     setForm((current) => ({ ...current, [name]: value }));
   }
 
-  function addStock(product, { addQuantity, newImeis }) {
+  function addStock(product, { addQuantity, newImeis, location }) {
+    const nextLocation = location === undefined ? product.location : location;
     if (product.requiresImei) {
-      onSaveProduct({ ...product, imeis: [...(product.imeis || []), ...newImeis] });
+      onSaveProduct({ ...product, location: nextLocation, imeis: [...(product.imeis || []), ...newImeis] });
     } else {
-      onSaveProduct({ ...product, quantity: (Number(product.quantity) || 0) + addQuantity });
+      onSaveProduct({ ...product, location: nextLocation, quantity: (Number(product.quantity) || 0) + addQuantity });
     }
   }
 
@@ -4722,6 +4783,24 @@ function InventoryPage({
     window.scrollTo({ top: 0, behavior: "smooth" });
   }
 
+  function editStore(location) {
+    const tax = taxFor(location) || {};
+    setNewStore({
+      name: location,
+      street: tax.street || "",
+      city: tax.city || "",
+      state: tax.state || "",
+      zip: tax.zip || "",
+      hours: tax.hours || "",
+    });
+    setEditingStore(location);
+  }
+
+  function cancelEditStore() {
+    setNewStore(emptyStore);
+    setEditingStore(null);
+  }
+
   const filtered = useMemo(() => {
     const query = search.trim().toLowerCase();
     return products
@@ -4734,6 +4813,31 @@ function InventoryPage({
       })
       .sort((a, b) => String(a.name || "").localeCompare(String(b.name || "")));
   }, [products, search]);
+
+  // Roll the per-store product rows up by item so admins can see how many of
+  // each item are in stock at every store at a glance.
+  const stockByItem = useMemo(() => {
+    const query = lookup.trim().toLowerCase();
+    const groups = new Map();
+    for (const product of products) {
+      if (query) {
+        const haystack = [product.name, product.sku, product.barcode].filter(Boolean).join(" ").toLowerCase();
+        if (!haystack.includes(query)) continue;
+      }
+      const key = String(product.sku || product.name || product.id).trim().toLowerCase();
+      const stock = product.requiresImei ? product.imeis?.length || 0 : Number(product.quantity) || 0;
+      const loc = product.location || "";
+      const group = groups.get(key) || { key, name: product.name, sku: product.sku, byStore: {}, total: 0 };
+      group.byStore[loc] = (group.byStore[loc] || 0) + stock;
+      group.total += stock;
+      if (!group.name && product.name) group.name = product.name;
+      if (!group.sku && product.sku) group.sku = product.sku;
+      groups.set(key, group);
+    }
+    return Array.from(groups.values()).sort((a, b) => String(a.name || "").localeCompare(String(b.name || "")));
+  }, [products, lookup]);
+
+  const lookupHasAllStores = useMemo(() => stockByItem.some((item) => item.byStore[""]), [stockByItem]);
 
   function locationFor(name) {
     return (employeeLocations || []).find((entry) => entry?.name === name)?.location || "";
@@ -4919,21 +5023,91 @@ function InventoryPage({
       <section className="history">
         <div className="history-header">
           <div>
+            <p className="eyebrow">Stock</p>
+            <h2>Stock lookup</h2>
+          </div>
+          <input
+            className="pos-search"
+            value={lookup}
+            onChange={(event) => setLookup(event.target.value)}
+            placeholder="Search item, SKU, barcode"
+          />
+        </div>
+        <p className="muted">How many of each item are in stock at every store.</p>
+        <div className="table-wrap catalog-table">
+          <table>
+            <thead>
+              <tr>
+                <th>Item</th>
+                {storeLocations.map((location) => (
+                  <th key={location}>{location}</th>
+                ))}
+                {lookupHasAllStores ? <th>All stores</th> : null}
+                <th>Total</th>
+              </tr>
+            </thead>
+            <tbody>
+              {stockByItem.length ? (
+                stockByItem.map((item) => (
+                  <tr key={item.key}>
+                    <td>
+                      <strong>{item.name}</strong>
+                      {item.sku ? <p className="muted">{item.sku}</p> : null}
+                    </td>
+                    {storeLocations.map((location) => (
+                      <td key={location}>{item.byStore[location] || 0}</td>
+                    ))}
+                    {lookupHasAllStores ? <td>{item.byStore[""] || 0}</td> : null}
+                    <td><strong>{item.total}</strong></td>
+                  </tr>
+                ))
+              ) : (
+                <tr>
+                  <td colSpan={storeLocations.length + (lookupHasAllStores ? 3 : 2)} className="empty-state">
+                    No matching items.
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section className="history">
+        <div className="history-header">
+          <div>
             <p className="eyebrow">Stores</p>
-            <h2>Locations</h2>
+            <h2>{editingStore ? `Edit ${editingStore}` : "Locations"}</h2>
           </div>
         </div>
         <form
           className="form-grid inventory-form"
           onSubmit={(event) => {
             event.preventDefault();
-            onAddStoreLocation(newStore);
+            if (editingStore) {
+              onUpdateStoreInfo(editingStore, {
+                street: newStore.street.trim(),
+                city: newStore.city.trim(),
+                state: newStore.state.trim(),
+                zip: newStore.zip.trim(),
+                hours: newStore.hours.trim(),
+              });
+            } else {
+              onAddStoreLocation(newStore);
+            }
             setNewStore(emptyStore);
+            setEditingStore(null);
           }}
         >
           <label className="field">
             <span>Store name</span>
-            <input value={newStore.name} onChange={(event) => setNewStore((s) => ({ ...s, name: event.target.value }))} required />
+            <input
+              value={newStore.name}
+              onChange={(event) => setNewStore((s) => ({ ...s, name: event.target.value }))}
+              readOnly={Boolean(editingStore)}
+              title={editingStore ? "Store name can't be changed here" : undefined}
+              required
+            />
           </label>
           <label className="field">
             <span>Street</span>
@@ -4955,7 +5129,12 @@ function InventoryPage({
             <span>Hours (shown on receipt)</span>
             <input value={newStore.hours} onChange={(event) => setNewStore((s) => ({ ...s, hours: event.target.value }))} placeholder="Sun 12PM-6:30PM · Mon-Thu 10:30AM-6:30PM" />
           </label>
-          <button className="primary-button align-end" type="submit">Add store</button>
+          <div className="align-end inline-actions">
+            <button className="primary-button" type="submit">{editingStore ? "Save changes" : "Add store"}</button>
+            {editingStore ? (
+              <button className="secondary-button" type="button" onClick={cancelEditStore}>Cancel</button>
+            ) : null}
+          </div>
         </form>
         <p className="muted">Address &amp; hours print on the receipt. Enter each store's sales-tax rate below.</p>
         <div className="request-list">
@@ -5000,6 +5179,9 @@ function InventoryPage({
                   />
                 </label>
                 <div className="store-row-actions">
+                  <button className="secondary-button compact-button" type="button" onClick={() => editStore(location)}>
+                    Edit
+                  </button>
                   <button className="secondary-button compact-button" type="button" onClick={() => onRemoveStoreLocation(location)}>
                     Remove
                   </button>
@@ -5034,6 +5216,17 @@ function InventoryPage({
                   <option key={location}>{location}</option>
                 ))}
               </select>
+              <button
+                className="secondary-button compact-button"
+                type="button"
+                onClick={() => {
+                  if (window.confirm(`Remove ${employee} from the staff list? This does not delete their sign-in account.`)) {
+                    onRemoveEmployee(employee);
+                  }
+                }}
+              >
+                Remove
+              </button>
             </div>
           ))}
         </div>
@@ -5042,6 +5235,7 @@ function InventoryPage({
       {restock ? (
         <RestockDialog
           product={restock}
+          storeLocations={storeLocations}
           onClose={() => setRestock(null)}
           onAddStock={(payload) => addStock(restock, payload)}
         />

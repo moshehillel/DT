@@ -26,7 +26,7 @@ Set these on Firebase Functions (`firebase functions:secrets:set` or `.env`):
 - `TELEBROAD_API_BASE_URL` — optional, defaults to `https://webserv.telebroad.com/api/teleconsole/rest`.
 - `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_FROM_NUMBER` — still used for outgoing voice-call notifications (e.g. rental return reminders).
 
-In-person card payments use the **Sola CloudIM** cloud API against a **PAX A80** terminal — no per-register software install. SMS is sent through the **Telebroad REST API**; voice-call notifications remain on Twilio.
+In-person card payments use **Sola BBPOS** against a **Verifone P200** terminal. BBPOS ("PaymentEngineExt") is a small tray app installed on each register that runs a local HTTPS server at `https://localemv.com:8887`; the browser POS posts the sale to it and it drives the P200 over USB/LAN. The Cardknox API key is configured inside the tray app, so it never reaches the browser, and there is no per-store device ID to set. SMS is sent through the **Telebroad REST API**; voice-call notifications remain on Twilio.
 
 ## Included features
 

@@ -2187,6 +2187,11 @@ tr:last-child td {
   gap: 8px;
 }
 
+.inline-actions {
+  display: flex;
+  gap: 8px;
+}
+
 .tax-rate-field {
   max-width: 120px;
 }

@@ -12,6 +12,7 @@ const answeredInbound = {
   UniqueId: "1743731665.624991",
   direction: "Incoming",
   status: "ended",
+  talkDuration: 33,
   callerIdExternal: "17329942081",
   callerNameExternal: "John Customer",
   callerNameInternal: "Sally Edwards",
@@ -22,6 +23,20 @@ const answeredInbound = {
 const ringingInbound = {
   ...answeredInbound,
   status: "ringing",
+  talkDuration: 0,
+};
+
+// Caller rolled to voicemail: the call "ended" but no agent ever talked.
+const voicemailInbound = {
+  ...answeredInbound,
+  status: "voicemail",
+  talkDuration: 0,
+};
+
+// Rang an agent who never picked up, then hung up: ended with no talk time.
+const unansweredInbound = {
+  ...answeredInbound,
+  talkDuration: 0,
 };
 
 const userEndedAnswered = {
@@ -38,7 +53,7 @@ const userEndedAnswered = {
   startTime: "2025-04-03T21:54:15-04:00",
 };
 
-test("isAnsweredCall accepts ended account real-time calls", () => {
+test("isAnsweredCall accepts calls a live agent talked on", () => {
   assert.equal(isAnsweredCall(answeredInbound), true);
   assert.equal(isAnsweredCall(ringingInbound), false);
 });
@@ -48,9 +63,16 @@ test("isAnsweredCall accepts user end call with talk duration", () => {
   assert.equal(isAnsweredCall({ ...userEndedAnswered, talkDuration: 0 }), false);
 });
 
-test("shouldImportCall skips internal and unanswered calls", () => {
+test("isAnsweredCall rejects voicemail and no-pickup calls", () => {
+  assert.equal(isAnsweredCall(voicemailInbound), false);
+  assert.equal(isAnsweredCall(unansweredInbound), false);
+});
+
+test("shouldImportCall skips internal, voicemail, and unanswered calls", () => {
   assert.equal(shouldImportCall(answeredInbound), true);
   assert.equal(shouldImportCall(ringingInbound), false);
+  assert.equal(shouldImportCall(voicemailInbound), false);
+  assert.equal(shouldImportCall(unansweredInbound), false);
   assert.equal(shouldImportCall({ ...answeredInbound, direction: "Internal" }), false);
 });
 

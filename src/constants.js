@@ -70,6 +70,62 @@ export const repairStatuses = [
   "Cancelled",
 ];
 
+// Common repair phone models, surfaced as autocomplete suggestions on the
+// repair form. The field still accepts any custom value the employee types.
+export const repairPhoneModels = [
+  "LG Exalt VN220",
+  "LG Classic Flip",
+  "Kyocera E4610",
+  "Kyocera E4810",
+  "Kyocera S2720",
+  "Qin F30",
+  "TCL Flip 2",
+  "Alcatel 4051S",
+  "POM TX 10",
+  "Pom Classic",
+  "FIG Flip 2 (F52)",
+  "FIG Mini (F45)",
+  "Coolpad",
+  "Nokia 6300",
+  "ANS F30",
+  "Sunbeam",
+  "XP3 3800",
+  "XP3+ 3900",
+  "Etalk",
+];
+
+// Repair/service types taken from the shop price sheet. Surfaced as autocomplete
+// suggestions on the repair form's damage field; the field still accepts any
+// custom value the employee types and can be edited after selecting one.
+export const repairDamageTypes = [
+  "ShellChange",
+  "Upper Hinge",
+  "Bottom Hinge",
+  "Flex Cable",
+  "Hinge + Cable",
+  "Screen Replacments",
+  "Upper Green Board",
+  "Charge Port",
+  "Mic",
+  "Speaker Mic",
+  "BothMics",
+  "Loud Speaker",
+  "EarPeice",
+  "Earphone Jack",
+  "New Main Board",
+  "Camera",
+  "Buttons",
+  "Button Pad",
+  "Volume Buttons",
+  "Hinge Tightening Or Wire Adjustment",
+  "Remove Water",
+  "Vibrator",
+  "SIM Card Reader",
+  "SD Card Reader",
+  "Take Out Info",
+  "Clean Mic or Charge Port",
+];
+
 export const reportTypes = {
   call: {
     title: "Phone call report",
@@ -101,8 +157,8 @@ export const reportTypes = {
     mark: "R",
     description: "Device service",
     fields: [
-      { name: "model", label: "Phone model", placeholder: "Samsung Galaxy S23" },
-      { name: "damage", label: "What is damaged?", placeholder: "Screen, charging port, battery" },
+      { name: "model", label: "Phone model", placeholder: "Start typing a model…", suggestions: repairPhoneModels },
+      { name: "damage", label: "What is damaged?", placeholder: "Start typing a repair…", suggestions: repairDamageTypes },
       { name: "status", label: "Repair status", type: "select", options: repairStatuses },
       { name: "paymentStatus", label: "Repair paid?", type: "select", options: ["Not paid", "Paid"] },
       { name: "notificationPreference", label: "When ready notify by", type: "select", options: ["Text message", "Phone call"] },
