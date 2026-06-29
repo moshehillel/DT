@@ -432,10 +432,24 @@ async function sendVoiceCall({ to, body }) {
   return { status: "Sent", detail: `Call ${call.sid}` };
 }
 
+// Telebroad expects a US number with country code. Customer numbers already
+// carry a leading "1" (the phone field pre-fills it), but handler numbers are
+// usually entered as bare 10 digits — add the "1" so both send the same way.
+function normalizeSmsRecipient(value) {
+  const digits = String(value || "").replace(/\D/g, "");
+  if (digits.length === 10) return `1${digits}`;
+  return digits;
+}
+
 // Outgoing SMS goes through the Telebroad REST API.
 async function sendSms({ to, body }) {
   if (!TELEBROAD_USERNAME || !TELEBROAD_PASSWORD || !TELEBROAD_SMS_LINE) {
     return { status: "Queued", detail: "Telebroad SMS credentials are not configured" };
+  }
+
+  const receiver = normalizeSmsRecipient(to);
+  if (!receiver) {
+    return { status: "Failed", detail: "Telebroad SMS: no valid recipient number" };
   }
 
   const { url, options } = buildTelebroadSmsRequest({
@@ -443,7 +457,7 @@ async function sendSms({ to, body }) {
     username: TELEBROAD_USERNAME,
     password: TELEBROAD_PASSWORD,
     smsLine: TELEBROAD_SMS_LINE,
-    to,
+    to: receiver,
     message: body,
   });
 
