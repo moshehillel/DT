@@ -37,7 +37,8 @@ import {
   signOutUser,
   subscribeAuth,
 } from "./firebaseClient";
-import { chargeOnDevice, refundToCard } from "./solaTerminal";
+import { refundToCard } from "./solaTerminal";
+import { chargeOnLocalTerminal } from "./bbposTerminal";
 import {
   buildAppNotifications,
   calculateInclusiveDays,
@@ -492,6 +493,7 @@ function Workspace({ currentUser, isAdmin }) {
       ...product,
       id,
       sku: String(product.sku || "").trim(),
+      barcode: String(product.barcode || "").trim(),
       name: String(product.name || "").trim(),
       price: String(product.price ?? "").trim(),
       category: product.category || productCategories[0],
@@ -3019,7 +3021,6 @@ function PhoneOrderPage({ activeEmployee, sessionRole, phoneOrders, orderHandler
     ? phoneOrders
     : phoneOrders.filter((order) => order.assignedTo === activeEmployee);
 
-  const deviceId = (storeDevices || []).find((entry) => entry?.name === form.location)?.deviceId || "";
   const availableProducts = useMemo(
     () => products
       .filter((product) => !form.location || !product.location || product.location === form.location)
@@ -3085,7 +3086,11 @@ function PhoneOrderPage({ activeEmployee, sessionRole, phoneOrders, orderHandler
   function findProductBySku(sku) {
     const clean = String(sku || "").trim().toLowerCase();
     if (!clean) return null;
-    const matches = products.filter((product) => String(product.sku || "").trim().toLowerCase() === clean);
+    const matches = products.filter(
+      (product) =>
+        String(product.sku || "").trim().toLowerCase() === clean ||
+        String(product.barcode || "").trim().toLowerCase() === clean,
+    );
     if (!matches.length) return null;
     return matches.find((product) => product.location === form.location) || matches.find((product) => !product.location) || matches[0];
   }
@@ -3162,11 +3167,9 @@ function PhoneOrderPage({ activeEmployee, sessionRole, phoneOrders, orderHandler
     if (!requiresCardCharge || !orderTotal) return;
     try {
       setCard({ status: "charging", message: "Sending sale to the terminal...", refNum: "" });
-      const result = await chargeOnDevice({
+      const result = await chargeOnLocalTerminal({
         amount: orderTotal.toFixed(2),
-        deviceId,
-        location: form.location,
-        customerPhone: form.customerPhone.trim(),
+        externalRequestId: `order-${Date.now()}`,
         manualEntry: cardEntryMode === "manual",
         onStatus: (text) => setCard((current) => ({ ...current, message: text })),
       });
@@ -3449,21 +3452,20 @@ function PhoneOrderPage({ activeEmployee, sessionRole, phoneOrders, orderHandler
         {requiresCardCharge ? (
           <div className="payment-panel payment-panel-stack">
             <div>
-              <p className="eyebrow">Card payment (Sola terminal)</p>
+              <p className="eyebrow">Card payment (Verifone P200)</p>
               <h3>Charge {formatMoney(orderTotal)} on the terminal</h3>
             </div>
             <div className="card-reader-row">
-              <span className={`reader-dot ${deviceId ? "connected" : "disconnected"}`} aria-hidden="true" />
-              <span className="muted">{deviceId ? `Terminal: ${deviceId}` : "No terminal assigned to this location"}</span>
+              <span className="reader-dot connected" aria-hidden="true" />
+              <span className="muted">Verifone P200 · local terminal (Sola BBPOS)</span>
             </div>
             <div className="segmented-control" role="tablist" aria-label="Card entry mode">
               <button type="button" className={cardEntryMode === "terminal" ? "selected" : ""} onClick={() => setCardEntryMode("terminal")} disabled={card.status === "charging" || card.status === "paid"}>Tap / dip / swipe</button>
               <button type="button" className={cardEntryMode === "manual" ? "selected" : ""} onClick={() => setCardEntryMode("manual")} disabled={card.status === "charging" || card.status === "paid"}>Manual entry</button>
             </div>
-            <button className="secondary-button" type="button" onClick={chargeCard} disabled={!orderTotal || !deviceId || card.status === "charging" || card.status === "paid"}>
+            <button className="secondary-button" type="button" onClick={chargeCard} disabled={!orderTotal || card.status === "charging" || card.status === "paid"}>
               {card.status === "paid" ? "Card charged" : card.status === "charging" ? "Waiting for card..." : cardEntryMode === "manual" ? "Charge card (manual entry)" : "Charge card (tap / dip / swipe)"}
             </button>
-            {!deviceId ? <p className="summary-error">Assign a Sola device ID to this location in Inventory before taking card payments.</p> : null}
             {card.message ? <p className={card.status === "error" ? "summary-error" : "muted"}>{card.message}</p> : null}
           </div>
         ) : null}
@@ -3608,7 +3610,9 @@ function PosPage({ products, activeEmployee, activeLocation, activeDeviceId, act
     const clean = String(sku || "").trim().toLowerCase();
     if (!clean) return null;
     const matches = products.filter(
-      (product) => String(product.sku || "").trim().toLowerCase() === clean,
+      (product) =>
+        String(product.sku || "").trim().toLowerCase() === clean ||
+        String(product.barcode || "").trim().toLowerCase() === clean,
     );
     if (!matches.length) return null;
     return (
@@ -3710,11 +3714,9 @@ function PosPage({ products, activeEmployee, activeLocation, activeDeviceId, act
     if (!requiresCardCharge || !total) return;
     try {
       setCard({ status: "charging", message: "Sending sale to the terminal...", refNum: "" });
-      const result = await chargeOnDevice({
+      const result = await chargeOnLocalTerminal({
         amount: total.toFixed(2),
-        deviceId: activeDeviceId,
-        location: activeLocation,
-        customerPhone: customerPhone.trim(),
+        externalRequestId: `sale-${Date.now()}`,
         manualEntry: cardEntryMode === "manual",
         onStatus: (text) => setCard((current) => ({ ...current, message: text })),
       });
@@ -4014,16 +4016,12 @@ function PosPage({ products, activeEmployee, activeLocation, activeDeviceId, act
           {requiresCardCharge ? (
             <div className="payment-panel payment-panel-stack">
               <div>
-                <p className="eyebrow">Card payment (Sola terminal)</p>
+                <p className="eyebrow">Card payment (Verifone P200)</p>
                 <h3>Charge {formatMoney(total)} on the terminal</h3>
               </div>
               <div className="card-reader-row">
-                <span className={`reader-dot ${activeDeviceId ? "connected" : "disconnected"}`} aria-hidden="true" />
-                <span className="muted">
-                  {activeDeviceId
-                    ? `Terminal: ${activeDeviceId}`
-                    : "No terminal assigned to this store"}
-                </span>
+                <span className="reader-dot connected" aria-hidden="true" />
+                <span className="muted">Verifone P200 · local terminal (Sola BBPOS)</span>
               </div>
               <div className="segmented-control" role="tablist" aria-label="Card entry mode">
                 <button type="button" className={cardEntryMode === "terminal" ? "selected" : ""} onClick={() => setCardEntryMode("terminal")} disabled={card.status === "charging" || card.status === "paid"}>Tap / dip / swipe</button>
@@ -4033,7 +4031,7 @@ function PosPage({ products, activeEmployee, activeLocation, activeDeviceId, act
                 className="secondary-button"
                 type="button"
                 onClick={chargeCard}
-                disabled={!total || !activeDeviceId || card.status === "charging" || card.status === "paid"}
+                disabled={!total || card.status === "charging" || card.status === "paid"}
               >
                 {card.status === "paid"
                   ? "Card charged"
@@ -4043,9 +4041,6 @@ function PosPage({ products, activeEmployee, activeLocation, activeDeviceId, act
                       ? "Charge card (manual entry)"
                       : "Charge card (tap / dip / swipe)"}
               </button>
-              {!activeDeviceId ? (
-                <p className="summary-error">Assign a Sola device ID to this store in Inventory before taking card payments.</p>
-              ) : null}
               {card.message ? (
                 <p className={card.status === "error" ? "summary-error" : "muted"}>{card.message}</p>
               ) : null}
@@ -4663,6 +4658,7 @@ function InventoryPage({
   const emptyForm = {
     id: "",
     sku: "",
+    barcode: "",
     name: "",
     price: "",
     category: productCategories[0],
@@ -4730,7 +4726,7 @@ function InventoryPage({
     return products
       .filter((product) => {
         if (!query) return true;
-        return [product.name, product.sku, product.category, product.location]
+        return [product.name, product.sku, product.barcode, product.category, product.location]
           .join(" ")
           .toLowerCase()
           .includes(query);
@@ -4772,14 +4768,24 @@ function InventoryPage({
         <form className="form-grid inventory-form" onSubmit={submit}>
           <p className="form-section-title">Product details</p>
           <label className="field">
-            <span>SKU / barcode</span>
+            <span>SKU</span>
             <input
               value={form.sku}
               onChange={(event) => updateField("sku", event.target.value)}
-              placeholder="Scan or type"
+              placeholder="Internal code"
               autoComplete="off"
               spellCheck={false}
               required
+            />
+          </label>
+          <label className="field">
+            <span>Barcode</span>
+            <input
+              value={form.barcode}
+              onChange={(event) => updateField("barcode", event.target.value)}
+              placeholder="Scan UPC / EAN (optional)"
+              autoComplete="off"
+              spellCheck={false}
             />
           </label>
           <label className="field">
@@ -4880,7 +4886,7 @@ function InventoryPage({
                 filtered.map((product) => (
                   <tr key={product.id}>
                     <td><strong>{product.name}</strong></td>
-                    <td>{product.sku}</td>
+                    <td>{product.sku}{product.barcode ? <p className="muted">{product.barcode}</p> : null}</td>
                     <td>{product.category}</td>
                     <td>{product.location || "All stores"}</td>
                     <td>{formatMoney(Number(product.price) || 0)}</td>
