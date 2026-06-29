@@ -45,7 +45,8 @@ service cloud.firestore {
     }
 
     match /orderHandlers/{handlerId} {
-      allow read, create, update, delete: if signedIn();
+      allow read, create, update: if signedIn();
+      allow delete: if isAdmin();
     }
 
     match /inventoryPhones/{phoneId} {
@@ -54,7 +55,8 @@ service cloud.firestore {
     }
 
     match /products/{productId} {
-      allow read, create, update, delete: if signedIn();
+      allow read, create, update: if signedIn();
+      allow delete: if isAdmin();
     }
 
     match /customers/{customerId} {

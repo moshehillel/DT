@@ -193,13 +193,6 @@ function Workspace({ currentUser, isAdmin }) {
     return { address: formatStoreAddress(match), hours: match?.hours || "" };
   }, [storeTax, activeLocation]);
 
-  const employeeCanSeeReport = useMemo(() => {
-    return (report) => {
-      const store = report.location || report.details?.location || "";
-      return !store || store === activeLocation || report.servedBy === activeEmployee;
-    };
-  }, [activeLocation, activeEmployee]);
-
   const filteredReports = useMemo(() => {
     const query = filters.query.trim().toLowerCase();
     const phoneQuery = digitsOnly(query);
@@ -209,11 +202,7 @@ function Workspace({ currentUser, isAdmin }) {
     const amountMax = Number.parseFloat(filters.amountMax);
     const dateFrom = filters.dateFrom ? new Date(`${filters.dateFrom}T00:00:00`) : null;
     const dateTo = filters.dateTo ? new Date(`${filters.dateTo}T23:59:59`) : null;
-    const availableReports = sessionRole === "admin"
-      ? reports
-      : reports.filter(employeeCanSeeReport);
-
-    return availableReports.filter((report) => {
+    return reports.filter((report) => {
       const reportDate = toJsDate(report.createdAt);
       const reportAmount = Number.parseFloat(report.paymentAmount || "0") || 0;
       const searchable = [
@@ -249,7 +238,7 @@ function Workspace({ currentUser, isAdmin }) {
 
       return (
         (filters.type === "all" || report.type === filters.type) &&
-        (sessionRole !== "admin" || filters.employee === "all" || report.servedBy === filters.employee) &&
+        (filters.employee === "all" || report.servedBy === filters.employee) &&
         (filters.paymentMethod === "all" || report.paymentMethod === filters.paymentMethod) &&
         (filters.status === "all" || report.details?.status === filters.status) &&
         (filters.location === "all" || reportLocation === filters.location) &&
@@ -262,27 +251,21 @@ function Workspace({ currentUser, isAdmin }) {
         (!query || searchable.includes(query) || (phoneQuery && searchableDigits.includes(phoneQuery)))
       );
     });
-  }, [employeeCanSeeReport, filters, reports, sessionRole]);
+  }, [filters, reports]);
 
   const visibleReports = useMemo(
-    () => (sessionRole === "admin" ? reports : reports.filter(employeeCanSeeReport)),
-    [employeeCanSeeReport, reports, sessionRole],
+    () => reports,
+    [reports],
   );
 
-  const visibleEmployees = sessionRole === "admin" ? employees : [activeEmployee];
+  const visibleEmployees = employees;
   const visibleNotifications = useMemo(() => {
-    if (sessionRole === "admin") return notifications;
-    const visibleReportIds = new Set(
-      reports.filter(employeeCanSeeReport).map((report) => report.id),
-    );
+    const visibleReportIds = new Set(reports.map((report) => report.id));
     return notifications.filter((notice) => visibleReportIds.has(notice.reportId));
-  }, [employeeCanSeeReport, notifications, reports, sessionRole]);
+  }, [notifications, reports]);
   const appNotifications = useMemo(() => {
-    const availableReports = sessionRole === "admin"
-      ? reports
-      : reports.filter(employeeCanSeeReport);
-    return buildAppNotifications(availableReports);
-  }, [employeeCanSeeReport, reports, sessionRole]);
+    return buildAppNotifications(reports);
+  }, [reports]);
 
   function addStoreLocation(store) {
     const name = String((typeof store === "string" ? store : store?.name) || "").trim();
@@ -308,6 +291,7 @@ function Workspace({ currentUser, isAdmin }) {
       window.alert("Keep at least one store location.");
       return;
     }
+    if (!window.confirm(`Remove ${name}? This also removes its tax and address settings.`)) return;
     setStoreLocations((current) => current.filter((location) => location !== name));
     setStoreTax((current) => current.filter((entry) => entry?.name !== name));
   }
@@ -408,6 +392,13 @@ function Workspace({ currentUser, isAdmin }) {
   }
 
   function removeCustomer(customerId) {
+    if (sessionRole !== "admin") {
+      window.alert("Only admin can delete customers.");
+      return;
+    }
+    const customer = customers.find((entry) => entry.id === customerId);
+    const label = customer?.name || customer?.phone || "this customer";
+    if (!window.confirm(`Delete ${label}? This cannot be undone.`)) return;
     setCustomers((current) => current.filter((entry) => entry.id !== customerId));
   }
 
@@ -514,6 +505,13 @@ function Workspace({ currentUser, isAdmin }) {
   }
 
   function removeProduct(productId) {
+    if (sessionRole !== "admin") {
+      window.alert("Only admin can delete inventory.");
+      return;
+    }
+    const product = products.find((item) => item.id === productId);
+    const label = product?.name || product?.sku || "this inventory item";
+    if (!window.confirm(`Delete ${label}? This cannot be undone.`)) return;
     setProducts((current) => current.filter((item) => item.id !== productId));
   }
 
@@ -717,6 +715,9 @@ function Workspace({ currentUser, isAdmin }) {
   }
 
   function removeOrderHandler(handlerId) {
+    const handler = orderHandlers.find((item) => item.id === handlerId);
+    const label = handler?.name || "this order handler";
+    if (!window.confirm(`Remove ${label}? This cannot be undone.`)) return;
     setOrderHandlers((current) => current.filter((handler) => handler.id !== handlerId));
   }
 
@@ -1125,7 +1126,7 @@ function Workspace({ currentUser, isAdmin }) {
             onStatusChange={updateRepairStatus}
             onExport={() => exportCsv(filteredReports)}
             onExportAll={() => exportCsv(visibleReports)}
-            onClearReports={clearReports}
+            onClearReports={sessionRole === "admin" ? clearReports : null}
             onDeleteReport={sessionRole === "admin" ? deleteReport : null}
             onReturn={setReturnTarget}
             onScanReturn={returnByCode}
@@ -1449,31 +1450,32 @@ function Sidebar({
           );
         })}
 
+        <p className="nav-section-title">Manage</p>
+        <button
+          className={`tab inventory-tab ${activeView === "inventory" ? "active" : ""}`}
+          type="button"
+          onClick={() => onViewChange("inventory")}
+        >
+          <span className="tab-mark">I</span>
+          <span>
+            <strong>Inventory</strong>
+            <small>Catalog, stock & stores</small>
+          </span>
+        </button>
+        <button
+          className={`tab ${activeView === "customers" ? "active" : ""}`}
+          type="button"
+          onClick={() => onViewChange("customers")}
+        >
+          <span className="tab-mark">C</span>
+          <span>
+            <strong>Customers</strong>
+            <small>CRM &amp; contacts</small>
+          </span>
+        </button>
+
         {sessionRole === "admin" ? (
           <>
-            <p className="nav-section-title">Manage</p>
-            <button
-              className={`tab inventory-tab ${activeView === "inventory" ? "active" : ""}`}
-              type="button"
-              onClick={() => onViewChange("inventory")}
-            >
-              <span className="tab-mark">I</span>
-              <span>
-                <strong>Inventory</strong>
-                <small>Catalog, stock & stores</small>
-              </span>
-            </button>
-            <button
-              className={`tab ${activeView === "customers" ? "active" : ""}`}
-              type="button"
-              onClick={() => onViewChange("customers")}
-            >
-              <span className="tab-mark">C</span>
-              <span>
-                <strong>Customers</strong>
-                <small>CRM &amp; contacts</small>
-              </span>
-            </button>
             <button
               className={`tab ${activeView === "admin" ? "active" : ""}`}
               type="button"
@@ -2456,6 +2458,14 @@ function ReportHistory({
     setReturnScan("");
   }
 
+  function confirmExport(callback) {
+    const confirmed = window.confirm(
+      "Exporting too often may incur extra charges. Continue with this export?",
+    );
+    if (!confirmed) return;
+    callback?.();
+  }
+
   const MAX_RANGE_DAYS = 30;
   const hasRange = Boolean(filters.dateFrom && filters.dateTo);
   const rangeDays = hasRange ? calculateInclusiveDays(filters.dateFrom, filters.dateTo) : 0;
@@ -2500,11 +2510,13 @@ function ReportHistory({
               <button className="secondary-button" type="submit">Return</button>
             </form>
           ) : null}
-          <button className="secondary-button" type="button" onClick={onExport} disabled={!rangeValid}>Export view (CSV)</button>
+          <button className="secondary-button" type="button" onClick={() => confirmExport(onExport)} disabled={!rangeValid}>Export view (CSV)</button>
           {onExportAll ? (
-            <button className="secondary-button" type="button" onClick={onExportAll}>Export all (CSV)</button>
+            <button className="secondary-button" type="button" onClick={() => confirmExport(onExportAll)}>Export all (CSV)</button>
           ) : null}
-          <button className="danger-button" type="button" onClick={onClearReports}>Clear local data</button>
+          {onClearReports ? (
+            <button className="danger-button" type="button" onClick={onClearReports}>Clear local data</button>
+          ) : null}
         </div>
       </div>
 
@@ -4830,7 +4842,7 @@ function InventoryPage({
   onSaveProduct,
   onRemoveProduct,
 }) {
-  const isAdmin = sessionRole === "admin";
+  const canDelete = sessionRole === "admin";
   const emptyForm = {
     id: "",
     sku: "",
@@ -4938,20 +4950,6 @@ function InventoryPage({
 
   const selectedGroup = selectedKey ? groups.find((group) => group.key === selectedKey) : null;
   const selectedHasAllStores = selectedGroup ? Boolean(selectedGroup.byStore[""]) : false;
-
-  if (!isAdmin) {
-    return (
-      <section className="workspace">
-        <div className="workspace-header">
-          <div>
-            <p className="eyebrow">Inventory</p>
-            <h2>Admin only</h2>
-          </div>
-        </div>
-        <p className="empty-state">Only admins can manage the catalog and stores.</p>
-      </section>
-    );
-  }
 
   return (
     <>
@@ -5120,7 +5118,7 @@ function InventoryPage({
             setRestock(product);
           }}
           onEdit={editProduct}
-          onDelete={onRemoveProduct}
+          onDelete={canDelete ? onRemoveProduct : null}
         />
       ) : null}
 
@@ -5199,9 +5197,11 @@ function ItemDetailsDialog({ group, storeLocations, hasAllStores, onClose, onRes
                   <button className="secondary-button compact-button" type="button" onClick={() => onEdit(product)}>
                     Edit
                   </button>
-                  <button className="secondary-button compact-button" type="button" onClick={() => onDelete(product.id)}>
-                    Delete
-                  </button>
+                  {onDelete ? (
+                    <button className="secondary-button compact-button" type="button" onClick={() => onDelete(product.id)}>
+                      Delete
+                    </button>
+                  ) : null}
                 </div>
               </div>
             );
