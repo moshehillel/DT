@@ -123,7 +123,7 @@ function Workspace({ currentUser, isAdmin }) {
   const [activeEmployee, setActiveEmployee] = useState(
     isAdmin ? localStorage.getItem(ACTIVE_EMPLOYEE_KEY) || employeeName || employees[0] || "" : employeeName,
   );
-  const [activeView, setActiveView] = useState(isAdmin ? "admin" : "pendingReports");
+  const [activeView, setActiveView] = useState(isAdmin ? "admin" : "pos");
   const [filters, setFilters] = useState(createEmptyFilters);
   const [formNonce, setFormNonce] = useState(0);
   const [returnTarget, setReturnTarget] = useState(null);
