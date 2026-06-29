@@ -979,6 +979,12 @@ button:active {
   font-weight: 650;
 }
 
+.field-hint {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 600;
+}
+
 input,
 select,
 textarea {

@@ -126,6 +126,79 @@ export const repairDamageTypes = [
   "Clean Mic or Charge Port",
 ];
 
+// Repair price sheet, transcribed from the shop's Google Sheet. Each row is the
+// 26 prices for a model, in the SAME order as `repairDamageTypes`. Values may be
+// a fixed price ("$350.00"), a range ("80/90"), or "NA" (not offered).
+const repairPriceRows = {
+  "LG Exalt VN220": ["$350.00", "$95.00", "$95.00", "$95.00", "$125.00", "$125.00", "$150.00", "$90.00", "$90.00", "$90.00", "$125.00", "$35.00", "$75.00", "80/90", "200/300", "$65.00", "50/75", "$35.00", "$100.00", "35/50", "100/150", "65/85", "$65.00", "$100.00", "$50.00", "$35.00"],
+  "LG Classic Flip": ["$95.00", "$100.00", "$100.00", "$100.00", "$125.00", "$85.00", "$85.00", "$90.00", "$90.00", "$90.00", "$125.00", "$35.00", "$65.00", "80/90", "$100.00", "$65.00", "50/75", "35/50", "50/65", "35/50", "100/150", "65/85", "$100.00", "$100.00", "$50.00", "$35.00"],
+  "Kyocera E4610": ["$200.00", "$150.00", "$125.00", "$150.00", "$175.00", "$85.00", "$80.00", "$85.00", "$90.00", "$90.00", "$135.00", "$50.00", "$90.00", "$65.00", "$100.00", "$75.00", "50/65", "$35.00", "50/65", "$50.00", "100/150", "65/85", "$100.00", "$100.00", "50/75", "$50.00"],
+  "Kyocera E4810": ["$200.00", "$135.00", "$135.00", "$150.00", "$200.00", "$85.00", "$80.00", "$105.00", "$90.00", "$90.00", "$135.00", "$50.00", "$85.00", "$65.00", "$100.00", "$75.00", "50/65", "$35.00", "50/65", "$50.00", "100/150", "65/85", "$100.00", "$100.00", "50/75", "35/50"],
+  "Kyocera S2720": ["$250.00", "$135.00", "85/100", "100/135", "135/150", "$85.00", "$65.00", "$90.00", "$90.00", "$90.00", "$125.00", "$35.00", "$85.00", "80/90", "$100.00", "$65.00", "50/65", "$35.00", "50/65", "35/50", "100/150", "$100.00", "50/65", "50/65", "$50.00", "$35.00"],
+  "Qin F30": ["NA", "NA", "NA", "NA", "NA", "$100.00", "NA", "$95.00", "$90.00", "$90.00", "$125.00", "65/100", "65/100", "NA", "100/150", "50/75", "35/80", "35/50", "NA", "35/50", "100/150", "75/100", "$100.00", "NA", "$50.00", "$35.00"],
+  "TCL Flip 2": ["$75.00", "NA", "NA", "NA", "NA", "NA", "NA", "$85.00", "$85.00", "$85.00", "$110.00", "$35.00", "$65.00", "NA", "NA", "$65.00", "$50.00", "25/35", "NA", "35/50", "100/150", "65/90", "NA", "NA", "$50.00", "25/35"],
+  "Alcatel 4051S": ["NA", "NA", "NA", "NA", "NA", "NA", "NA", "$90.00", "$85.00", "NA", "NA", "$35.00", "NA", "NA", "NA", "$35.00", "35/50", "$25.00", "$85.00", "35/50", "100/150", "NA", "NA", "$100.00", "$50.00", "25/35"],
+  "POM TX 10": ["$130.00", "NA", "NA", "NA", "NA", "NA", "NA", "$100.00", "$90.00", "NA", "NA", "$50.00", "$79.00", "NA", "NA", "$35.00", "35/50", "$25.00", "25/35", "35/50", "100/150", "$35.00", "$100.00", "NA", "$75.00", "25/35"],
+  "Pom Classic": ["$135.00", "$85.00", "$85.00", "$85.00", "$85.00", "NA", "$100.00", "$100.00", "$90.00", "$90.00", "$90.00", "$50.00", "$79.00", "80/90", "NA", "$75.00", "25/35", "25/35", "25/35", "35/50", "100/150", "$35.00", "$100.00", "NA", "$75.00", "25/35"],
+  "FIG Flip 2 (F52)": ["$130.00", "$85.00", "$85.00", "$85.00", "$85.00", "NA", "$150.00", "$100.00", "$90.00", "$90.00", "$90.00", "$50.00", "$79.00", "80/90", "NA", "$75.00", "25/35", "25/35", "25/35", "35/50", "100/150", "$55.00", "$100.00", "NA", "$75.00", "25/35"],
+  "FIG Mini (F45)": ["$130.00", "$85.00", "$85.00", "$85.00", "$85.00", "NA", "$100.00", "$100.00", "$90.00", "$90.00", "$90.00", "$50.00", "$79.00", "80/90", "NA", "$75.00", "25/35", "25/35", "25/35", "35/50", "100/150", "$55.00", "$100.00", "NA", "$75.00", "25/35"],
+  "Coolpad": ["$125.00", "NA", "NA", "NA", "NA", "NA", "NA", "$90.00", "$90.00", "$90.00", "NA", "NA", "NA", "NA", "NA", "NA", "35/50", "$25.00", "$90.00", "35/50", "100/150", "NA", "NA", "NA", "$50.00", "25/35"],
+  "Nokia 6300": ["$100.00", "NA", "NA", "NA", "NA", "NA", "NA", "$90.00", "$90.00", "$90.00", "NA", "NA", "NA", "NA", "NA", "NA", "35/50", "$25.00", "NA", "35/50", "100/150", "NA", "NA", "NA", "$50.00", "25/35"],
+  "ANS F30": ["$65.00", "NA", "NA", "NA", "NA", "NA", "NA", "$90.00", "$90.00", "$90.00", "NA", "NA", "NA", "NA", "NA", "NA", "35/50", "$25.00", "$90.00", "35/50", "100/150", "NA", "NA", "NA", "$50.00", "25/35"],
+  "Sunbeam": ["NA", "NA", "NA", "NA", "NA", "NA", "NA", "$90.00", "$90.00", "$90.00", "NA", "NA", "NA", "NA", "NA", "NA", "35/50", "$25.00", "$90.00", "35/50", "100/150", "$90.00", "NA", "NA", "$75.00", "$35.00"],
+  "XP3 3800": ["$185.00", "NA", "NA", "NA", "NA", "65/85", "65/85", "$85.00", "$90.00", "$90.00", "NA", "NA", "NA", "$65.00", "NA", "NA", "35/50", "$25.00", "50/65", "35/50", "100/150", "$90.00", "NA", "NA", "50/75", "$50.00"],
+  "XP3+ 3900": ["$195.00", "NA", "NA", "NA", "NA", "65/85", "65/85", "$85.00", "$90.00", "$90.00", "NA", "NA", "NA", "$65.00", "NA", "NA", "35/50", "$25.00", "50/65", "35/50", "100/150", "$90.00", "NA", "NA", "50/75", "$50.00"],
+  "Etalk": ["$65.00", "NA", "NA", "NA", "NA", "NA", "NA", "$90.00", "$65.00", "NA", "NA", "NA", "NA", "NA", "NA", "NA", "35/50", "$25.00", "50/65", "NA", "100/150", "NA", "NA", "NA", "50/75", "$50.00"],
+};
+
+// Build a { model: { damageType: priceString } } lookup from the rows above.
+export const repairPriceSheet = Object.fromEntries(
+  Object.entries(repairPriceRows).map(([model, prices]) => [
+    model,
+    Object.fromEntries(prices.map((price, index) => [repairDamageTypes[index], price])),
+  ]),
+);
+
+// Parses a raw sheet cell into a normalized price descriptor.
+// - "$350.00" -> { kind: "fixed", amount: 350, display: "$350" }
+// - "80/90"   -> { kind: "range", amount: 80, low: 80, high: 90, display: "80/90" }
+// - "NA"/""   -> { kind: "na" } / { kind: "none" }
+export function parseRepairPrice(raw) {
+  const value = String(raw == null ? "" : raw).trim();
+  if (!value) return { kind: "none", raw: value };
+  if (value.toUpperCase() === "NA") return { kind: "na", raw: value };
+
+  const toNumber = (text) => {
+    const cleaned = String(text).replace(/[^0-9.]/g, "");
+    const parsed = Number.parseFloat(cleaned);
+    return Number.isFinite(parsed) ? parsed : null;
+  };
+
+  if (value.includes("/")) {
+    const [lowRaw, highRaw] = value.split("/");
+    const low = toNumber(lowRaw);
+    const high = toNumber(highRaw);
+    return { kind: "range", amount: low, low, high, display: value, raw: value };
+  }
+
+  const amount = toNumber(value);
+  if (amount == null) return { kind: "none", raw: value };
+  return { kind: "fixed", amount, display: value, raw: value };
+}
+
+// Looks up the price for a model + damage/service pair. Returns null when either
+// side is empty or not present in the sheet (e.g. a custom typed value), so the
+// caller can leave the amount untouched for free-typed entries.
+export function lookupRepairPrice(model, damage) {
+  const modelKey = String(model || "").trim();
+  const damageKey = String(damage || "").trim();
+  if (!modelKey || !damageKey) return null;
+  const row = repairPriceSheet[modelKey];
+  if (!row) return null;
+  if (!Object.prototype.hasOwnProperty.call(row, damageKey)) return null;
+  return parseRepairPrice(row[damageKey]);
+}
+
 export const reportTypes = {
   call: {
     title: "Phone call report",
@@ -161,7 +234,7 @@ export const reportTypes = {
       { name: "damage", label: "What is damaged?", placeholder: "Start typing a repair…", suggestions: repairDamageTypes },
       { name: "status", label: "Repair status", type: "select", options: repairStatuses },
       { name: "paymentStatus", label: "Repair paid?", type: "select", options: ["Not paid", "Paid"] },
-      { name: "notificationPreference", label: "When ready notify by", type: "select", options: ["Text message", "Phone call"] },
+      { name: "notificationPreference", label: "When ready notify by", type: "select", options: ["Text message", "Phone call", "Both"] },
       { name: "dueDate", label: "Expected ready date", type: "date" },
     ],
   },
@@ -175,9 +248,13 @@ export const reportTypes = {
       { name: "simPhone", label: "SIM number", placeholder: "SIM / ICCID number" },
       { name: "plan", label: "Plan / activation notes", placeholder: "Monthly plan, port-in, new number" },
       { name: "accountPin", label: "PIN / account note", placeholder: "Optional" },
-      { name: "reminderDate", label: "Refill reminder date", type: "date" },
+      { name: "planType", label: "Plan type", type: "select", options: ["Monthly", "One time"] },
       { name: "cardLast4", label: "Card last 4 digits", placeholder: "1234" },
-      { name: "reminderPreference", label: "Remind by", type: "select", options: ["Text message", "Phone call"] },
+      // Monthly plans repeat: we remind on this day-of-month every month.
+      { name: "refillDate", label: "Monthly refill date", type: "date", showIf: { field: "planType", equals: "Monthly" } },
+      // One-time plans fire a single reminder on this date.
+      { name: "reminderDate", label: "Refill reminder date", type: "date", showIf: { field: "planType", equals: "One time" } },
+      { name: "reminderPreference", label: "Remind by", type: "select", options: ["Text message", "Phone call", "Both"] },
     ],
   },
   rental: {

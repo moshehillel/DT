@@ -495,6 +495,17 @@ async function sendSms({ to, body }) {
 }
 
 async function sendCustomerNotification({ to, method, body }) {
+  if (method === "Both") {
+    const [sms, call] = await Promise.all([
+      sendSms({ to, body }),
+      sendVoiceCall({ to, body }),
+    ]);
+    const status = sms.status === "Sent" || call.status === "Sent" ? "Sent" : "Failed";
+    return {
+      status,
+      detail: `Text: ${sms.detail || sms.status}; Call: ${call.detail || call.status}`,
+    };
+  }
   if (method === "Phone call") {
     return sendVoiceCall({ to, body });
   }
@@ -537,9 +548,10 @@ exports.notifyRepairDelivered = onDocumentUpdated(
 
     if (!before || !after || after.type !== "repair") return;
 
-    const oldStatus = before.details?.status;
-    const newStatus = after.details?.status;
-    if (oldStatus === "Ready" || newStatus !== "Ready") return;
+    // Fire on two independent transitions: status -> Ready, and payment -> Paid.
+    const becameReady = before.details?.status !== "Ready" && after.details?.status === "Ready";
+    const becamePaid = before.details?.paymentStatus !== "Paid" && after.details?.paymentStatus === "Paid";
+    if (!becameReady && !becamePaid) return;
 
     const to = after.customerPhone;
     if (!to) {
@@ -547,18 +559,28 @@ exports.notifyRepairDelivered = onDocumentUpdated(
       return;
     }
 
-    const body = `Diamant Telecom: repair ticket ${after.details?.ticketNumber || ""} for ${after.details?.model || "your phone"} is ready for pickup.`;
-    const method = after.details?.notificationPreference || "Text message";
-
-    try {
-      const result = await sendCustomerNotification({ to, method, body });
-      // Only log failures; a successful pickup text needs no record.
-      if (result.status !== "Sent") {
-        await logNotification(event.params.reportId, after, result.status, result.detail);
+    const sendOne = async (method, body) => {
+      try {
+        const result = await sendCustomerNotification({ to, method, body });
+        // Only log failures; a successful text needs no record.
+        if (result.status !== "Sent") {
+          await logNotification(event.params.reportId, after, result.status, result.detail);
+        }
+      } catch (error) {
+        logger.error("notifyRepairDelivered failed", error);
+        await logNotification(event.params.reportId, after, "Failed", error.message);
       }
-    } catch (error) {
-      logger.error("notifyRepairDelivered failed", error);
-      await logNotification(event.params.reportId, after, "Failed", error.message);
+    };
+
+    if (becameReady) {
+      const body = `Diamant Telecom: repair ticket ${after.details?.ticketNumber || ""} for ${after.details?.model || "your phone"} is ready for pickup.`;
+      await sendOne(after.details?.notificationPreference || "Text message", body);
+    }
+
+    if (becamePaid) {
+      const ticket = after.details?.ticketNumber ? ` ticket ${after.details.ticketNumber}` : "";
+      const model = after.details?.model || "your phone";
+      await sendOne("Text message", `Diamant Telecom: payment for your ${model} repair${ticket} is marked paid. Thank you!`);
     }
   },
 );
@@ -1229,6 +1251,26 @@ function todayDateString() {
   ].join("-");
 }
 
+// Year-month stamp (e.g. "2026-06"), used to dedupe monthly reminders so a
+// recurring plan is only reminded once per calendar month.
+function monthStamp() {
+  const date = new Date();
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}`;
+}
+
+// True when a monthly plan's refill day-of-month matches today. Days past the
+// end of a shorter month (e.g. the 31st in February) fire on the last day.
+function isMonthlyRefillDueToday(refillDate) {
+  const parts = String(refillDate || "").trim().split("-");
+  if (parts.length < 3) return false;
+  const refillDay = Number.parseInt(parts[2], 10);
+  if (!Number.isFinite(refillDay)) return false;
+  const now = new Date();
+  const daysInMonth = new Date(now.getFullYear(), now.getMonth() + 1, 0).getDate();
+  const effectiveDay = Math.min(refillDay, daysInMonth);
+  return now.getDate() === effectiveDay;
+}
+
 function buildSimExpiryMessage(cardLast4) {
   const last4 = String(cardLast4 || "").replace(/\D/g, "").slice(-4);
   const cardPart = last4
@@ -1290,16 +1332,10 @@ exports.sendSimExpiryReminders = onSchedule(
   },
   async () => {
     const today = todayDateString();
-    const snapshot = await db
-      .collection("reports")
-      .where("type", "==", "sim")
-      .where("details.reminderDate", "==", today)
-      .limit(500)
-      .get();
 
-    await Promise.all(snapshot.docs.map(async (doc) => {
+    // Send a single SIM reminder/refill notification and log the outcome.
+    const sendSimReminder = async (doc, logId, type) => {
       const report = doc.data() || {};
-      const logId = `sim-expiry-reminder-${doc.id}-${today}`;
       const logRef = db.collection("notificationLogs").doc(logId);
       const existingLog = await logRef.get();
       if (existingLog.exists) return;
@@ -1307,7 +1343,7 @@ exports.sendSimExpiryReminders = onSchedule(
       const method = report.details?.reminderPreference || "Text message";
       const to = report.customerPhone || "";
       if (!to) {
-        await writeNotificationLog(logId, doc.id, report, method, "Skipped", "No customer phone number", "sim-expiry-reminder");
+        await writeNotificationLog(logId, doc.id, report, method, "Skipped", "No customer phone number", type);
         return;
       }
 
@@ -1315,12 +1351,39 @@ exports.sendSimExpiryReminders = onSchedule(
 
       try {
         const result = await sendCustomerNotification({ to, method, body });
-        await writeNotificationLog(logId, doc.id, report, method, result.status, result.detail, "sim-expiry-reminder");
+        await writeNotificationLog(logId, doc.id, report, method, result.status, result.detail, type);
       } catch (error) {
         logger.error("sendSimExpiryReminders failed", error);
-        await writeNotificationLog(logId, doc.id, report, method, "Failed", error.message, "sim-expiry-reminder");
+        await writeNotificationLog(logId, doc.id, report, method, "Failed", error.message, type);
       }
-    }));
+    };
+
+    // One-time plans: fire a single reminder on the chosen reminder date.
+    const oneTimeSnapshot = await db
+      .collection("reports")
+      .where("type", "==", "sim")
+      .where("details.reminderDate", "==", today)
+      .limit(500)
+      .get();
+
+    // Monthly (running) plans: remind every month on the chosen refill day.
+    const monthlySnapshot = await db
+      .collection("reports")
+      .where("type", "==", "sim")
+      .where("details.planType", "==", "Monthly")
+      .limit(500)
+      .get();
+
+    const stamp = monthStamp();
+
+    await Promise.all([
+      ...oneTimeSnapshot.docs.map((doc) =>
+        sendSimReminder(doc, `sim-expiry-reminder-${doc.id}-${today}`, "sim-expiry-reminder")),
+      ...monthlySnapshot.docs
+        .filter((doc) => isMonthlyRefillDueToday(doc.data()?.details?.refillDate))
+        .map((doc) =>
+          sendSimReminder(doc, `sim-monthly-reminder-${doc.id}-${stamp}`, "sim-monthly-reminder")),
+    ]);
   },
 );
 

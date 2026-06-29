@@ -12,6 +12,7 @@ import {
   EMPLOYEE_KEY,
   EMPLOYEE_LOCATIONS_KEY,
   FUNCTIONS_BASE_URL,
+  lookupRepairPrice,
   manualReportTypeKeys,
   ORDER_HANDLERS_KEY,
   paymentMethods,
@@ -125,7 +126,6 @@ function Workspace({ currentUser, isAdmin }) {
   const [activeView, setActiveView] = useState(isAdmin ? "admin" : "pendingReports");
   const [filters, setFilters] = useState(createEmptyFilters);
   const [formNonce, setFormNonce] = useState(0);
-  const [dialogOpen, setDialogOpen] = useState(false);
   const [returnTarget, setReturnTarget] = useState(null);
 
   // Keep the signed-in employee's name in the shared list so admins can see and
@@ -737,6 +737,19 @@ function Workspace({ currentUser, isAdmin }) {
     }
   }
 
+  // Mark a repair paid (optionally storing card-charge details). Persisting the
+  // status change triggers the notifyRepairPaid Cloud Function, which texts the
+  // customer that their repair is marked paid.
+  function markRepairPaid(reportId, extra = {}) {
+    setReports((current) =>
+      current.map((report) =>
+        report.id === reportId
+          ? { ...report, details: { ...report.details, paymentStatus: "Paid", ...extra } }
+          : report,
+      ),
+    );
+  }
+
   function queueDeliveryNotification(report) {
     const method = report.details?.notificationPreference || "Text message";
     const notification = {
@@ -1017,7 +1030,6 @@ function Workspace({ currentUser, isAdmin }) {
         employees={employees}
         activeEmployee={activeEmployee}
         onEmployeeChange={setActiveEmployee}
-        onManageEmployees={() => setDialogOpen(true)}
         onTypeChange={setActiveType}
         onViewChange={setActiveView}
         onLogout={logout}
@@ -1053,6 +1065,7 @@ function Workspace({ currentUser, isAdmin }) {
           <OpenRepairsPage
             reports={filteredReports}
             onStatusChange={updateRepairStatus}
+            onMarkPaid={markRepairPaid}
           />
         ) : activeView === "customers" ? (
           <CustomersPage
@@ -1135,21 +1148,10 @@ function Workspace({ currentUser, isAdmin }) {
         ) : activeView === "inventory" ? (
           <InventoryPage
             products={products}
-            employees={employees}
             storeLocations={storeLocations}
-            employeeLocations={employeeLocations}
-            storeDevices={storeDevices}
-            storeTax={storeTax}
             sessionRole={sessionRole}
             onSaveProduct={saveProduct}
             onRemoveProduct={removeProduct}
-            onAddStoreLocation={addStoreLocation}
-            onRemoveStoreLocation={removeStoreLocation}
-            onSetEmployeeLocation={setEmployeeLocation}
-            onRemoveEmployee={unsyncEmployeeName}
-            onSetStoreDevice={setStoreDevice}
-            onSetStoreTaxRate={setStoreTaxRate}
-            onUpdateStoreInfo={updateStoreInfo}
           />
         ) : (
           <AdminPage
@@ -1158,26 +1160,28 @@ function Workspace({ currentUser, isAdmin }) {
             notifications={notifications}
             resetRequests={resetRequests}
             orderHandlers={orderHandlers}
+            storeLocations={storeLocations}
+            employeeLocations={employeeLocations}
+            storeDevices={storeDevices}
+            storeTax={storeTax}
             onMarkResetHandled={markResetHandled}
             onResetPassword={requestPasswordReset}
             onAddOrderHandler={addOrderHandler}
             onRemoveOrderHandler={removeOrderHandler}
+            onAddStoreLocation={addStoreLocation}
+            onRemoveStoreLocation={removeStoreLocation}
+            onUpdateStoreInfo={updateStoreInfo}
+            onSetStoreDevice={setStoreDevice}
+            onSetStoreTaxRate={setStoreTaxRate}
+            onSetEmployeeLocation={setEmployeeLocation}
+            onRemoveEmployee={unsyncEmployeeName}
+            onSyncName={syncEmployeeName}
+            onUnsyncName={unsyncEmployeeName}
           />
         )}
 
         <PoweredByFooter />
       </main>
-
-      {dialogOpen && sessionRole === "admin" && (
-        <EmployeeDialog
-          onClose={() => setDialogOpen(false)}
-          onSyncName={syncEmployeeName}
-          onUnsyncName={unsyncEmployeeName}
-          storeLocations={storeLocations}
-          employeeLocations={employeeLocations}
-          onSetLocation={setEmployeeLocation}
-        />
-      )}
 
       {returnTarget && (
         <ReturnDialog
@@ -1362,7 +1366,6 @@ function Sidebar({
   employees,
   activeEmployee,
   onEmployeeChange,
-  onManageEmployees,
   onTypeChange,
   onViewChange,
   onLogout,
@@ -1499,11 +1502,6 @@ function Sidebar({
             <input value={activeEmployee} disabled readOnly />
           )}
         </label>
-        {sessionRole === "admin" ? (
-          <button className="ghost-button" type="button" onClick={onManageEmployees}>
-            Manage employees
-          </button>
-        ) : null}
         <button className="ghost-button" type="button" onClick={onLogout}>
           Sign out
         </button>
@@ -1512,15 +1510,66 @@ function Sidebar({
   );
 }
 
+// Seeds field state so conditional (showIf) fields evaluate correctly on first
+// render: selects default to their first option, everything else starts empty.
+function buildInitialFieldValues(config) {
+  const values = {};
+  (config.fields || []).forEach((field) => {
+    values[field.name] = field.type === "select" && field.options ? field.options[0] : "";
+  });
+  return values;
+}
+
 function ReportForm({ activeType, activeEmployee, reports, customers, activeStoreInfo, onSaveCustomerName, onSaveCustomer, onSave }) {
   const [now, setNow] = useState(new Date());
   const [customerPhone, setCustomerPhone] = useState("");
+  const [paymentAmount, setPaymentAmount] = useState("");
+  const [repairPriceHint, setRepairPriceHint] = useState("");
+  const repairSelectionRef = useRef({ model: "", damage: "" });
   const config = reportTypes[activeType];
+  const isRepair = activeType === "repair";
+  const [fieldValues, setFieldValues] = useState(() => buildInitialFieldValues(config));
 
   useEffect(() => {
     const timer = window.setInterval(() => setNow(new Date()), 30000);
     return () => window.clearInterval(timer);
   }, []);
+
+  // Tracks every field value so conditional fields (showIf) can react, and, for
+  // repairs, auto-fills the payment amount from the price sheet when the
+  // model + damage pair matches the sheet. The amount stays editable, and a
+  // custom (non-sheet) model or damage simply leaves the amount untouched.
+  function handleFieldChange(name, value) {
+    setFieldValues((current) => ({ ...current, [name]: value }));
+
+    if (!isRepair || (name !== "model" && name !== "damage")) return;
+
+    const selection = repairSelectionRef.current;
+    if (name === "model") selection.model = value;
+    else selection.damage = value;
+
+    const price = lookupRepairPrice(selection.model, selection.damage);
+    if (!price) {
+      setRepairPriceHint("");
+      return;
+    }
+    if (price.kind === "fixed") {
+      setPaymentAmount(String(price.amount));
+      setRepairPriceHint(`Sheet price: ${price.display}`);
+    } else if (price.kind === "range") {
+      setPaymentAmount(price.amount != null ? String(price.amount) : "");
+      setRepairPriceHint(`Sheet range ${price.display} — filled the low end, adjust as needed.`);
+    } else if (price.kind === "na") {
+      setPaymentAmount("");
+      setRepairPriceHint("Not offered for this model on the price sheet.");
+    } else {
+      setRepairPriceHint("");
+    }
+  }
+
+  const visibleFields = config.fields.filter(
+    (field) => !field.showIf || fieldValues[field.showIf.field] === field.showIf.equals,
+  );
 
   function handleSubmit(event) {
     event.preventDefault();
@@ -1599,7 +1648,16 @@ function ReportForm({ activeType, activeEmployee, reports, customers, activeStor
 
           <label className="field">
             <span>Payment amount</span>
-            <input name="paymentAmount" inputMode="decimal" placeholder="0.00" />
+            <input
+              name="paymentAmount"
+              inputMode="decimal"
+              placeholder="0.00"
+              value={paymentAmount}
+              onChange={(event) => setPaymentAmount(event.target.value)}
+            />
+            {isRepair && repairPriceHint ? (
+              <small className="field-hint">{repairPriceHint}</small>
+            ) : null}
           </label>
 
           <label className="field">
@@ -1618,8 +1676,12 @@ function ReportForm({ activeType, activeEmployee, reports, customers, activeStor
         </div>
 
         <div className="form-grid">
-          {config.fields.map((field) => (
-            <DynamicField key={field.name} field={field} />
+          {visibleFields.map((field) => (
+            <DynamicField
+              key={field.name}
+              field={field}
+              onValueChange={handleFieldChange}
+            />
           ))}
         </div>
 
@@ -1637,12 +1699,16 @@ function ReportForm({ activeType, activeEmployee, reports, customers, activeStor
   );
 }
 
-function DynamicField({ field }) {
+function DynamicField({ field, onValueChange }) {
+  const handleChange = onValueChange
+    ? (event) => onValueChange(field.name, event.target.value)
+    : undefined;
+
   if (field.type === "select") {
     return (
       <label className="field">
         <span>{field.label}</span>
-        <select name={field.name} defaultValue={field.options[0]}>
+        <select name={field.name} defaultValue={field.options[0]} onChange={handleChange}>
           {field.options.map((option) => (
             <option key={option}>{option}</option>
           ))}
@@ -1661,6 +1727,7 @@ function DynamicField({ field }) {
         type={field.type || "text"}
         placeholder={field.placeholder || ""}
         list={listId}
+        onChange={handleChange}
         {...(field.name === "imei" ? {
           inputMode: "numeric",
           autoComplete: "off",
@@ -2257,6 +2324,7 @@ function RentalReportForm({ activeEmployee, customers, onSaveCustomerName, onSav
               <select value={form.returnReminderPreference} onChange={(event) => updateField("returnReminderPreference", event.target.value)}>
                 <option>Text message</option>
                 <option>Phone call</option>
+                <option>Both</option>
               </select>
             </label>
             <label className="field">
@@ -2613,10 +2681,48 @@ function ReportHistory({
   );
 }
 
-function OpenRepairsPage({ reports, onStatusChange }) {
+function OpenRepairsPage({ reports, onStatusChange, onMarkPaid }) {
+  const [paying, setPaying] = useState({ id: "", status: "", message: "" });
   const openRepairs = reports.filter((report) =>
     report.type === "repair" && !["Completed", "Cancelled"].includes(report.details?.status),
   );
+
+  // Mark a repair paid. For card payments, run the charge on the local terminal
+  // first and only mark paid once the card is approved. The "paid" SMS to the
+  // customer is sent by the notifyRepairPaid Cloud Function on the status change.
+  async function handleMarkPaid(repair) {
+    if (repair.details?.paymentStatus === "Paid") return;
+    const needsTerminal = ["CC", "Card"].includes(repair.paymentMethod);
+
+    if (!needsTerminal) {
+      onMarkPaid(repair.id);
+      setPaying({ id: "", status: "", message: "" });
+      return;
+    }
+
+    const amount = Number.parseFloat(repair.paymentAmount);
+    if (!Number.isFinite(amount) || amount <= 0) {
+      window.alert("Set a payment amount on this repair before charging the card.");
+      return;
+    }
+
+    try {
+      setPaying({ id: repair.id, status: "charging", message: "Follow the terminal: tap, insert, or swipe the card." });
+      const result = await chargeOnLocalTerminal({
+        amount: amount.toFixed(2),
+        externalRequestId: `repair-${repair.id}`.slice(0, 32),
+        onStatus: (text) => setPaying((current) => ({ ...current, message: text })),
+      });
+      onMarkPaid(repair.id, {
+        paymentRefNum: result.refNum || "",
+        cardType: result.cardType || "",
+        maskedCardNumber: result.maskedCardNumber || "",
+      });
+      setPaying({ id: "", status: "", message: "" });
+    } catch (error) {
+      setPaying({ id: repair.id, status: "error", message: error.message || "Card payment failed." });
+    }
+  }
 
   return (
     <section className="history">
@@ -2644,28 +2750,50 @@ function OpenRepairsPage({ reports, onStatusChange }) {
           </thead>
           <tbody>
             {openRepairs.length ? (
-              openRepairs.map((repair) => (
-                <tr key={repair.id}>
-                  <td><strong>{repair.details?.ticketNumber || "-"}</strong></td>
-                  <td>{formatShortDate(repair.createdAt)}</td>
-                  <td>{repair.customerPhone || "-"}</td>
-                  <td>{repair.details?.model || "-"}</td>
-                  <td>{repair.details?.damage || "-"}</td>
-                  <td>{formatPayment(repair.paymentAmount)} · {repair.details?.paymentStatus || "Not paid"}</td>
-                  <td>{repair.servedBy || "-"}</td>
-                  <td>
-                    <select
-                      className="status-select"
-                      value={repair.details?.status || repairStatuses[0]}
-                      onChange={(event) => onStatusChange(repair.id, event.target.value)}
-                    >
-                      {repairStatuses.map((status) => (
-                        <option key={status}>{status}</option>
-                      ))}
-                    </select>
-                  </td>
-                </tr>
-              ))
+              openRepairs.map((repair) => {
+                const isPaid = repair.details?.paymentStatus === "Paid";
+                const isCharging = paying.id === repair.id && paying.status === "charging";
+                const needsTerminal = ["CC", "Card"].includes(repair.paymentMethod);
+                return (
+                  <tr key={repair.id}>
+                    <td><strong>{repair.details?.ticketNumber || "-"}</strong></td>
+                    <td>{formatShortDate(repair.createdAt)}</td>
+                    <td>{repair.customerPhone || "-"}</td>
+                    <td>{repair.details?.model || "-"}</td>
+                    <td>{repair.details?.damage || "-"}</td>
+                    <td>
+                      <div>{formatPayment(repair.paymentAmount)} · {isPaid ? "Paid" : "Not paid"}{repair.paymentMethod ? ` · ${repair.paymentMethod}` : ""}</div>
+                      {isPaid ? null : (
+                        <div className="pos-row-actions">
+                          <button
+                            className="secondary-button compact-button"
+                            type="button"
+                            disabled={isCharging}
+                            onClick={() => handleMarkPaid(repair)}
+                          >
+                            {isCharging ? "Charging…" : needsTerminal ? "Charge card & mark paid" : "Mark paid"}
+                          </button>
+                        </div>
+                      )}
+                      {paying.id === repair.id && paying.message ? (
+                        <p className={paying.status === "error" ? "summary-error" : "muted"}>{paying.message}</p>
+                      ) : null}
+                    </td>
+                    <td>{repair.servedBy || "-"}</td>
+                    <td>
+                      <select
+                        className="status-select"
+                        value={repair.details?.status || repairStatuses[0]}
+                        onChange={(event) => onStatusChange(repair.id, event.target.value)}
+                      >
+                        {repairStatuses.map((status) => (
+                          <option key={status}>{status}</option>
+                        ))}
+                      </select>
+                    </td>
+                  </tr>
+                );
+              })
             ) : (
               <tr>
                 <td colSpan="8" className="empty-state">No open repairs.</td>
@@ -4697,21 +4825,10 @@ function RestockDialog({ product, storeLocations, onClose, onAddStock }) {
 
 function InventoryPage({
   products,
-  employees,
   storeLocations,
-  employeeLocations,
-  storeDevices,
-  storeTax,
   sessionRole,
   onSaveProduct,
   onRemoveProduct,
-  onAddStoreLocation,
-  onRemoveStoreLocation,
-  onSetEmployeeLocation,
-  onRemoveEmployee,
-  onSetStoreDevice,
-  onSetStoreTaxRate,
-  onUpdateStoreInfo,
 }) {
   const isAdmin = sessionRole === "admin";
   const emptyForm = {
@@ -4726,17 +4843,10 @@ function InventoryPage({
     quantity: "0",
     imeis: [],
   };
-  const emptyStore = { name: "", street: "", city: "", state: "", zip: "", hours: "" };
   const [form, setForm] = useState(emptyForm);
-  const [newStore, setNewStore] = useState(emptyStore);
-  const [editingStore, setEditingStore] = useState(null);
   const [search, setSearch] = useState("");
-  const [lookup, setLookup] = useState("");
   const [restock, setRestock] = useState(null);
-
-  function taxFor(name) {
-    return (storeTax || []).find((entry) => entry?.name === name) || null;
-  }
+  const [selectedKey, setSelectedKey] = useState("");
 
   function updateField(name, value) {
     setForm((current) => ({ ...current, [name]: value }));
@@ -4780,72 +4890,54 @@ function InventoryPage({
       quantity: String(product.quantity ?? 0),
       imeis: product.imeis || [],
     });
+    setSelectedKey("");
     window.scrollTo({ top: 0, behavior: "smooth" });
   }
 
-  function editStore(location) {
-    const tax = taxFor(location) || {};
-    setNewStore({
-      name: location,
-      street: tax.street || "",
-      city: tax.city || "",
-      state: tax.state || "",
-      zip: tax.zip || "",
-      hours: tax.hours || "",
-    });
-    setEditingStore(location);
-  }
-
-  function cancelEditStore() {
-    setNewStore(emptyStore);
-    setEditingStore(null);
-  }
-
-  const filtered = useMemo(() => {
-    const query = search.trim().toLowerCase();
-    return products
-      .filter((product) => {
-        if (!query) return true;
-        return [product.name, product.sku, product.barcode, product.category, product.location]
-          .join(" ")
-          .toLowerCase()
-          .includes(query);
-      })
-      .sort((a, b) => String(a.name || "").localeCompare(String(b.name || "")));
-  }, [products, search]);
-
-  // Roll the per-store product rows up by item so admins can see how many of
-  // each item are in stock at every store at a glance.
-  const stockByItem = useMemo(() => {
-    const query = lookup.trim().toLowerCase();
-    const groups = new Map();
+  // Group per-store product rows up by item so we can show, in one popup, how
+  // many of each item are in stock at every store along with its variants.
+  const groups = useMemo(() => {
+    const map = new Map();
     for (const product of products) {
-      if (query) {
-        const haystack = [product.name, product.sku, product.barcode].filter(Boolean).join(" ").toLowerCase();
-        if (!haystack.includes(query)) continue;
-      }
       const key = String(product.sku || product.name || product.id).trim().toLowerCase();
       const stock = product.requiresImei ? product.imeis?.length || 0 : Number(product.quantity) || 0;
       const loc = product.location || "";
-      const group = groups.get(key) || { key, name: product.name, sku: product.sku, byStore: {}, total: 0 };
+      const group = map.get(key) || {
+        key,
+        name: product.name,
+        sku: product.sku,
+        category: product.category,
+        requiresImei: Boolean(product.requiresImei),
+        total: 0,
+        byStore: {},
+        variants: [],
+      };
       group.byStore[loc] = (group.byStore[loc] || 0) + stock;
       group.total += stock;
+      group.variants.push(product);
       if (!group.name && product.name) group.name = product.name;
       if (!group.sku && product.sku) group.sku = product.sku;
-      groups.set(key, group);
+      if (!group.category && product.category) group.category = product.category;
+      if (product.requiresImei) group.requiresImei = true;
+      map.set(key, group);
     }
-    return Array.from(groups.values()).sort((a, b) => String(a.name || "").localeCompare(String(b.name || "")));
-  }, [products, lookup]);
+    return Array.from(map.values()).sort((a, b) => String(a.name || "").localeCompare(String(b.name || "")));
+  }, [products]);
 
-  const lookupHasAllStores = useMemo(() => stockByItem.some((item) => item.byStore[""]), [stockByItem]);
+  const filteredGroups = useMemo(() => {
+    const query = search.trim().toLowerCase();
+    if (!query) return [];
+    return groups.filter((group) => {
+      const haystack = [group.name, group.sku, group.category, ...group.variants.map((variant) => variant.barcode)]
+        .filter(Boolean)
+        .join(" ")
+        .toLowerCase();
+      return haystack.includes(query);
+    });
+  }, [groups, search]);
 
-  function locationFor(name) {
-    return (employeeLocations || []).find((entry) => entry?.name === name)?.location || "";
-  }
-
-  function deviceFor(name) {
-    return (storeDevices || []).find((entry) => entry?.name === name)?.deviceId || "";
-  }
+  const selectedGroup = selectedKey ? groups.find((group) => group.key === selectedKey) : null;
+  const selectedHasAllStores = selectedGroup ? Boolean(selectedGroup.byStore[""]) : false;
 
   if (!isAdmin) {
     return (
@@ -4962,114 +5054,360 @@ function InventoryPage({
       <section className="history">
         <div className="history-header">
           <div>
-            <p className="eyebrow">Catalog</p>
-            <h2>Products ({products.length})</h2>
+            <p className="eyebrow">Inventory</p>
+            <h2>Search inventory</h2>
           </div>
           <input
             className="pos-search"
             value={search}
             onChange={(event) => setSearch(event.target.value)}
-            placeholder="Search name, SKU, store"
+            placeholder="Search item, SKU, barcode"
           />
         </div>
+        <p className="muted">Search the catalog, then open an item to see its stock per store.</p>
+        {search.trim() ? (
+          <div className="table-wrap catalog-table">
+            <table>
+              <thead>
+                <tr>
+                  <th>Item</th>
+                  <th>SKU</th>
+                  <th>Category</th>
+                  <th>Total stock</th>
+                  <th></th>
+                </tr>
+              </thead>
+              <tbody>
+                {filteredGroups.length ? (
+                  filteredGroups.map((item) => (
+                    <tr key={item.key}>
+                      <td><strong>{item.name}</strong></td>
+                      <td>{item.sku || "-"}</td>
+                      <td>{item.category || "-"}</td>
+                      <td><strong>{item.total}</strong></td>
+                      <td className="pos-row-actions">
+                        <button
+                          className="secondary-button compact-button"
+                          type="button"
+                          onClick={() => setSelectedKey(item.key)}
+                        >
+                          View
+                        </button>
+                      </td>
+                    </tr>
+                  ))
+                ) : (
+                  <tr>
+                    <td colSpan="5" className="empty-state">No matching items.</td>
+                  </tr>
+                )}
+              </tbody>
+            </table>
+          </div>
+        ) : (
+          <p className="empty-state">Start typing to search inventory.</p>
+        )}
+      </section>
+
+      {selectedGroup ? (
+        <ItemDetailsDialog
+          group={selectedGroup}
+          storeLocations={storeLocations}
+          hasAllStores={selectedHasAllStores}
+          onClose={() => setSelectedKey("")}
+          onRestock={(product) => {
+            setSelectedKey("");
+            setRestock(product);
+          }}
+          onEdit={editProduct}
+          onDelete={onRemoveProduct}
+        />
+      ) : null}
+
+      {restock ? (
+        <RestockDialog
+          product={restock}
+          storeLocations={storeLocations}
+          onClose={() => setRestock(null)}
+          onAddStock={(payload) => addStock(restock, payload)}
+        />
+      ) : null}
+    </>
+  );
+}
+
+// Popup showing one item's stock per store plus each per-store variant, with
+// restock / edit / delete actions. Replaces the always-on inventory tables.
+function ItemDetailsDialog({ group, storeLocations, hasAllStores, onClose, onRestock, onEdit, onDelete }) {
+  const subtitle = [group.sku ? `SKU ${group.sku}` : "", group.category || "", group.requiresImei ? "IMEI tracked" : ""]
+    .filter(Boolean)
+    .join(" · ");
+
+  return (
+    <div className="dialog-backdrop" role="presentation" onClick={onClose}>
+      <div
+        className="dialog-card dialog-card-wide"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="item-dialog-title"
+        onClick={(event) => event.stopPropagation()}
+      >
+        <div>
+          <p className="eyebrow">Inventory</p>
+          <h2 id="item-dialog-title">{group.name}</h2>
+          {subtitle ? <p className="muted">{subtitle}</p> : null}
+        </div>
+
         <div className="table-wrap catalog-table">
           <table>
             <thead>
               <tr>
-                <th>Name</th>
-                <th>SKU</th>
-                <th>Category</th>
-                <th>Store</th>
-                <th>Price</th>
-                <th>Stock</th>
-                <th>IMEI</th>
-                <th></th>
+                {storeLocations.map((location) => (
+                  <th key={location}>{location}</th>
+                ))}
+                {hasAllStores ? <th>All stores</th> : null}
+                <th>Total</th>
               </tr>
             </thead>
             <tbody>
-              {filtered.length ? (
-                filtered.map((product) => (
-                  <tr key={product.id}>
-                    <td><strong>{product.name}</strong></td>
-                    <td>{product.sku}{product.barcode ? <p className="muted">{product.barcode}</p> : null}</td>
-                    <td>{product.category}</td>
-                    <td>{product.location || "All stores"}</td>
-                    <td>{formatMoney(Number(product.price) || 0)}</td>
-                    <td>{product.requiresImei ? (product.imeis?.length || 0) : Number(product.quantity) || 0}</td>
-                    <td>{product.requiresImei ? "Yes" : "No"}</td>
-                    <td className="pos-row-actions">
-                      <button className="secondary-button compact-button" type="button" onClick={() => setRestock(product)}>
-                        Restock
-                      </button>
-                      <button className="secondary-button compact-button" type="button" onClick={() => editProduct(product)}>
-                        Edit
-                      </button>
-                      <button className="secondary-button compact-button" type="button" onClick={() => onRemoveProduct(product.id)}>
-                        Delete
-                      </button>
-                    </td>
-                  </tr>
-                ))
-              ) : (
-                <tr>
-                  <td colSpan="8" className="empty-state">No products yet.</td>
-                </tr>
-              )}
+              <tr>
+                {storeLocations.map((location) => (
+                  <td key={location}>{group.byStore[location] || 0}</td>
+                ))}
+                {hasAllStores ? <td>{group.byStore[""] || 0}</td> : null}
+                <td><strong>{group.total}</strong></td>
+              </tr>
             </tbody>
           </table>
+        </div>
+
+        <div className="request-list">
+          {group.variants.map((product) => {
+            const stock = product.requiresImei ? product.imeis?.length || 0 : Number(product.quantity) || 0;
+            return (
+              <div className="request-row store-row" key={product.id}>
+                <div>
+                  <strong>{product.location || "All stores"}</strong>
+                  <p className="muted">
+                    {formatMoney(Number(product.price) || 0)} · {stock} in stock{product.requiresImei ? " · IMEI" : ""}
+                  </p>
+                </div>
+                <div className="store-row-actions">
+                  <button className="secondary-button compact-button" type="button" onClick={() => onRestock(product)}>
+                    Restock
+                  </button>
+                  <button className="secondary-button compact-button" type="button" onClick={() => onEdit(product)}>
+                    Edit
+                  </button>
+                  <button className="secondary-button compact-button" type="button" onClick={() => onDelete(product.id)}>
+                    Delete
+                  </button>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+
+        <div className="form-actions">
+          <button className="secondary-button" type="button" onClick={onClose}>Done</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function AdminPage({
+  employees,
+  reports,
+  notifications,
+  resetRequests,
+  orderHandlers,
+  storeLocations,
+  employeeLocations,
+  storeDevices,
+  storeTax,
+  onMarkResetHandled,
+  onResetPassword,
+  onAddOrderHandler,
+  onRemoveOrderHandler,
+  onAddStoreLocation,
+  onRemoveStoreLocation,
+  onUpdateStoreInfo,
+  onSetStoreDevice,
+  onSetStoreTaxRate,
+  onSetEmployeeLocation,
+  onRemoveEmployee,
+  onSyncName,
+  onUnsyncName,
+}) {
+  const emptyStore = { name: "", street: "", city: "", state: "", zip: "", hours: "" };
+  const [handlerForm, setHandlerForm] = useState({ name: "", phone: "", location: "" });
+  const [newStore, setNewStore] = useState(emptyStore);
+  const [editingStore, setEditingStore] = useState(null);
+
+  function taxFor(name) {
+    return (storeTax || []).find((entry) => entry?.name === name) || null;
+  }
+
+  function deviceFor(name) {
+    return (storeDevices || []).find((entry) => entry?.name === name)?.deviceId || "";
+  }
+
+  function locationFor(name) {
+    return (employeeLocations || []).find((entry) => entry?.name === name)?.location || "";
+  }
+
+  function editStore(location) {
+    const tax = taxFor(location) || {};
+    setNewStore({
+      name: location,
+      street: tax.street || "",
+      city: tax.city || "",
+      state: tax.state || "",
+      zip: tax.zip || "",
+      hours: tax.hours || "",
+    });
+    setEditingStore(location);
+  }
+
+  function cancelEditStore() {
+    setNewStore(emptyStore);
+    setEditingStore(null);
+  }
+  const activity = useMemo(() => {
+    return employees.map((employee) => {
+      const employeeReports = reports
+        .filter((report) => report.servedBy === employee)
+        .sort((left, right) => (toJsDate(right.createdAt)?.getTime() || 0) - (toJsDate(left.createdAt)?.getTime() || 0));
+      const totals = employeeReports.reduce(
+        (acc, report) => {
+          acc.amount += Number.parseFloat(report.paymentAmount || "0") || 0;
+          acc[report.type] += 1;
+          return acc;
+        },
+        { amount: 0, call: 0, sale: 0, repair: 0, sim: 0, rental: 0, phoneOrder: 0, return: 0 },
+      );
+      const lastReport = employeeReports[0];
+      return { employee, count: employeeReports.length, totals, lastReport };
+    });
+  }, [employees, reports]);
+
+  const sortedReports = [...reports].sort(
+    (left, right) => (toJsDate(right.createdAt)?.getTime() || 0) - (toJsDate(left.createdAt)?.getTime() || 0),
+  );
+
+  function updateHandlerField(name, value) {
+    setHandlerForm((current) => ({ ...current, [name]: value }));
+  }
+
+  function submitHandler(event) {
+    event.preventDefault();
+    onAddOrderHandler(handlerForm);
+    setHandlerForm({ name: "", phone: "", location: "" });
+  }
+
+  return (
+    <>
+      <section className="workspace admin-hero">
+        <div>
+          <p className="eyebrow">Admin</p>
+          <h2>Employee activity</h2>
+        </div>
+        <div className="summary-strip">
+          <span className="metric">Employees <strong>{employees.length}</strong></span>
+          <span className="metric">Total reports <strong>{reports.length}</strong></span>
+          <span className="metric">Reset requests <strong>{resetRequests.filter((item) => item.status !== "Handled").length}</strong></span>
+          <span className="metric">Queued notices <strong>{notifications.length}</strong></span>
+        </div>
+      </section>
+
+      <section className="history">
+        <div className="admin-grid">
+          {activity.map((item) => (
+            <article className="employee-card" key={item.employee}>
+              <div className="employee-card-head">
+                <div>
+                  <p className="eyebrow">Employee</p>
+                  <h3>{item.employee}</h3>
+                </div>
+                <button className="secondary-button" type="button" onClick={() => onResetPassword(item.employee)}>
+                  Reset password
+                </button>
+              </div>
+              <div className="employee-stats">
+                <span>Reports <strong>{item.count}</strong></span>
+                <span>Payments <strong>{formatMoney(item.totals.amount)}</strong></span>
+                <span>Calls <strong>{item.totals.call}</strong></span>
+                <span>Sales <strong>{item.totals.sale}</strong></span>
+                <span>Repairs <strong>{item.totals.repair}</strong></span>
+                <span>SIM <strong>{item.totals.sim}</strong></span>
+                <span>Rentals <strong>{item.totals.rental}</strong></span>
+                <span>Orders <strong>{item.totals.phoneOrder}</strong></span>
+              </div>
+              <p className="muted">
+                Last activity: {item.lastReport ? `${reportTypes[item.lastReport.type].label} on ${formatShortDate(item.lastReport.createdAt)}` : "No activity yet"}
+              </p>
+            </article>
+          ))}
         </div>
       </section>
 
       <section className="history">
         <div className="history-header">
           <div>
-            <p className="eyebrow">Stock</p>
-            <h2>Stock lookup</h2>
+            <p className="eyebrow">Team</p>
+            <h2>Manage employee accounts</h2>
           </div>
-          <input
-            className="pos-search"
-            value={lookup}
-            onChange={(event) => setLookup(event.target.value)}
-            placeholder="Search item, SKU, barcode"
-          />
         </div>
-        <p className="muted">How many of each item are in stock at every store.</p>
-        <div className="table-wrap catalog-table">
-          <table>
-            <thead>
-              <tr>
-                <th>Item</th>
+        <p className="muted">Create sign-in accounts, set each person's store, and control admin access.</p>
+        <EmployeeManager
+          storeLocations={storeLocations}
+          employeeLocations={employeeLocations}
+          onSyncName={onSyncName}
+          onUnsyncName={onUnsyncName}
+          onSetLocation={onSetEmployeeLocation}
+        />
+      </section>
+
+      <section className="history">
+        <div className="history-header">
+          <div>
+            <p className="eyebrow">Staff</p>
+            <h2>Assign employees to a store</h2>
+          </div>
+        </div>
+        <div className="request-list">
+          {employees.length ? employees.map((employee) => (
+            <div className="request-row" key={employee}>
+              <div>
+                <strong>{employee}</strong>
+                <p className="muted">POS sales are recorded at this store</p>
+              </div>
+              <select
+                className="status-select"
+                value={locationFor(employee)}
+                onChange={(event) => onSetEmployeeLocation(employee, event.target.value)}
+              >
+                <option value="">Default ({storeLocations[0] || "none"})</option>
                 {storeLocations.map((location) => (
-                  <th key={location}>{location}</th>
+                  <option key={location}>{location}</option>
                 ))}
-                {lookupHasAllStores ? <th>All stores</th> : null}
-                <th>Total</th>
-              </tr>
-            </thead>
-            <tbody>
-              {stockByItem.length ? (
-                stockByItem.map((item) => (
-                  <tr key={item.key}>
-                    <td>
-                      <strong>{item.name}</strong>
-                      {item.sku ? <p className="muted">{item.sku}</p> : null}
-                    </td>
-                    {storeLocations.map((location) => (
-                      <td key={location}>{item.byStore[location] || 0}</td>
-                    ))}
-                    {lookupHasAllStores ? <td>{item.byStore[""] || 0}</td> : null}
-                    <td><strong>{item.total}</strong></td>
-                  </tr>
-                ))
-              ) : (
-                <tr>
-                  <td colSpan={storeLocations.length + (lookupHasAllStores ? 3 : 2)} className="empty-state">
-                    No matching items.
-                  </td>
-                </tr>
-              )}
-            </tbody>
-          </table>
+              </select>
+              <button
+                className="secondary-button compact-button"
+                type="button"
+                onClick={() => {
+                  if (window.confirm(`Remove ${employee} from the staff list? This does not delete their sign-in account.`)) {
+                    onRemoveEmployee(employee);
+                  }
+                }}
+              >
+                Remove
+              </button>
+            </div>
+          )) : (
+            <p className="empty-state">No employees on the staff list yet.</p>
+          )}
         </div>
       </section>
 
@@ -5189,148 +5527,6 @@ function InventoryPage({
               </div>
             );
           })}
-        </div>
-      </section>
-
-      <section className="history">
-        <div className="history-header">
-          <div>
-            <p className="eyebrow">Staff</p>
-            <h2>Assign employees to a store</h2>
-          </div>
-        </div>
-        <div className="request-list">
-          {employees.map((employee) => (
-            <div className="request-row" key={employee}>
-              <div>
-                <strong>{employee}</strong>
-                <p className="muted">POS sales are recorded at this store</p>
-              </div>
-              <select
-                className="status-select"
-                value={locationFor(employee)}
-                onChange={(event) => onSetEmployeeLocation(employee, event.target.value)}
-              >
-                <option value="">Default ({storeLocations[0] || "none"})</option>
-                {storeLocations.map((location) => (
-                  <option key={location}>{location}</option>
-                ))}
-              </select>
-              <button
-                className="secondary-button compact-button"
-                type="button"
-                onClick={() => {
-                  if (window.confirm(`Remove ${employee} from the staff list? This does not delete their sign-in account.`)) {
-                    onRemoveEmployee(employee);
-                  }
-                }}
-              >
-                Remove
-              </button>
-            </div>
-          ))}
-        </div>
-      </section>
-
-      {restock ? (
-        <RestockDialog
-          product={restock}
-          storeLocations={storeLocations}
-          onClose={() => setRestock(null)}
-          onAddStock={(payload) => addStock(restock, payload)}
-        />
-      ) : null}
-    </>
-  );
-}
-
-function AdminPage({
-  employees,
-  reports,
-  notifications,
-  resetRequests,
-  orderHandlers,
-  onMarkResetHandled,
-  onResetPassword,
-  onAddOrderHandler,
-  onRemoveOrderHandler,
-}) {
-  const [handlerForm, setHandlerForm] = useState({ name: "", phone: "", location: "" });
-  const activity = useMemo(() => {
-    return employees.map((employee) => {
-      const employeeReports = reports
-        .filter((report) => report.servedBy === employee)
-        .sort((left, right) => (toJsDate(right.createdAt)?.getTime() || 0) - (toJsDate(left.createdAt)?.getTime() || 0));
-      const totals = employeeReports.reduce(
-        (acc, report) => {
-          acc.amount += Number.parseFloat(report.paymentAmount || "0") || 0;
-          acc[report.type] += 1;
-          return acc;
-        },
-        { amount: 0, call: 0, sale: 0, repair: 0, sim: 0, rental: 0, phoneOrder: 0, return: 0 },
-      );
-      const lastReport = employeeReports[0];
-      return { employee, count: employeeReports.length, totals, lastReport };
-    });
-  }, [employees, reports]);
-
-  const sortedReports = [...reports].sort(
-    (left, right) => (toJsDate(right.createdAt)?.getTime() || 0) - (toJsDate(left.createdAt)?.getTime() || 0),
-  );
-
-  function updateHandlerField(name, value) {
-    setHandlerForm((current) => ({ ...current, [name]: value }));
-  }
-
-  function submitHandler(event) {
-    event.preventDefault();
-    onAddOrderHandler(handlerForm);
-    setHandlerForm({ name: "", phone: "", location: "" });
-  }
-
-  return (
-    <>
-      <section className="workspace admin-hero">
-        <div>
-          <p className="eyebrow">Admin</p>
-          <h2>Employee activity</h2>
-        </div>
-        <div className="summary-strip">
-          <span className="metric">Employees <strong>{employees.length}</strong></span>
-          <span className="metric">Total reports <strong>{reports.length}</strong></span>
-          <span className="metric">Reset requests <strong>{resetRequests.filter((item) => item.status !== "Handled").length}</strong></span>
-          <span className="metric">Queued notices <strong>{notifications.length}</strong></span>
-        </div>
-      </section>
-
-      <section className="history">
-        <div className="admin-grid">
-          {activity.map((item) => (
-            <article className="employee-card" key={item.employee}>
-              <div className="employee-card-head">
-                <div>
-                  <p className="eyebrow">Employee</p>
-                  <h3>{item.employee}</h3>
-                </div>
-                <button className="secondary-button" type="button" onClick={() => onResetPassword(item.employee)}>
-                  Reset password
-                </button>
-              </div>
-              <div className="employee-stats">
-                <span>Reports <strong>{item.count}</strong></span>
-                <span>Payments <strong>{formatMoney(item.totals.amount)}</strong></span>
-                <span>Calls <strong>{item.totals.call}</strong></span>
-                <span>Sales <strong>{item.totals.sale}</strong></span>
-                <span>Repairs <strong>{item.totals.repair}</strong></span>
-                <span>SIM <strong>{item.totals.sim}</strong></span>
-                <span>Rentals <strong>{item.totals.rental}</strong></span>
-                <span>Orders <strong>{item.totals.phoneOrder}</strong></span>
-              </div>
-              <p className="muted">
-                Last activity: {item.lastReport ? `${reportTypes[item.lastReport.type].label} on ${formatShortDate(item.lastReport.createdAt)}` : "No activity yet"}
-              </p>
-            </article>
-          ))}
         </div>
       </section>
 
@@ -6014,7 +6210,7 @@ function CustomersPage({ customers, sessionRole, onSave, onRemove, onSync }) {
   );
 }
 
-function EmployeeDialog({ onClose, onSyncName, onUnsyncName, storeLocations, employeeLocations, onSetLocation }) {
+function EmployeeManager({ onSyncName, onUnsyncName, storeLocations, employeeLocations, onSetLocation }) {
   const stores = storeLocations || [];
   const [users, setUsers] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -6102,14 +6298,7 @@ function EmployeeDialog({ onClose, onSyncName, onUnsyncName, storeLocations, emp
   }
 
   return (
-    <div className="dialog-backdrop" role="presentation">
-      <div className="dialog-card dialog-card-wide" role="dialog" aria-modal="true" aria-labelledby="employee-dialog-title">
-        <div>
-          <p className="eyebrow">Team</p>
-          <h2 id="employee-dialog-title">Manage employees</h2>
-          <p className="muted">Create sign-in accounts and control who is an admin.</p>
-        </div>
-
+    <>
         <form className="form-grid dialog-form" onSubmit={createUser}>
           <label className="field">
             <span>Name</span>
@@ -6177,11 +6366,7 @@ function EmployeeDialog({ onClose, onSyncName, onUnsyncName, storeLocations, emp
           )}
         </div>
 
-        <div className="form-actions">
-          <button className="secondary-button" type="button" onClick={onClose}>Done</button>
-        </div>
-      </div>
-    </div>
+    </>
   );
 }
 

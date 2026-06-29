@@ -147,19 +147,36 @@ export function normalizeRcukSimNumber(value) {
   return digits;
 }
 
+// Plain 6-digit numeric ticket numbers (100001-999999) so customers can key
+// them into the IVR easily. We scan every existing repair to guarantee the new
+// number is not already taken, then take the next sequential value.
 export function generateRepairTicketNumber(reports) {
-  const today = new Date();
-  const datePart = [
-    today.getFullYear(),
-    String(today.getMonth() + 1).padStart(2, "0"),
-    String(today.getDate()).padStart(2, "0"),
-  ].join("");
-  const prefix = `DR-${datePart}`;
-  const todaysRepairCount = reports.filter((report) =>
-    report.type === "repair" && report.details?.ticketNumber?.startsWith(prefix),
-  ).length;
+  const used = new Set();
+  let max = 100000; // next number is at least 100001 — always 6 digits, no leading zeros
 
-  return `${prefix}-${String(todaysRepairCount + 1).padStart(4, "0")}`;
+  for (const report of reports || []) {
+    if (report?.type !== "repair") continue;
+    const digits = String(report.details?.ticketDigits || report.details?.ticketNumber || "").replace(/\D/g, "");
+    if (!digits) continue;
+    used.add(digits);
+    // Only let real 6-digit tickets advance the counter (ignore legacy formats).
+    if (digits.length <= 6) {
+      const value = Number.parseInt(digits, 10);
+      if (Number.isFinite(value) && value > max) max = value;
+    }
+  }
+
+  let candidate = max + 1;
+  while (used.has(String(candidate))) candidate += 1;
+
+  // Safety net: if we ever run past 6 digits, pick a random unused 6-digit number.
+  if (candidate > 999999) {
+    do {
+      candidate = 100000 + Math.floor(Math.random() * 900000);
+    } while (used.has(String(candidate)));
+  }
+
+  return String(candidate);
 }
 
 export function exportCsv(reports) {
