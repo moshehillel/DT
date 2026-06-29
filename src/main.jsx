@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
+import { createPortal } from "react-dom";
 import {
   ACTIVE_EMPLOYEE_KEY,
   COMPANY,
@@ -59,6 +60,8 @@ import {
   isSolaPaidStatus,
   normalizeRcukSimNumber,
   numberValue,
+  playScanBeep,
+  playScanError,
   toJsDate,
   uniqueValues,
 } from "./utils";
@@ -1211,27 +1214,44 @@ function LoginPage({ authError }) {
     }
   }
 
+  const features = [
+    { icon: "📞", title: "Calls", copy: "Log every customer call and follow-up." },
+    { icon: "🛒", title: "Sales", copy: "Track sales and payments as they happen." },
+    { icon: "🔧", title: "Repairs", copy: "Keep repair tickets moving to done." },
+    { icon: "📶", title: "SIM & activations", copy: "Manage new lines and port-ins." },
+  ];
+
   return (
     <main className="login-page">
       <section className="login-shell">
         <div className="login-aside">
-          <div className="brand">
-            <img className="brand-mark brand-logo" src="/logo.webp" alt="Diamant Telecom" />
-            <div>
-              <h1>Diamant Telecom</h1>
-              <p>Store reports</p>
+          <div className="login-aside-top">
+            <div className="brand">
+              <img className="brand-mark brand-logo" src="/logo.webp" alt="Diamant Telecom" />
+              <div>
+                <h1>Diamant Telecom</h1>
+                <p>Store reports</p>
+              </div>
+            </div>
+            <div className="login-aside-copy">
+              <p className="eyebrow">✦ Daily workspace</p>
+              <h2>Every call, sale, repair, and activation — <em>in one clean place.</em></h2>
             </div>
           </div>
-          <div className="login-aside-copy">
-            <p className="eyebrow">Daily workspace</p>
-            <h2>Capture every call, sale, repair, and activation in one clean place.</h2>
-          </div>
-          <div className="login-mini-grid">
-            <span>Calls</span>
-            <span>Sales</span>
-            <span>Repairs</span>
-            <span>SIM</span>
-          </div>
+
+          <ul className="login-feature-list">
+            {features.map((feature) => (
+              <li key={feature.title}>
+                <span className="login-feature-icon" aria-hidden="true">{feature.icon}</span>
+                <span className="login-feature-text">
+                  <strong>{feature.title}</strong>
+                  <span>{feature.copy}</span>
+                </span>
+              </li>
+            ))}
+          </ul>
+
+          <p className="login-aside-note">Secure store reporting for the Diamant Telecom team.</p>
         </div>
 
         <div className="login-panel">
@@ -1244,9 +1264,10 @@ function LoginPage({ authError }) {
           </div>
 
           <form className="login-form" onSubmit={handleSubmit}>
-            <div>
+            <div className="login-form-head">
               <p className="eyebrow">Sign in</p>
-              <h2>Sign in to your account</h2>
+              <h2>Welcome back</h2>
+              <p className="login-form-sub">Sign in to your account to continue.</p>
             </div>
 
             <label className="field">
@@ -1262,7 +1283,12 @@ function LoginPage({ authError }) {
             </label>
 
             <label className="field">
-              <span>Password</span>
+              <div className="field-label-row">
+                <span>Password</span>
+                <button className="link-button" type="button" onClick={handleForgotPassword}>
+                  Forgot password?
+                </button>
+              </div>
               <input
                 type="password"
                 value={password}
@@ -1273,11 +1299,8 @@ function LoginPage({ authError }) {
               />
             </label>
 
-            <button className="primary-button" type="submit" disabled={status === "signing-in"}>
+            <button className="primary-button login-submit" type="submit" disabled={status === "signing-in"}>
               {status === "signing-in" ? "Signing in…" : "Sign in"}
-            </button>
-            <button className="secondary-button" type="button" onClick={handleForgotPassword}>
-              Forgot password
             </button>
             {message ? <p className="summary-error">{message}</p> : null}
             {authError ? <p className="summary-error">Could not reach the sign-in service. Check your connection.</p> : null}
@@ -2166,15 +2189,25 @@ function RentalReportForm({ activeEmployee, customers, onSaveCustomerName, onSav
               <input value={form.imei} onChange={(event) => updateField("imei", event.target.value)} inputMode="numeric" autoComplete="off" spellCheck={false} placeholder="Scan or type 15-digit IMEI" />
             </label>
             <label className="field">
-              <span>SIM number</span>
-              <input inputMode="numeric" value={form.simNumber} onChange={(event) => updateField("simNumber", event.target.value)} />
+              <div className="field-label-row">
+                <span>SIM number</span>
+                {isRcukRental ? (
+                  <button
+                    className="sim-check-btn"
+                    type="button"
+                    onClick={checkSimWithRcuk}
+                    disabled={!normalizedSimNumber || simCheckState.status === "checking"}
+                  >
+                    {simCheckState.status === "checking" ? "Checking…" : "Check SIM"}
+                  </button>
+                ) : null}
+              </div>
+              <input
+                inputMode="numeric"
+                value={isRcukRental ? normalizedSimNumber : form.simNumber}
+                onChange={(event) => updateField("simNumber", event.target.value)}
+              />
             </label>
-            {isRcukRental ? (
-              <label className="field">
-                <span>SIM sent to RCUK</span>
-                <input value={normalizedSimNumber} readOnly disabled />
-              </label>
-            ) : null}
           </div>
 
           <div className="form-grid">
@@ -2252,9 +2285,6 @@ function RentalReportForm({ activeEmployee, customers, onSaveCustomerName, onSav
               <>
                 <button className="primary-button" type="button" onClick={submitRentalToRcuk} disabled={!canSubmitRental || submitState.status === "submitting"}>
                   Submit rental
-                </button>
-                <button className="secondary-button" type="button" onClick={checkSimWithRcuk} disabled={!normalizedSimNumber || simCheckState.status === "checking"}>
-                  Check SIM
                 </button>
                 <button className="secondary-button" type="button" onClick={getRentalNumbers} disabled={!submitState.rentalId || submitState.status === "getting-numbers"}>
                   Get numbers
@@ -3041,9 +3071,11 @@ function PhoneOrderPage({ activeEmployee, sessionRole, phoneOrders, orderHandler
     event.preventDefault();
     const product = findProductBySku(scan);
     if (!product) {
+      playScanError();
       setMessage(`No product matches "${scan.trim()}".`);
       return;
     }
+    playScanBeep();
     addProductToCart(product);
     setMessage(`Added ${product.name}.`);
     setScan("");
@@ -3577,8 +3609,10 @@ function PosPage({ products, activeEmployee, activeLocation, activeDeviceId, act
     if (!term) return;
     const product = findProductBySku(term);
     if (!product) {
+      playScanError();
       setMessage(`No product found for "${term}".`);
     } else {
+      playScanBeep();
       addProductToCart(product);
       setMessage(`Added ${product.name}.`);
     }
@@ -4060,10 +4094,16 @@ function CustomerInfoDialog({ phone, customer, onSave, onSkip, onClose }) {
 
   function submit(event) {
     event.preventDefault();
+    // Stop the submit from bubbling (through React's portal tree) to any parent
+    // report/order form, which would otherwise also fire its own submit.
+    event.stopPropagation();
     onSave({ name, mobile, address });
   }
 
-  return (
+  // Rendered through a portal so the dialog's <form> is never nested inside the
+  // parent report/order form. Nested forms make the browser submit the outer
+  // form instead — which skips this dialog's save and reloads the app.
+  return createPortal(
     <div className="dialog-backdrop" role="presentation" onMouseDown={onClose}>
       <div className="dialog-card" role="dialog" aria-modal="true" onMouseDown={(event) => event.stopPropagation()}>
         <h2>{isNew ? "Add new customer" : "Complete customer details"}</h2>
@@ -4083,7 +4123,8 @@ function CustomerInfoDialog({ phone, customer, onSave, onSkip, onClose }) {
           </div>
         </form>
       </div>
-    </div>
+    </div>,
+    document.body,
   );
 }
 

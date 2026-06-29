@@ -8,6 +8,53 @@ export function readJson(key, fallback) {
   }
 }
 
+// --- Scanner feedback sounds -------------------------------------------------
+// Synthesised with the Web Audio API so there's no audio file to ship and it
+// works fully offline. A shared AudioContext is created lazily; browsers keep
+// it suspended until a user gesture, so we resume() on each play (the scanner's
+// Enter keystroke counts as a gesture).
+let sharedAudioCtx = null;
+function getAudioCtx() {
+  if (typeof window === "undefined") return null;
+  const Ctx = window.AudioContext || window.webkitAudioContext;
+  if (!Ctx) return null;
+  if (!sharedAudioCtx) sharedAudioCtx = new Ctx();
+  return sharedAudioCtx;
+}
+
+function playTone({ frequency, duration = 0.12, type = "square", volume = 0.18, slideTo }) {
+  const ctx = getAudioCtx();
+  if (!ctx) return;
+  try {
+    if (ctx.state === "suspended") ctx.resume();
+    const now = ctx.currentTime;
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = type;
+    osc.frequency.setValueAtTime(frequency, now);
+    if (slideTo) osc.frequency.exponentialRampToValueAtTime(slideTo, now + duration);
+    gain.gain.setValueAtTime(0.0001, now);
+    gain.gain.exponentialRampToValueAtTime(volume, now + 0.008);
+    gain.gain.exponentialRampToValueAtTime(0.0001, now + duration);
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.start(now);
+    osc.stop(now + duration + 0.02);
+  } catch {
+    /* audio is best-effort; never block a scan on it */
+  }
+}
+
+// Crisp confirmation beep when an item is successfully scanned in.
+export function playScanBeep() {
+  playTone({ frequency: 880, duration: 0.1, volume: 0.2 });
+}
+
+// Lower, descending buzz when a scan doesn't match anything.
+export function playScanError() {
+  playTone({ frequency: 320, slideTo: 180, duration: 0.28, volume: 0.2 });
+}
+
 export function createEmptyFilters() {
   return {
     query: "",
