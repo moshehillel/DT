@@ -2963,6 +2963,7 @@ function PhoneOrderPage({ activeEmployee, sessionRole, phoneOrders, orderHandler
     customerName: "",
     customerPhone: "",
     contactDetails: "",
+    customerAddress: "",
     deliveryAddress: "",
     paymentStatus: "Paid",
     paymentMethod: "Cash",
@@ -2983,6 +2984,8 @@ function PhoneOrderPage({ activeEmployee, sessionRole, phoneOrders, orderHandler
       customerPhone: customer.phone || current.customerPhone,
       customerName: customer.name || current.customerName,
       contactDetails: customer.contactDetails || current.contactDetails,
+      // The on-file address always reflects the selected customer.
+      customerAddress: customer.address || current.customerAddress,
       // Pre-fill delivery with the on-file address as a convenience; the employee
       // can change it if this order ships somewhere else.
       deliveryAddress: current.deliveryAddress || customer.address || "",
@@ -3174,7 +3177,7 @@ function PhoneOrderPage({ activeEmployee, sessionRole, phoneOrders, orderHandler
 
   function createOrder(matchedCustomer) {
     const phoneLine = cart.find((line) => line.requiresImei && line.imei);
-    const onFileAddress = matchedCustomer?.address || form.deliveryAddress.trim();
+    const onFileAddress = form.customerAddress.trim() || matchedCustomer?.address || form.deliveryAddress.trim();
     const order = {
       id: crypto.randomUUID(),
       type: "phoneOrder",
@@ -3227,6 +3230,7 @@ function PhoneOrderPage({ activeEmployee, sessionRole, phoneOrders, orderHandler
       customerName: "",
       customerPhone: "",
       contactDetails: "",
+      customerAddress: "",
       deliveryAddress: "",
       notes: "",
     }));
@@ -3317,8 +3321,13 @@ function PhoneOrderPage({ activeEmployee, sessionRole, phoneOrders, orderHandler
             <input value={form.contactDetails} onChange={(event) => updateField("contactDetails", event.target.value)} placeholder="Email, WhatsApp, alternate phone" />
           </label>
           <label className="field">
+            <span>Customer address (on file)</span>
+            <input value={form.customerAddress} onChange={(event) => updateField("customerAddress", event.target.value)} placeholder="Auto-filled from the customer" />
+          </label>
+          <label className="field full">
             <span>Delivery address</span>
             <input value={form.deliveryAddress} onChange={(event) => updateField("deliveryAddress", event.target.value)} placeholder="Where to deliver this order" required />
+            <small className="muted">Defaults to the customer address — change it if delivering somewhere else.</small>
           </label>
         </div>
 
@@ -4303,7 +4312,13 @@ function printPhoneOrderReceipt(order) {
     .barcode svg { max-width: 100%; height: 56px; }
     .barcode-text { font-size: 11px; letter-spacing: 2px; margin-top: 2px; }`;
   const customerBlock = receiptCustomerHtml(order.customerName, order.customerPhone, "", "");
-  const deliverBlock = `<div class="deliver"><strong>Deliver to:</strong>${escapeHtml(order.deliveryAddress || order.address || "-")}</div>`;
+  const deliverTo = order.deliveryAddress || order.address || "-";
+  const onFile = (order.address || "").trim();
+  // Show the on-file customer address too when the delivery address differs.
+  const onFileLine = onFile && onFile !== (order.deliveryAddress || "").trim()
+    ? `<div class="deliver"><strong>Customer address:</strong>${escapeHtml(onFile)}</div>`
+    : "";
+  const deliverBlock = `${onFileLine}<div class="deliver"><strong>Deliver to:</strong>${escapeHtml(deliverTo)}</div>`;
   const body = `
     ${receiptHeaderHtml(location, order.storeAddress)}
     <div class="divider"></div>
