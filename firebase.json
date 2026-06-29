@@ -7,6 +7,16 @@
       "**/node_modules/**"
     ],
     "rewrites": [
+      { "source": "/api/notifyPhoneOrderAssigned", "function": { "functionId": "notifyPhoneOrderAssigned", "region": "us-central1" } },
+      { "source": "/api/notifyPhoneOrderDelivered", "function": { "functionId": "notifyPhoneOrderDelivered", "region": "us-central1" } },
+      { "source": "/api/rcukAddRental", "function": { "functionId": "rcukAddRental", "region": "us-central1" } },
+      { "source": "/api/rcukCheckSim", "function": { "functionId": "rcukCheckSim", "region": "us-central1" } },
+      { "source": "/api/rcukGetRental", "function": { "functionId": "rcukGetRental", "region": "us-central1" } },
+      { "source": "/api/solaCreateCharge", "function": { "functionId": "solaCreateCharge", "region": "us-central1" } },
+      { "source": "/api/solaDeviceSale", "function": { "functionId": "solaDeviceSale", "region": "us-central1" } },
+      { "source": "/api/solaDeviceResult", "function": { "functionId": "solaDeviceResult", "region": "us-central1" } },
+      { "source": "/api/solaRefund", "function": { "functionId": "solaRefund", "region": "us-central1" } },
+      { "source": "/api/telebroadCallRecording", "function": { "functionId": "telebroadCallRecording", "region": "us-central1" } },
       {
         "source": "**",
         "destination": "/index.html"

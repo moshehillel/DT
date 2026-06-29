@@ -447,8 +447,21 @@ async function sendSms({ to, body }) {
     message: body,
   });
 
-  const response = await fetch(url, options);
-  const text = await response.text();
+  // Guard the call with a timeout so a slow/unreachable Telebroad response can
+  // never hang the whole function until its 60s kill (which would drop CORS
+  // headers and fail the browser request). 15s is plenty for an SMS POST.
+  let response;
+  let text;
+  try {
+    response = await fetch(url, { ...options, signal: AbortSignal.timeout(15000) });
+    text = await response.text();
+  } catch (error) {
+    const reason = error && (error.name === "TimeoutError" || error.name === "AbortError")
+      ? "request timed out"
+      : (error && error.message) || "network error";
+    return { status: "Failed", detail: `Telebroad SMS: ${reason}` };
+  }
+
   let data;
   try {
     data = text ? JSON.parse(text) : {};
