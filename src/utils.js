@@ -290,6 +290,20 @@ export function isSameArray(left, right) {
   return JSON.stringify(left) === JSON.stringify(right);
 }
 
+// Union of two string lists, preserving the cloud order first. Used so syncing
+// the employees name-list can only ever ADD names, never drop ones another
+// device already recorded.
+export function unionStrings(local, cloud) {
+  const seen = new Set();
+  const result = [];
+  for (const name of [...(cloud || []), ...(local || [])]) {
+    if (typeof name !== "string" || seen.has(name)) continue;
+    seen.add(name);
+    result.push(name);
+  }
+  return result;
+}
+
 export function calculateInclusiveDays(startDate, endDate) {
   if (!startDate || !endDate) return 0;
   const start = new Date(`${startDate}T00:00:00`);

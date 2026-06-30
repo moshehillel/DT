@@ -1,0 +1,16 @@
+{
+  "name": "Diamant Telecom Reports",
+  "short_name": "Diamant Telecom",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0b1f3a",
+  "theme_color": "#0b1f3a",
+  "icons": [
+    {
+      "src": "/app-icon.webp",
+      "type": "image/webp",
+      "sizes": "any",
+      "purpose": "any"
+    }
+  ]
+}

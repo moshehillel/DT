@@ -37,6 +37,7 @@ import {
   signInWithEmail,
   signOutUser,
   subscribeAuth,
+  subscribeCloudStatus,
 } from "./firebaseClient";
 import { refundToCard } from "./solaTerminal";
 import { chargeOnLocalTerminal } from "./bbposTerminal";
@@ -66,6 +67,7 @@ import {
   playScanError,
   titleCaseName,
   toJsDate,
+  unionStrings,
   uniqueValues,
 } from "./utils";
 import "./styles.css";
@@ -105,7 +107,9 @@ function Workspace({ currentUser, isAdmin }) {
   const employeeName = currentUser?.displayName || currentUser?.email || "";
   const sessionRole = isAdmin ? "admin" : "employee";
   const [activeType, setActiveType] = useState(defaultManualReportType);
-  const [employees, setEmployees] = useCloudDocumentState("employees", EMPLOYEE_KEY, defaultEmployees);
+  const [employees, setEmployees] = useCloudDocumentState("employees", EMPLOYEE_KEY, defaultEmployees, {
+    merge: unionStrings,
+  });
   const [reports, setReports] = useCloudCollectionState("reports", STORAGE_KEY, []);
   const [pendingReports, setPendingReports] = useCloudCollectionState("pendingReports", PENDING_REPORTS_KEY, []);
   const [phoneOrders, setPhoneOrders] = useCloudCollectionState("phoneOrders", PHONE_ORDERS_KEY, []);
@@ -124,6 +128,8 @@ function Workspace({ currentUser, isAdmin }) {
     isAdmin ? localStorage.getItem(ACTIVE_EMPLOYEE_KEY) || employeeName || employees[0] || "" : employeeName,
   );
   const [activeView, setActiveView] = useState(isAdmin ? "admin" : "pos");
+  // null = still checking, true = reaching the cloud, false = blocked/offline.
+  const [cloudOnline, setCloudOnline] = useState(null);
   const [filters, setFilters] = useState(createEmptyFilters);
   const [formNonce, setFormNonce] = useState(0);
   const [returnTarget, setReturnTarget] = useState(null);
@@ -149,6 +155,8 @@ function Workspace({ currentUser, isAdmin }) {
   useEffect(() => {
     if (isAdmin) localStorage.setItem(ACTIVE_EMPLOYEE_KEY, activeEmployee);
   }, [activeEmployee, isAdmin]);
+
+  useEffect(() => subscribeCloudStatus(setCloudOnline), []);
 
   // Warn before a manual refresh: a cold reload re-reads data from the database,
   // and refreshing often adds up to extra read charges. The app already syncs
@@ -1117,6 +1125,11 @@ function Workspace({ currentUser, isAdmin }) {
       />
 
       <main className="main">
+        {cloudOnline === false ? (
+          <div className="cloud-offline-banner" role="alert">
+            ⚠️ Can't reach the cloud — changes you make now are <strong>not being saved</strong> and won't sync to other devices. Check the internet/filter and reload before editing.
+          </div>
+        ) : null}
         <div className="topbar">
           <div>
             <p className="eyebrow">Signed in</p>
@@ -1602,7 +1615,10 @@ function Sidebar({
 function buildInitialFieldValues(config) {
   const values = {};
   (config.fields || []).forEach((field) => {
-    values[field.name] = field.type === "select" && field.options ? field.options[0] : "";
+    // A select with a placeholder starts empty (an unselected "prompt" option);
+    // otherwise it defaults to its first real option.
+    values[field.name] =
+      field.type === "select" && field.options && !field.placeholder ? field.options[0] : "";
   });
   return values;
 }
@@ -1668,6 +1684,23 @@ function ReportForm({ activeType, activeEmployee, reports, customers, activeStor
     });
 
     if (activeType === "repair") {
+      // Require a status choice (it now defaults to the unselected "Select one").
+      if (!details.status) {
+        window.alert("Choose a repair status before saving.");
+        return;
+      }
+      // Intake ("Received") means the phone is in hand: capture what we need to
+      // identify it and label it before it goes on the shelf.
+      if (details.status === "Received") {
+        const missing = [];
+        if (!details.model) missing.push("phone model");
+        if (!details.damage) missing.push("what is damaged");
+        if (!details.imei) missing.push("phone IMEI");
+        if (missing.length) {
+          window.alert(`Before receiving the phone, add: ${missing.join(", ")}.`);
+          return;
+        }
+      }
       details.ticketNumber = generateRepairTicketNumber(reports);
       details.ticketDigits = digitsOnly(details.ticketNumber);
     }
@@ -1702,6 +1735,8 @@ function ReportForm({ activeType, activeEmployee, reports, customers, activeStor
 
     onSave(savedReport);
     if (activeType === "repair") {
+      // Small label to stick on the phone, then the full customer ticket.
+      printRepairPhoneLabel(savedReport);
       printRepairTicket(savedReport);
     }
   }
@@ -1795,7 +1830,8 @@ function DynamicField({ field, onValueChange }) {
     return (
       <label className="field">
         <span>{field.label}</span>
-        <select name={field.name} defaultValue={field.options[0]} onChange={handleChange}>
+        <select name={field.name} defaultValue={field.placeholder ? "" : field.options[0]} onChange={handleChange}>
+          {field.placeholder ? <option value="">{field.placeholder}</option> : null}
           {field.options.map((option) => (
             <option key={option}>{option}</option>
           ))}
@@ -4939,6 +4975,32 @@ function printPhoneOrderReceipt(order) {
 }
 
 // Prints a repair drop-off ticket with the generated ticket number.
+// Prints a compact label to stick on the received phone: ticket number, who it
+// belongs to, the device, and what's wrong with it. Companion to the full
+// customer ticket below.
+function printRepairPhoneLabel(report) {
+  const details = report.details || {};
+  const customer = [details.customerName, report.customerPhone].filter(Boolean).join(" · ");
+
+  const css = `
+    .eyebrow { text-align: center; font-size: 11px; text-transform: uppercase; letter-spacing: 1px; }
+    .ticket { text-align: center; font-size: 26px; font-weight: 800; margin: 4px 0; letter-spacing: 1px; }
+    .who { text-align: center; font-size: 12.5px; font-weight: 700; }
+    .row { font-size: 12.5px; margin: 2px 0; }
+    .row strong { display: inline-block; min-width: 52px; }
+    .issue { font-size: 14px; font-weight: 800; margin-top: 4px; }`;
+  const body = `
+    <div class="eyebrow">Repair — stick on phone</div>
+    <div class="ticket">${escapeHtml(details.ticketNumber || "")}</div>
+    ${customer ? `<div class="who">${escapeHtml(customer)}</div>` : ""}
+    <div class="divider"></div>
+    ${details.model ? `<div class="row"><strong>Model</strong> ${escapeHtml(details.model)}</div>` : ""}
+    ${details.imei ? `<div class="row"><strong>IMEI</strong> ${escapeHtml(details.imei)}</div>` : ""}
+    ${details.damage ? `<div class="issue">Issue: ${escapeHtml(details.damage)}</div>` : ""}`;
+
+  openThermalReceipt(`Repair label ${details.ticketNumber || ""}`, css, body);
+}
+
 function printRepairTicket(report) {
   const details = report.details || {};
   const createdAt = (toJsDate(report.createdAt) || new Date()).toLocaleString();
@@ -4947,6 +5009,7 @@ function printRepairTicket(report) {
   const rowsSource = [
     ["Phone", report.customerPhone],
     ["Model", details.model],
+    ["IMEI", details.imei],
     ["Issue", details.damage],
     ["Paid", details.paymentStatus],
     ["Expected ready", details.dueDate],

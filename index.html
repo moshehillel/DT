@@ -3,7 +3,12 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <link rel="icon" type="image/webp" href="/logo.webp" />
+    <!-- Browser tab + installed-shortcut/taskbar icon use the web banner.
+         The in-app logo (receipts, header) stays /logo.webp. -->
+    <link rel="icon" type="image/webp" href="/app-icon.webp" />
+    <link rel="apple-touch-icon" href="/app-icon.webp" />
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <meta name="theme-color" content="#0b1f3a" />
     <title>Diamant Telecom Reports</title>
   </head>
   <body>

@@ -68,6 +68,45 @@ async function getFirebase() {
   return firebasePromise;
 }
 
+// --- Cloud reachability ------------------------------------------------------
+// Tracks whether Firestore's server is actually reachable so the UI can warn
+// staff that their edits aren't saving (e.g. a content filter silently blocking
+// firestore.googleapis.com). `online` is null until we know, true once a live
+// server snapshot arrives, false on a listener error or if the first server
+// snapshot never shows up.
+const cloudStatus = { online: null, listeners: new Set() };
+let connectivityTimer = null;
+
+function setCloudOnline(online) {
+  if (online === true && connectivityTimer) {
+    clearTimeout(connectivityTimer);
+    connectivityTimer = null;
+  }
+  if (cloudStatus.online === online) return;
+  cloudStatus.online = online;
+  cloudStatus.listeners.forEach((listener) => listener(online));
+}
+
+function armConnectivityTimeout() {
+  if (connectivityTimer || cloudStatus.online === true) return;
+  connectivityTimer = setTimeout(() => {
+    connectivityTimer = null;
+    if (cloudStatus.online !== true) setCloudOnline(false);
+  }, 12000);
+}
+
+export function subscribeCloudStatus(listener) {
+  cloudStatus.listeners.add(listener);
+  listener(cloudStatus.online);
+  return () => cloudStatus.listeners.delete(listener);
+}
+
+// A snapshot served purely from the local cache (never confirmed by the server)
+// means we're offline; one confirmed by the server means we're online.
+function reportSnapshotStatus(snapshot) {
+  if (!snapshot.metadata.fromCache) setCloudOnline(true);
+}
+
 let offlineLogged = false;
 
 // Collapses the "no Firebase config" case into a single friendly message, while
@@ -174,11 +213,17 @@ export function watchCollection(collectionName, onItems, onError) {
       if (cancelled) return;
       unsubscribe = onSnapshot(
         collection(db, collectionName),
+        { includeMetadataChanges: true },
         (snapshot) => {
+          reportSnapshotStatus(snapshot);
           onItems(snapshot.docs.map((item) => normalizeFirestoreDoc(item.id, item.data())));
         },
-        onError,
+        (error) => {
+          setCloudOnline(false);
+          onError(error);
+        },
       );
+      armConnectivityTimeout();
     })
     .catch(onError);
 
@@ -198,11 +243,17 @@ export function watchAppStateDocument(documentId, fallback, onValue, onError) {
       if (cancelled) return;
       unsubscribe = onSnapshot(
         doc(db, "appState", documentId),
+        { includeMetadataChanges: true },
         (snapshot) => {
+          reportSnapshotStatus(snapshot);
           onValue(snapshot.exists() ? snapshot.data().items || fallback : fallback);
         },
-        onError,
+        (error) => {
+          setCloudOnline(false);
+          onError(error);
+        },
       );
+      armConnectivityTimeout();
     })
     .catch(onError);
 

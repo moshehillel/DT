@@ -232,7 +232,10 @@ export const reportTypes = {
     fields: [
       { name: "model", label: "Phone model", placeholder: "Start typing a model…", suggestions: repairPhoneModels },
       { name: "damage", label: "What is damaged?", placeholder: "Start typing a repair…", suggestions: repairDamageTypes },
-      { name: "status", label: "Repair status", type: "select", options: repairStatuses },
+      { name: "status", label: "Repair status", type: "select", options: repairStatuses, placeholder: "Select one" },
+      // The phone IMEI is captured once the device is in hand. Required when the
+      // status is "Received" (see ReportForm's submit validation).
+      { name: "imei", label: "Phone IMEI", placeholder: "Scan or type 15-digit IMEI", showIf: { field: "status", equals: "Received" } },
       { name: "paymentStatus", label: "Repair paid?", type: "select", options: ["Not paid", "Paid"] },
       { name: "notificationPreference", label: "When ready notify by", type: "select", options: ["Text message", "Phone call", "Both"] },
       { name: "dueDate", label: "Expected ready date", type: "date" },
