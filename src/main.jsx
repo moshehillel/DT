@@ -466,6 +466,7 @@ function Workspace({ currentUser, isAdmin }) {
 
   function saveProduct(product) {
     const id = product.id || crypto.randomUUID();
+    const existing = products.find((item) => item.id === id);
     const requiresImei = Boolean(product.requiresImei);
     const imeis = requiresImei
       ? [
@@ -488,6 +489,9 @@ function Workspace({ currentUser, isAdmin }) {
       barcode: String(product.barcode || "").trim(),
       name: String(product.name || "").trim(),
       price: String(product.price ?? "").trim(),
+      cost: sessionRole === "admin"
+        ? String(product.cost ?? "").trim()
+        : String(existing?.cost ?? "").trim(),
       category: product.category || productCategories[0],
       requiresImei,
       location: product.location || "",
@@ -627,12 +631,25 @@ function Workspace({ currentUser, isAdmin }) {
       address: order.address,
       contactDetails: order.contactDetails,
     });
+    // The call-taker only routes the order to a store. Inventory is drawn down
+    // and the customer/handler are notified later, once the store fulfills the
+    // order (markOrderReady) and assigns a driver (assignOrderDriver).
     setPhoneOrders((current) => [enrichedOrder, ...current]);
-    // Scanned products are now sold/committed, so draw them down from inventory
-    // exactly like a POS sale (remove sold IMEIs, decrement plain stock).
+    setFormNonce((value) => value + 1);
+  }
+
+  // Store fulfillment: the store has scanned the IMEIs (if any) and charged the
+  // card (if CC), so commit the inventory and mark the order ready for a driver.
+  function markOrderReady(orderId, patch = {}) {
+    const order = phoneOrders.find((item) => item.id === orderId);
+    if (!order) return;
+    const lineItems = patch.lineItems || order.lineItems || [];
+
+    // Draw the sold units down from inventory exactly like a POS sale (remove
+    // the scanned IMEIs, decrement plain stock).
     setProducts((current) =>
       current.map((product) => {
-        const lines = (order.lineItems || []).filter((line) => line.productId === product.id);
+        const lines = lineItems.filter((line) => line.productId === product.id);
         if (!lines.length) return product;
         if (product.requiresImei) {
           const soldImeis = new Set(lines.map((line) => line.imei).filter(Boolean));
@@ -645,8 +662,71 @@ function Workspace({ currentUser, isAdmin }) {
         return { ...product, quantity: nextQuantity, updatedAt: new Date().toISOString() };
       }),
     );
-    queuePhoneOrderAssignedNotifications(enrichedOrder);
-    setFormNonce((value) => value + 1);
+
+    const phoneLine = lineItems.find((line) => line.requiresImei && line.imei);
+    setPhoneOrders((current) =>
+      current.map((item) =>
+        item.id === orderId
+          ? {
+            ...item,
+            ...patch,
+            lineItems,
+            imei: phoneLine?.imei || item.imei || "",
+            itemsText: lineItems
+              .map((line) => `${line.qty}x ${line.name}${line.imei ? ` (IMEI ${line.imei})` : ""}`)
+              .join(", "),
+            status: "Ready",
+            readyBy: activeEmployee,
+            readyAt: new Date().toISOString(),
+          }
+          : item,
+      ),
+    );
+  }
+
+  // Store hands the ready order to a driver: record the driver, flip to "Out for
+  // delivery", and fire the customer + handler texts (notifyPhoneOrderAssigned).
+  function assignOrderDriver(orderId, handler) {
+    const order = phoneOrders.find((item) => item.id === orderId);
+    if (!order || !handler) return;
+    const updated = {
+      ...order,
+      assignedTo: handler.name,
+      assignedPhone: handler.phone || "",
+      status: "Out for delivery",
+      assignedAt: new Date().toISOString(),
+      assignedBy: activeEmployee,
+    };
+    setPhoneOrders((current) => current.map((item) => (item.id === orderId ? updated : item)));
+    queuePhoneOrderAssignedNotifications(updated);
+  }
+
+  // Cancel a phone order and drop it from the pipeline. If the store had already
+  // committed stock (Ready / Out for delivery), put the units back on the shelf.
+  function cancelPhoneOrder(orderId) {
+    const order = phoneOrders.find((item) => item.id === orderId);
+    if (!order) return;
+    const committed = order.status === "Ready" || order.status === "Out for delivery";
+    if (committed) {
+      setProducts((current) =>
+        current.map((product) => {
+          const lines = (order.lineItems || []).filter((line) => line.productId === product.id);
+          if (!lines.length) return product;
+          if (product.requiresImei) {
+            const returned = lines
+              .map((line) => line.imei)
+              .filter(Boolean)
+              .filter((imei) => !(product.imeis || []).includes(imei));
+            if (!returned.length) return product;
+            const imeis = [...(product.imeis || []), ...returned];
+            return { ...product, imeis, quantity: imeis.length, updatedAt: new Date().toISOString() };
+          }
+          const qty = lines.reduce((total, line) => total + (Number(line.qty) || 0), 0);
+          return { ...product, quantity: (Number(product.quantity) || 0) + qty, updatedAt: new Date().toISOString() };
+        }),
+      );
+    }
+    setPhoneOrders((current) => current.filter((item) => item.id !== orderId));
   }
 
   async function completePhoneOrder(orderId) {
@@ -1091,6 +1171,8 @@ function Workspace({ currentUser, isAdmin }) {
               key={`${activeType}-${formNonce}`}
               activeEmployee={activeEmployee}
               sessionRole={sessionRole}
+              activeLocation={activeLocation}
+              storeLocations={storeLocations}
               phoneOrders={phoneOrders}
               orderHandlers={orderHandlers}
               storeTax={storeTax}
@@ -1100,6 +1182,9 @@ function Workspace({ currentUser, isAdmin }) {
               onSaveCustomerName={saveCustomerName}
               onSaveCustomer={saveCustomer}
               onCreate={createPhoneOrder}
+              onMarkReady={markOrderReady}
+              onAssignDriver={assignOrderDriver}
+              onCancel={cancelPhoneOrder}
               onDelivered={completePhoneOrder}
             />
           ) : (
@@ -3149,11 +3234,10 @@ function PendingReportCard({ pendingReport, activeEmployee, customers, onSaveCus
   );
 }
 
-function PhoneOrderPage({ activeEmployee, sessionRole, phoneOrders, orderHandlers, storeTax, storeDevices, products, customers, onSaveCustomerName, onSaveCustomer, onCreate, onDelivered }) {
+function PhoneOrderPage({ activeEmployee, sessionRole, activeLocation, storeLocations, phoneOrders, orderHandlers, storeTax, storeDevices, products, customers, onSaveCustomerName, onSaveCustomer, onCreate, onMarkReady, onAssignDriver, onCancel, onDelivered }) {
   const [outOfState, setOutOfState] = useState(false);
   const [form, setForm] = useState({
-    location: orderHandlers[0]?.location || "",
-    assignedTo: orderHandlers[0]?.name || "",
+    location: activeLocation || (storeLocations || [])[0] || "",
     customerName: "",
     customerPhone: "",
     contactDetails: "",
@@ -3165,10 +3249,9 @@ function PhoneOrderPage({ activeEmployee, sessionRole, phoneOrders, orderHandler
   });
   const [cart, setCart] = useState([]);
   const [scan, setScan] = useState("");
+  const [productSearch, setProductSearch] = useState("");
   const [scanMode, setScanMode] = useState(true);
   const [message, setMessage] = useState("");
-  const [cardEntryMode, setCardEntryMode] = useState("terminal");
-  const [card, setCard] = useState({ status: "idle", message: "", refNum: "" });
   const [customerPrompt, setCustomerPrompt] = useState(null);
   const scanRef = useRef(null);
 
@@ -3186,27 +3269,17 @@ function PhoneOrderPage({ activeEmployee, sessionRole, phoneOrders, orderHandler
     }));
   }
 
-  useEffect(() => {
-    if (!orderHandlers.length) return;
-    setForm((current) => {
-      if (current.location && current.assignedTo) return current;
-      const firstHandler = orderHandlers[0];
-      return {
-        ...current,
-        location: current.location || firstHandler.location || "",
-        assignedTo: current.assignedTo || firstHandler.name || "",
-      };
-    });
-  }, [orderHandlers]);
+  const isAdmin = sessionRole === "admin";
+  const locations = uniqueValues([...(storeLocations || []), ...orderHandlers.map((handler) => handler.location)]);
 
-  const locations = uniqueValues(orderHandlers.map((handler) => handler.location));
-  const locationHandlers = orderHandlers.filter((handler) => handler.location === form.location);
-  const selectedHandler = orderHandlers.find((handler) => handler.name === form.assignedTo && handler.location === form.location)
-    || locationHandlers[0]
-    || null;
-  const visibleOrders = sessionRole === "admin"
-    ? phoneOrders
-    : phoneOrders.filter((order) => order.assignedTo === activeEmployee);
+  // An employee runs each pipeline stage for the store they are signed in at;
+  // admins see every store. Orders move: At store -> Ready -> Out for delivery.
+  const atMyStore = (order) => isAdmin || order.location === activeLocation;
+  const fulfillmentOrders = phoneOrders.filter((order) => order.status === "At store" && atMyStore(order));
+  const readyOrders = phoneOrders.filter((order) => order.status === "Ready" && atMyStore(order));
+  const deliveryOrders = phoneOrders.filter(
+    (order) => order.status === "Out for delivery" && (atMyStore(order) || order.assignedTo === activeEmployee),
+  );
 
   const availableProducts = useMemo(
     () => products
@@ -3218,6 +3291,40 @@ function PhoneOrderPage({ activeEmployee, sessionRole, phoneOrders, orderHandler
     () => Object.fromEntries(products.map((product) => [product.id, product])),
     [products],
   );
+
+  function productHaystack(product) {
+    return [product.name, product.sku, product.barcode, product.category]
+      .filter(Boolean)
+      .join(" ")
+      .toLowerCase();
+  }
+
+  function findProductsByTerm(term) {
+    const clean = String(term || "").trim().toLowerCase();
+    if (!clean) return [];
+    const exact = availableProducts.filter((product) => {
+      const sku = String(product.sku || "").trim().toLowerCase();
+      const barcode = String(product.barcode || "").trim().toLowerCase();
+      const name = String(product.name || "").trim().toLowerCase();
+      return sku === clean || barcode === clean || name === clean;
+    });
+    if (exact.length) return exact;
+    return availableProducts.filter((product) => productHaystack(product).includes(clean));
+  }
+
+  const productMatches = useMemo(() => {
+    const clean = productSearch.trim().toLowerCase();
+    if (!clean) return [];
+    return findProductsByTerm(productSearch).slice(0, 20);
+  }, [productSearch, availableProducts]);
+
+  // Don't dump the whole catalog — only surface matches once the user has typed
+  // a couple of characters.
+  const quickAddProducts = useMemo(() => {
+    const clean = productSearch.trim().toLowerCase();
+    if (clean.length < 2) return [];
+    return findProductsByTerm(productSearch);
+  }, [productSearch, availableProducts]);
 
   function imeiLineStatus(line) {
     if (!line.requiresImei) return "ok";
@@ -3270,29 +3377,32 @@ function PhoneOrderPage({ activeEmployee, sessionRole, phoneOrders, orderHandler
     return true;
   }
 
-  function findProductBySku(sku) {
-    const clean = String(sku || "").trim().toLowerCase();
-    if (!clean) return null;
-    const matches = products.filter(
-      (product) =>
-        String(product.sku || "").trim().toLowerCase() === clean ||
-        String(product.barcode || "").trim().toLowerCase() === clean,
-    );
-    if (!matches.length) return null;
-    return matches.find((product) => product.location === form.location) || matches.find((product) => !product.location) || matches[0];
+  function addProductFromSearch(product) {
+    if (addProductToCart(product)) {
+      playScanBeep();
+      setMessage(`Added ${product.name}.`);
+    }
   }
 
   function handleScan(event) {
     event.preventDefault();
-    const product = findProductBySku(scan);
-    if (!product) {
+    const term = scan.trim();
+    if (!term) return;
+    const matches = findProductsByTerm(term);
+    if (!matches.length) {
       playScanError();
-      setMessage(`No product matches "${scan.trim()}".`);
+      setMessage(`No product matches "${term}".`);
       return;
     }
-    if (addProductToCart(product)) {
+    if (matches.length > 1) {
+      setProductSearch(term);
+      setMessage(`Multiple items match "${term}". Pick one below.`);
+      setScan("");
+      return;
+    }
+    if (addProductToCart(matches[0])) {
       playScanBeep();
-      setMessage(`Added ${product.name}.`);
+      setMessage(`Added ${matches[0].name}.`);
     }
     setScan("");
     scanRef.current?.focus();
@@ -3315,66 +3425,22 @@ function PhoneOrderPage({ activeEmployee, sessionRole, phoneOrders, orderHandler
   const taxAmount = taxApplies ? subtotal * (taxRate / 100) : 0;
   const orderTotal = subtotal + taxAmount;
   const itemCount = cart.reduce((sum, line) => sum + line.qty, 0);
-  const itemsText = cart.map((line) => `${line.qty}x ${line.name}${line.imei ? ` (IMEI ${line.imei})` : ""}`).join(", ");
+  const itemsText = cart.map((line) => `${line.qty}x ${line.name}`).join(", ");
 
-  // Card is collected up front only when the order is marked Paid now.
-  const requiresCardCharge = form.paymentStatus === "Paid" && ["CC", "Card"].includes(form.paymentMethod);
-  const cardChargeComplete = !requiresCardCharge || card.status === "paid";
-  const imeiIssue = (() => {
-    if (cart.some((line) => imeiLineStatus(line) === "missing")) return "Scan an IMEI for every phone before creating the order.";
-    if (cart.some((line) => imeiLineStatus(line) === "duplicate")) return "The same IMEI is on two lines. Each phone needs its own unique IMEI.";
-    if (cart.some((line) => imeiLineStatus(line) === "notstock")) return "An IMEI is not in this product's inventory. Scan a phone that is in stock.";
-    return "";
-  })();
-
-  useEffect(() => {
-    setCard((current) => (current.status === "idle" ? current : { status: "idle", message: "", refNum: "" }));
-  }, [orderTotal, form.paymentMethod, form.paymentStatus]);
-
+  // The call-taker only routes the order to a store. The IMEI is scanned and the
+  // card is charged later by the store, so creation just needs a store, a
+  // customer, a delivery address, and at least one item.
   const canCreate = Boolean(form.location.trim())
-    && Boolean(selectedHandler)
     && localPhoneDigits(form.customerPhone).length >= 6
     && Boolean(form.deliveryAddress.trim())
-    && cart.length > 0
-    && !imeiIssue
-    && cardChargeComplete;
+    && cart.length > 0;
 
   function updateField(name, value) {
-    setForm((current) => {
-      const next = { ...current, [name]: value };
-      if (name === "location") {
-        const firstHandler = orderHandlers.find((handler) => handler.location === value);
-        next.assignedTo = firstHandler?.name || "";
-      }
-      return next;
-    });
+    setForm((current) => ({ ...current, [name]: value }));
   }
 
-  async function chargeCard() {
-    if (!requiresCardCharge || !orderTotal) return;
-    try {
-      setCard({ status: "charging", message: "Sending sale to the terminal...", refNum: "" });
-      const result = await chargeOnLocalTerminal({
-        amount: orderTotal.toFixed(2),
-        externalRequestId: `order-${Date.now()}`,
-        manualEntry: cardEntryMode === "manual",
-        onStatus: (text) => setCard((current) => ({ ...current, message: text })),
-      });
-      setCard({
-        status: "paid",
-        message: result.maskedCardNumber
-          ? `Card approved (${result.cardType || "card"} ${result.maskedCardNumber}).`
-          : "Card approved.",
-        refNum: result.refNum || "",
-      });
-    } catch (error) {
-      setCard({ status: "error", message: error.message || "Card payment failed.", refNum: "" });
-    }
-  }
-
-  function submitOrder(event) {
-    event.preventDefault();
-    if (!canCreate || !selectedHandler) return;
+  function handleCreateOrder() {
+    if (!canCreate) return;
     const matched = (customers || []).find(
       (entry) => entry.phoneDigits === localPhoneDigits(form.customerPhone) || entry.mobileDigits === localPhoneDigits(form.customerPhone),
     ) || null;
@@ -3387,19 +3453,20 @@ function PhoneOrderPage({ activeEmployee, sessionRole, phoneOrders, orderHandler
   }
 
   function createOrder(matchedCustomer) {
-    const phoneLine = cart.find((line) => line.requiresImei && line.imei);
     const onFileAddress = form.customerAddress.trim() || matchedCustomer?.address || form.deliveryAddress.trim();
     const order = {
       id: crypto.randomUUID(),
       type: "phoneOrder",
-      status: "Assigned",
+      // Routed to a store; the store fulfills it (scan IMEI / charge) before it
+      // becomes Ready and then Out for delivery.
+      status: "At store",
       receiptCode: generateReceiptCode(),
       createdAt: new Date().toISOString(),
       createdBy: activeEmployee,
       location: form.location.trim(),
-      assignedTo: selectedHandler.name,
-      assignedPhone: selectedHandler.phone || "",
-      customerName: titleCaseName(form.customerName),
+      assignedTo: "",
+      assignedPhone: "",
+      customerName: titleCaseName(form.customerName) || titleCaseName(matchedCustomer?.name || ""),
       customerPhone: form.customerPhone.trim(),
       customerPhoneDigits: localPhoneDigits(form.customerPhone),
       contactDetails: form.contactDetails.trim(),
@@ -3407,14 +3474,15 @@ function PhoneOrderPage({ activeEmployee, sessionRole, phoneOrders, orderHandler
       deliveryAddress: form.deliveryAddress.trim(),
       model: cart.length === 1 ? cart[0].name : itemsText,
       itemsText,
-      imei: phoneLine?.imei || "",
+      // IMEI is scanned by the store at fulfillment, not here.
+      imei: "",
       lineItems: cart.map((line) => ({
         productId: line.productId,
         sku: line.sku,
         name: line.name,
         price: line.price,
         qty: line.qty,
-        imei: line.imei,
+        imei: "",
         requiresImei: line.requiresImei,
         category: line.category,
       })),
@@ -3425,8 +3493,8 @@ function PhoneOrderPage({ activeEmployee, sessionRole, phoneOrders, orderHandler
       orderTotal: orderTotal.toFixed(2),
       paymentStatus: form.paymentStatus,
       paymentMethod: form.paymentMethod,
-      cardStatus: requiresCardCharge ? card.status : "",
-      solaRefNum: requiresCardCharge ? card.refNum : "",
+      cardStatus: "",
+      solaRefNum: "",
       storeAddress: formatStoreAddress((storeTax || []).find((entry) => entry?.name === form.location)),
       storeHours: (storeTax || []).find((entry) => entry?.name === form.location)?.hours || "",
       notes: form.notes.trim(),
@@ -3435,7 +3503,6 @@ function PhoneOrderPage({ activeEmployee, sessionRole, phoneOrders, orderHandler
     printPhoneOrderReceipt(order);
     setCart([]);
     setCustomerPrompt(null);
-    setCard({ status: "idle", message: "", refNum: "" });
     setForm((current) => ({
       ...current,
       customerName: "",
@@ -3445,7 +3512,7 @@ function PhoneOrderPage({ activeEmployee, sessionRole, phoneOrders, orderHandler
       deliveryAddress: "",
       notes: "",
     }));
-    setMessage("Order created, receipt printed, and the handler was notified.");
+    setMessage(`Order created and sent to ${order.location || "the store"}.`);
   }
 
   function handleCustomerPromptSave(values) {
@@ -3472,37 +3539,26 @@ function PhoneOrderPage({ activeEmployee, sessionRole, phoneOrders, orderHandler
   }
 
   return (
-    <section className="workspace">
-      <div className="workspace-header">
-        <div>
-          <p className="eyebrow">Phone order</p>
-          <h2>Scan items and create the order</h2>
+    <>
+      <section className="workspace">
+        <div className="workspace-header">
+          <div>
+            <p className="eyebrow">Phone order · take the call</p>
+            <h2>Build the order and send it to a store</h2>
+          </div>
+          <div className="summary-strip">
+            <span className="metric">Store <strong>{form.location || "Unassigned"}</strong></span>
+            <span className="metric">Total <strong>{formatMoney(orderTotal)}</strong></span>
+          </div>
         </div>
-        <div className="summary-strip">
-          <span className="metric">Store <strong>{form.location || "Unassigned"}</strong></span>
-          <span className="metric">Total <strong>{formatMoney(orderTotal)}</strong></span>
-        </div>
-      </div>
 
-      <form className="report-form" onSubmit={submitOrder}>
         <div className="form-grid">
           <label className="field">
-            <span>Location</span>
+            <span>Assign to store</span>
             <select value={form.location} onChange={(event) => updateField("location", event.target.value)} required>
-              <option value="">Select location</option>
+              <option value="">Select store</option>
               {locations.map((location) => <option key={location}>{location}</option>)}
             </select>
-          </label>
-          <label className="field">
-            <span>Assign to</span>
-            <select value={form.assignedTo} onChange={(event) => updateField("assignedTo", event.target.value)} required>
-              <option value="">Select handler</option>
-              {locationHandlers.map((handler) => <option key={handler.id}>{handler.name}</option>)}
-            </select>
-          </label>
-          <label className="field">
-            <span>Handler phone</span>
-            <input value={selectedHandler?.phone || ""} readOnly disabled />
           </label>
           <label className="field">
             <span>Created by</span>
@@ -3511,11 +3567,7 @@ function PhoneOrderPage({ activeEmployee, sessionRole, phoneOrders, orderHandler
         </div>
 
         <div className="form-grid">
-          <label className="field">
-            <span>Customer name</span>
-            <input value={form.customerName} onChange={(event) => updateField("customerName", event.target.value)} />
-          </label>
-          <label className="field">
+          <label className="field full">
             <span>Customer phone</span>
             <CustomerPhoneInput
               value={form.customerPhone}
@@ -3531,10 +3583,6 @@ function PhoneOrderPage({ activeEmployee, sessionRole, phoneOrders, orderHandler
             <span>Contact details</span>
             <input value={form.contactDetails} onChange={(event) => updateField("contactDetails", event.target.value)} placeholder="Email, WhatsApp, alternate phone" />
           </label>
-          <label className="field">
-            <span>Customer address (on file)</span>
-            <input value={form.customerAddress} onChange={(event) => updateField("customerAddress", event.target.value)} placeholder="Auto-filled from the customer" />
-          </label>
           <label className="field full">
             <span>Delivery address</span>
             <input value={form.deliveryAddress} onChange={(event) => updateField("deliveryAddress", event.target.value)} placeholder="Where to deliver this order" required />
@@ -3546,127 +3594,187 @@ function PhoneOrderPage({ activeEmployee, sessionRole, phoneOrders, orderHandler
           <button type="button" className={scanMode ? "selected" : ""} onClick={() => { setScanMode(true); scanRef.current?.focus(); }}>Scan</button>
           <button type="button" className={!scanMode ? "selected" : ""} onClick={() => { setScanMode(false); scanRef.current?.focus(); }}>Manual</button>
         </div>
-        <div className="pos-scan">
+        <form className="pos-scan" onSubmit={handleScan}>
           <input
             ref={scanRef}
             className="pos-scan-input"
             value={scan}
             onChange={(event) => setScan(event.target.value)}
-            onKeyDown={(event) => { if (event.key === "Enter") handleScan(event); }}
-            placeholder={scanMode ? "Scan a barcode — it adds automatically" : "Type SKU / barcode, then press Enter"}
+            placeholder={scanMode ? "Scan a barcode — it adds automatically" : "Type item name, SKU, or barcode, then press Enter"}
             inputMode="text"
             autoComplete="off"
             spellCheck={false}
           />
-          {!scanMode ? <button className="primary-button" type="button" onClick={handleScan}>Add</button> : null}
-        </div>
+          {!scanMode ? <button className="primary-button" type="submit">Add</button> : null}
+        </form>
+        <label className="field full product-search-field">
+          <span>Find item by name</span>
+          <input
+            className="pos-search"
+            value={productSearch}
+            onChange={(event) => setProductSearch(event.target.value)}
+            placeholder="Search item name, SKU, or barcode"
+            autoComplete="off"
+            spellCheck={false}
+          />
+        </label>
+        {productSearch.trim() ? (
+          productMatches.length ? (
+            <div className="product-search-results">
+              {productMatches.map((product) => {
+                const stock = product.requiresImei ? product.imeis?.length || 0 : Number(product.quantity) || 0;
+                return (
+                  <button
+                    className="product-search-row"
+                    type="button"
+                    key={product.id}
+                    onClick={() => addProductFromSearch(product)}
+                  >
+                    <div>
+                      <strong>{product.name}</strong>
+                      <p className="muted">
+                        {[product.sku, product.barcode].filter(Boolean).join(" · ") || "No SKU"}
+                        {" · "}{formatMoney(Number(product.price) || 0)}
+                        {" · "}{stock} in stock{product.requiresImei ? " · IMEI" : ""}
+                      </p>
+                    </div>
+                    <span className="product-search-add">Add</span>
+                  </button>
+                );
+              })}
+            </div>
+          ) : (
+            <p className="muted">No matching items for &ldquo;{productSearch.trim()}&rdquo;.</p>
+          )
+        ) : null}
         {message ? <p className="pos-message">{message}</p> : null}
+      </section>
 
-        {cart.length ? (
-          <div className="table-wrap">
-            <table>
-              <thead>
-                <tr><th>Item</th><th>Price</th><th>Qty</th><th>IMEI</th><th>Line</th><th></th></tr>
-              </thead>
-              <tbody>
-                {cart.map((line) => (
-                  <tr key={line.lineId}>
-                    <td><strong>{line.name}</strong><p className="muted">{line.sku}</p></td>
-                    <td>{formatMoney(line.price)}</td>
-                    <td>
-                      {line.requiresImei ? <span className="muted">1</span> : (
-                        <input className="pos-qty" type="number" min="1" value={line.qty} onChange={(event) => updateQty(line.lineId, event.target.value)} />
-                      )}
-                    </td>
-                    <td>
-                      {line.requiresImei ? (
-                        <input
-                          className={`pos-imei ${imeiLineStatus(line) === "ok" ? "" : "pos-imei-missing"}`}
-                          value={line.imei}
-                          onChange={(event) => updateImei(line.lineId, event.target.value)}
-                          placeholder="Scan IMEI"
-                          inputMode="numeric"
-                          autoComplete="off"
-                          spellCheck={false}
-                        />
-                      ) : <span className="muted">-</span>}
-                    </td>
-                    <td>{formatMoney(line.price * line.qty)}</td>
-                    <td><button className="secondary-button" type="button" onClick={() => removeLine(line.lineId)}>Remove</button></td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+      <div className="pos-layout">
+        <section className="history pos-cart">
+          <div className="history-header">
+            <div>
+              <p className="eyebrow">Cart</p>
+              <h2>{itemCount} item{itemCount === 1 ? "" : "s"}</h2>
+            </div>
           </div>
-        ) : <p className="empty-state">Scan a product to start the order.</p>}
+          {cart.length ? (
+            <div className="table-wrap">
+              <table>
+                <thead>
+                  <tr><th>Item</th><th>Price</th><th>Qty</th><th>IMEI</th><th>Line</th><th></th></tr>
+                </thead>
+                <tbody>
+                  {cart.map((line) => (
+                    <tr key={line.lineId}>
+                      <td><strong>{line.name}</strong><p className="muted">{line.sku}</p></td>
+                      <td>{formatMoney(line.price)}</td>
+                      <td>
+                        {line.requiresImei ? <span className="muted">1</span> : (
+                          <input className="pos-qty" type="number" min="1" value={line.qty} onChange={(event) => updateQty(line.lineId, event.target.value)} />
+                        )}
+                      </td>
+                      <td>
+                        {line.requiresImei ? <span className="muted">At store</span> : <span className="muted">-</span>}
+                      </td>
+                      <td>{formatMoney(line.price * line.qty)}</td>
+                      <td><button className="secondary-button" type="button" onClick={() => removeLine(line.lineId)}>Remove</button></td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          ) : (
+            <p className="empty-state">Scan a product to start the order.</p>
+          )}
+        </section>
 
+        <section className="workspace pos-checkout">
+          <div className="workspace-header">
+            <div>
+              <p className="eyebrow">Checkout</p>
+              <h2>{formatMoney(orderTotal)}</h2>
+            </div>
+          </div>
+
+          <div className="pos-totals">
+            <div className="pos-totals-row"><span>Subtotal</span><span>{formatMoney(subtotal)}</span></div>
+            <label className="checkbox-field pos-out-of-state">
+              <input type="checkbox" checked={outOfState} onChange={(event) => setOutOfState(event.target.checked)} />
+              <span>Out of state (no sales tax)</span>
+            </label>
+            <div className="pos-totals-row"><span>Tax{taxApplies ? ` (${taxRate}%)` : ""}</span><span>{formatMoney(taxAmount)}</span></div>
+            <div className="pos-totals-row pos-totals-grand"><span>Order total</span><strong>{formatMoney(orderTotal)}</strong></div>
+          </div>
+
+          <div className="form-grid">
+            <label className="field">
+              <span>Payment status</span>
+              <select value={form.paymentStatus} onChange={(event) => updateField("paymentStatus", event.target.value)}>
+                <option>Paid</option>
+                <option>Collect on delivery</option>
+              </select>
+            </label>
+            <label className="field">
+              <span>Payment method</span>
+              <select value={form.paymentMethod} onChange={(event) => updateField("paymentMethod", event.target.value)}>
+                {paymentMethods.map((method) => <option key={method}>{method}</option>)}
+              </select>
+            </label>
+            <label className="field full">
+              <span>Notes</span>
+              <textarea rows={2} value={form.notes} onChange={(event) => updateField("notes", event.target.value)} />
+            </label>
+          </div>
+
+          {form.paymentStatus === "Paid" && ["CC", "Card"].includes(form.paymentMethod) ? (
+            <p className="muted pos-warning">The store will charge the card on its terminal before marking the order ready.</p>
+          ) : null}
+          <p className="muted pos-checkout-hint">Use the Create order bar at the bottom of the screen.</p>
+        </section>
+      </div>
+
+      <section className="history">
+        <div className="history-header">
+          <div>
+            <p className="eyebrow">Quick add</p>
+            <h2>Products</h2>
+          </div>
+          <input
+            className="pos-search"
+            value={productSearch}
+            onChange={(event) => setProductSearch(event.target.value)}
+            placeholder="Search item name, SKU, or barcode"
+            autoComplete="off"
+            spellCheck={false}
+          />
+        </div>
         <div className="pos-product-grid">
-          {availableProducts.map((product) => (
-            <button className="pos-product" type="button" key={product.id} onClick={() => { if (addProductToCart(product)) setMessage(`Added ${product.name}.`); }}>
+          {quickAddProducts.length ? quickAddProducts.map((product) => (
+            <button className="pos-product" type="button" key={product.id} onClick={() => addProductFromSearch(product)}>
               <strong>{product.name}</strong>
               <span>{formatMoney(Number(product.price) || 0)}</span>
               <small className="muted">{product.requiresImei ? `In stock ${product.imeis?.length || 0} - IMEI` : `Stock ${Number(product.quantity) || 0}`}</small>
             </button>
-          ))}
+          )) : (
+            <p className="empty-state">{productSearch.trim().length >= 2 ? "No matching products for this store." : "Start typing to find a product."}</p>
+          )}
         </div>
+      </section>
 
-        <div className="pos-totals">
-          <div className="pos-totals-row"><span>Subtotal</span><span>{formatMoney(subtotal)}</span></div>
-          <label className="checkbox-field pos-out-of-state">
-            <input type="checkbox" checked={outOfState} onChange={(event) => setOutOfState(event.target.checked)} />
-            <span>Out of state (no sales tax)</span>
-          </label>
-          <div className="pos-totals-row"><span>Tax{taxApplies ? ` (${taxRate}%)` : ""}</span><span>{formatMoney(taxAmount)}</span></div>
-          <div className="pos-totals-row pos-totals-grand"><span>Order total</span><strong>{formatMoney(orderTotal)}</strong></div>
+      <div className="pos-action-spacer" />
+      <div className="pos-action-bar">
+        <div className="pos-action-bar-info">
+          <span>{itemCount} item{itemCount === 1 ? "" : "s"} · {form.location || "Store"}</span>
+          <strong>{formatMoney(orderTotal)}</strong>
         </div>
-
-        <div className="form-grid">
-          <label className="field">
-            <span>Payment status</span>
-            <select value={form.paymentStatus} onChange={(event) => updateField("paymentStatus", event.target.value)}>
-              <option>Paid</option>
-              <option>Collect on delivery</option>
-            </select>
-          </label>
-          <label className="field">
-            <span>Payment method</span>
-            <select value={form.paymentMethod} onChange={(event) => updateField("paymentMethod", event.target.value)}>
-              {paymentMethods.map((method) => <option key={method}>{method}</option>)}
-            </select>
-          </label>
+        <div className="pos-action-bar-cta">
+          {!form.location.trim() ? <span className="pos-action-warn">Pick a store</span> : null}
+          <button className="primary-button pos-complete-button" type="button" disabled={!canCreate} onClick={handleCreateOrder}>
+            {cart.length ? `Create order · ${formatMoney(orderTotal)}` : "Scan items to start"}
+          </button>
         </div>
-
-        {requiresCardCharge ? (
-          <div className="payment-panel payment-panel-stack">
-            <div>
-              <p className="eyebrow">Card payment (Verifone P200)</p>
-              <h3>Charge {formatMoney(orderTotal)} on the terminal</h3>
-            </div>
-            <div className="card-reader-row">
-              <span className="reader-dot connected" aria-hidden="true" />
-              <span className="muted">Verifone P200 · local terminal (Sola BBPOS)</span>
-            </div>
-            <div className="segmented-control" role="tablist" aria-label="Card entry mode">
-              <button type="button" className={cardEntryMode === "terminal" ? "selected" : ""} onClick={() => setCardEntryMode("terminal")} disabled={card.status === "charging" || card.status === "paid"}>Tap / dip / swipe</button>
-              <button type="button" className={cardEntryMode === "manual" ? "selected" : ""} onClick={() => setCardEntryMode("manual")} disabled={card.status === "charging" || card.status === "paid"}>Manual entry</button>
-            </div>
-            <button className="secondary-button" type="button" onClick={chargeCard} disabled={!orderTotal || card.status === "charging" || card.status === "paid"}>
-              {card.status === "paid" ? "Card charged" : card.status === "charging" ? "Waiting for card..." : cardEntryMode === "manual" ? "Charge card (manual entry)" : "Charge card (tap / dip / swipe)"}
-            </button>
-            {card.message ? <p className={card.status === "error" ? "summary-error" : "muted"}>{card.message}</p> : null}
-          </div>
-        ) : null}
-
-        <label className="field full">
-          <span>Notes</span>
-          <textarea rows="3" value={form.notes} onChange={(event) => updateField("notes", event.target.value)} />
-        </label>
-
-        {imeiIssue ? <p className="muted pos-warning">{imeiIssue}</p> : null}
-        <div className="form-actions">
-          <button className="primary-button" type="submit" disabled={!canCreate}>Create order · {formatMoney(orderTotal)}</button>
-        </div>
-      </form>
+      </div>
 
       {customerPrompt ? (
         <CustomerInfoDialog
@@ -3678,29 +3786,286 @@ function PhoneOrderPage({ activeEmployee, sessionRole, phoneOrders, orderHandler
         />
       ) : null}
 
-      <OpenPhoneOrders
-        orders={visibleOrders}
+      <StoreFulfillmentBoard
+        orders={fulfillmentOrders}
+        products={products}
+        onMarkReady={onMarkReady}
+        onCancel={onCancel}
+      />
+
+      <AssignDriverBoard
+        orders={readyOrders}
+        orderHandlers={orderHandlers}
+        onAssignDriver={onAssignDriver}
+        onCancel={onCancel}
+      />
+
+      <DeliveryBoard
+        orders={deliveryOrders}
         activeEmployee={activeEmployee}
         sessionRole={sessionRole}
+        activeLocation={activeLocation}
         onDelivered={onDelivered}
+        onCancel={onCancel}
       />
-    </section>
+    </>
   );
 }
 
-function OpenPhoneOrders({ orders, activeEmployee, sessionRole, onDelivered }) {
+function confirmCancelOrder(order, onCancel) {
+  if (!onCancel) return;
+  const restores = order.status === "Ready" || order.status === "Out for delivery";
+  const ok = window.confirm(
+    `Cancel the order for ${order.customerName || order.customerPhone || "this customer"}? It will be removed from the pipeline${restores ? " and the items returned to stock" : ""}.`,
+  );
+  if (ok) onCancel(order.id);
+}
+
+// Shared order summary block used across the three pipeline boards.
+function PhoneOrderSummary({ order }) {
+  return (
+    <>
+      <div className="pending-import">
+        <span><strong>Customer:</strong> {order.customerName || order.customerPhone}</span>
+        <span><strong>Phone:</strong> {order.customerPhone}</span>
+        <span><strong>Items:</strong> {order.itemsText || order.model}</span>
+        <span><strong>Total:</strong> {formatPayment(order.orderTotal)}</span>
+      </div>
+      <div className="details">
+        <span><strong>Deliver to:</strong> {order.deliveryAddress || order.address}</span>
+        {order.contactDetails ? <span><strong>Contact:</strong> {order.contactDetails}</span> : null}
+        {order.notes ? <span className="muted">{order.notes}</span> : null}
+      </div>
+    </>
+  );
+}
+
+// Stage 2 — the store fulfills each order: scan the IMEI(s), charge the card if
+// it's a pay-now CC order, then mark it ready for a driver.
+function StoreFulfillmentBoard({ orders, products, onMarkReady, onCancel }) {
   return (
     <div className="order-board">
       <div className="history-header">
         <div>
-          <p className="eyebrow">Assigned orders</p>
-          <h2>Open phone orders</h2>
+          <p className="eyebrow">At your store · fulfill</p>
+          <h2>Orders to prepare</h2>
+        </div>
+        <span className="metric">Waiting <strong>{orders.length}</strong></span>
+      </div>
+      <div className="pending-grid">
+        {orders.length ? (
+          orders.map((order) => (
+            <StoreOrderCard key={order.id} order={order} products={products} onMarkReady={onMarkReady} onCancel={onCancel} />
+          ))
+        ) : (
+          <p className="empty-state">No orders waiting to be prepared.</p>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function StoreOrderCard({ order, products, onMarkReady, onCancel }) {
+  const imeiLines = (order.lineItems || []).filter((line) => line.requiresImei);
+  const [imeis, setImeis] = useState(() => imeiLines.map((line) => line.imei || ""));
+  const [cardEntryMode, setCardEntryMode] = useState("terminal");
+  const [card, setCard] = useState({ status: "idle", message: "", refNum: "" });
+
+  const requiresCardCharge = order.paymentStatus === "Paid" && ["CC", "Card"].includes(order.paymentMethod);
+  const cardCharged = !requiresCardCharge || card.status === "paid";
+
+  function imeiStatus(index) {
+    const value = imeis[index];
+    if (!value) return "missing";
+    if (imeis.filter((other) => other === value).length > 1) return "duplicate";
+    const stock = products.find((product) => product.id === imeiLines[index].productId)?.imeis || [];
+    if (stock.length > 0 && !stock.includes(value)) return "notstock";
+    return "ok";
+  }
+  const imeisOk = imeiLines.every((_, index) => imeiStatus(index) === "ok");
+  const canReady = imeisOk && cardCharged;
+
+  async function chargeCard() {
+    const amount = Number(order.orderTotal) || 0;
+    if (!requiresCardCharge || !amount) return;
+    try {
+      setCard({ status: "charging", message: "Sending sale to the terminal...", refNum: "" });
+      const result = await chargeOnLocalTerminal({
+        amount: amount.toFixed(2),
+        externalRequestId: `order-${order.id}`.slice(0, 32),
+        manualEntry: cardEntryMode === "manual",
+        onStatus: (text) => setCard((current) => ({ ...current, message: text })),
+      });
+      setCard({
+        status: "paid",
+        message: result.maskedCardNumber
+          ? `Card approved (${result.cardType || "card"} ${result.maskedCardNumber}).`
+          : "Card approved.",
+        refNum: result.refNum || "",
+      });
+    } catch (error) {
+      setCard({ status: "error", message: error.message || "Card payment failed.", refNum: "" });
+    }
+  }
+
+  function markReady() {
+    if (!canReady) return;
+    let cursor = 0;
+    const lineItems = (order.lineItems || []).map((line) => {
+      if (!line.requiresImei) return line;
+      const imei = imeis[cursor];
+      cursor += 1;
+      return { ...line, imei };
+    });
+    onMarkReady(order.id, {
+      lineItems,
+      cardStatus: requiresCardCharge ? "paid" : "",
+      solaRefNum: requiresCardCharge ? card.refNum : "",
+      paymentStatus: requiresCardCharge ? "Paid" : order.paymentStatus,
+    });
+  }
+
+  return (
+    <article className="pending-card" key={order.id}>
+      <div className="pending-card-head">
+        <div>
+          <p className="eyebrow">{order.location}</p>
+          <h3>{order.model}</h3>
+        </div>
+        <span className="badge phoneOrder">{order.paymentMethod} · {order.paymentStatus}</span>
+      </div>
+      <PhoneOrderSummary order={order} />
+
+      {imeiLines.length ? (
+        <div className="store-imei-list">
+          {imeiLines.map((line, index) => (
+            <label className="field" key={`${line.lineId || line.productId}-${index}`}>
+              <span>IMEI · {line.name}</span>
+              <input
+                className={`pos-imei ${imeiStatus(index) === "ok" ? "" : "pos-imei-missing"}`}
+                value={imeis[index]}
+                onChange={(event) => setImeis((current) => current.map((value, i) => (i === index ? event.target.value.trim() : value)))}
+                placeholder="Scan IMEI"
+                inputMode="numeric"
+                autoComplete="off"
+                spellCheck={false}
+              />
+            </label>
+          ))}
+        </div>
+      ) : null}
+
+      {requiresCardCharge ? (
+        <div className="payment-panel payment-panel-stack">
+          <div>
+            <p className="eyebrow">Card payment</p>
+            <h3>Charge {formatPayment(order.orderTotal)} on the terminal</h3>
+          </div>
+          <div className="segmented-control" role="tablist" aria-label="Card entry mode">
+            <button type="button" className={cardEntryMode === "terminal" ? "selected" : ""} onClick={() => setCardEntryMode("terminal")} disabled={card.status === "charging" || card.status === "paid"}>Tap / dip / swipe</button>
+            <button type="button" className={cardEntryMode === "manual" ? "selected" : ""} onClick={() => setCardEntryMode("manual")} disabled={card.status === "charging" || card.status === "paid"}>Manual entry</button>
+          </div>
+          <button className="secondary-button" type="button" onClick={chargeCard} disabled={card.status === "charging" || card.status === "paid"}>
+            {card.status === "paid" ? "Card charged" : card.status === "charging" ? "Waiting for card..." : cardEntryMode === "manual" ? "Charge card (manual entry)" : "Charge card (tap / dip / swipe)"}
+          </button>
+          {card.message ? <p className={card.status === "error" ? "summary-error" : "muted"}>{card.message}</p> : null}
+        </div>
+      ) : null}
+
+      {!imeisOk ? <p className="muted pos-warning">Scan a valid in-stock IMEI for every phone.</p> : null}
+      {imeisOk && !cardCharged ? <p className="muted pos-warning">Charge the card before marking ready.</p> : null}
+      <div className="order-card-actions">
+        <button className="primary-button" type="button" disabled={!canReady} onClick={markReady}>
+          Mark ready
+        </button>
+        <button className="secondary-button" type="button" onClick={() => confirmCancelOrder(order, onCancel)}>
+          Cancel order
+        </button>
+      </div>
+    </article>
+  );
+}
+
+// Stage 3 — the store hands a ready order to a driver, which texts the driver
+// and the customer.
+function AssignDriverBoard({ orders, orderHandlers, onAssignDriver, onCancel }) {
+  return (
+    <div className="order-board">
+      <div className="history-header">
+        <div>
+          <p className="eyebrow">Ready · assign a driver</p>
+          <h2>Hand off to a driver</h2>
+        </div>
+        <span className="metric">Ready <strong>{orders.length}</strong></span>
+      </div>
+      <div className="pending-grid">
+        {orders.length ? (
+          orders.map((order) => (
+            <AssignDriverCard key={order.id} order={order} orderHandlers={orderHandlers} onAssignDriver={onAssignDriver} onCancel={onCancel} />
+          ))
+        ) : (
+          <p className="empty-state">No orders ready for a driver.</p>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function AssignDriverCard({ order, orderHandlers, onAssignDriver, onCancel }) {
+  const drivers = orderHandlers.filter((handler) => handler.location === order.location);
+  const list = drivers.length ? drivers : orderHandlers;
+  const [driverId, setDriverId] = useState(list[0]?.id || "");
+  const driver = list.find((handler) => handler.id === driverId) || list[0] || null;
+
+  return (
+    <article className="pending-card" key={order.id}>
+      <div className="pending-card-head">
+        <div>
+          <p className="eyebrow">{order.location}</p>
+          <h3>{order.model}</h3>
+        </div>
+        <span className="badge phoneOrder">Ready</span>
+      </div>
+      <PhoneOrderSummary order={order} />
+      <label className="field">
+        <span>Driver</span>
+        <select value={driverId} onChange={(event) => setDriverId(event.target.value)}>
+          {list.length ? (
+            list.map((handler) => <option key={handler.id} value={handler.id}>{handler.name}</option>)
+          ) : (
+            <option value="">No drivers for this store</option>
+          )}
+        </select>
+      </label>
+      <div className="order-card-actions">
+        <button className="primary-button" type="button" disabled={!driver} onClick={() => driver && onAssignDriver(order.id, driver)}>
+          Assign driver &amp; notify
+        </button>
+        <button className="secondary-button" type="button" onClick={() => confirmCancelOrder(order, onCancel)}>
+          Cancel order
+        </button>
+      </div>
+    </article>
+  );
+}
+
+// Stage 4 — out for delivery. The assigned driver, the store, or an admin can
+// mark it delivered, which files the report and texts the customer.
+function DeliveryBoard({ orders, activeEmployee, sessionRole, activeLocation, onDelivered, onCancel }) {
+  return (
+    <div className="order-board">
+      <div className="history-header">
+        <div>
+          <p className="eyebrow">Out for delivery</p>
+          <h2>Open deliveries</h2>
         </div>
         <span className="metric">Open <strong>{orders.length}</strong></span>
       </div>
       <div className="pending-grid">
         {orders.length ? orders.map((order) => {
-          const canDeliver = sessionRole === "admin" || order.assignedTo === activeEmployee;
+          const canDeliver = sessionRole === "admin"
+            || order.assignedTo === activeEmployee
+            || order.location === activeLocation;
           return (
             <article className="pending-card" key={order.id}>
               <div className="pending-card-head">
@@ -3710,27 +4075,22 @@ function OpenPhoneOrders({ orders, activeEmployee, sessionRole, onDelivered }) {
                 </div>
                 <span className="badge phoneOrder">{order.paymentStatus}</span>
               </div>
-              <div className="pending-import">
-                <span><strong>Customer:</strong> {order.customerName || order.customerPhone}</span>
-                <span><strong>Phone:</strong> {order.customerPhone}</span>
-                <span><strong>Total:</strong> {formatPayment(order.orderTotal)}</span>
-                <span><strong>Assigned:</strong> {order.assignedTo}</span>
-              </div>
+              <PhoneOrderSummary order={order} />
               <div className="details">
-                <span><strong>Deliver to:</strong> {order.deliveryAddress || order.address}</span>
-                {order.deliveryAddress && order.address && order.deliveryAddress !== order.address ? (
-                  <span className="muted">Customer address on file: {order.address}</span>
-                ) : null}
-                {order.contactDetails ? <span><strong>Contact:</strong> {order.contactDetails}</span> : null}
-                {order.notes ? <span className="muted">{order.notes}</span> : null}
+                <span><strong>Driver:</strong> {order.assignedTo || "-"}</span>
               </div>
-              <button className="primary-button" type="button" disabled={!canDeliver} onClick={() => onDelivered(order.id)}>
-                Mark delivered
-              </button>
+              <div className="order-card-actions">
+                <button className="primary-button" type="button" disabled={!canDeliver} onClick={() => onDelivered(order.id)}>
+                  Mark delivered
+                </button>
+                <button className="secondary-button" type="button" disabled={!canDeliver} onClick={() => confirmCancelOrder(order, onCancel)}>
+                  Cancel order
+                </button>
+              </div>
             </article>
           );
         }) : (
-          <p className="empty-state">No open phone orders.</p>
+          <p className="empty-state">No open deliveries.</p>
         )}
       </div>
     </div>
@@ -3741,6 +4101,7 @@ function PosPage({ products, activeEmployee, activeLocation, activeDeviceId, act
   const [cart, setCart] = useState([]);
   const [scan, setScan] = useState("");
   const [scanMode, setScanMode] = useState(true);
+  const [productSearch, setProductSearch] = useState("");
   const [customerPhone, setCustomerPhone] = useState("");
   const [paymentMethod, setPaymentMethod] = useState(paymentMethods[0]);
   const [outOfState, setOutOfState] = useState(false);
@@ -3768,6 +4129,20 @@ function PosPage({ products, activeEmployee, activeLocation, activeDeviceId, act
     () => Object.fromEntries(products.map((product) => [product.id, product])),
     [products],
   );
+
+  // Quick-add only surfaces matches once a couple of characters are typed,
+  // instead of listing the entire catalog up front.
+  const quickAddProducts = useMemo(() => {
+    const clean = productSearch.trim().toLowerCase();
+    if (clean.length < 2) return [];
+    return availableProducts.filter((product) =>
+      [product.name, product.sku, product.barcode, product.category]
+        .filter(Boolean)
+        .join(" ")
+        .toLowerCase()
+        .includes(clean),
+    );
+  }, [productSearch, availableProducts]);
 
   function imeiLineStatus(line) {
     if (!line.requiresImei) return "ok";
@@ -4247,12 +4622,20 @@ function PosPage({ products, activeEmployee, activeLocation, activeDeviceId, act
         <div className="history-header">
           <div>
             <p className="eyebrow">Quick add</p>
-            <h2>Tap a product</h2>
+            <h2>Find a product</h2>
           </div>
+          <input
+            className="pos-search"
+            value={productSearch}
+            onChange={(event) => setProductSearch(event.target.value)}
+            placeholder="Search item name, SKU, or barcode"
+            autoComplete="off"
+            spellCheck={false}
+          />
         </div>
         <div className="pos-product-grid">
-          {availableProducts.length ? (
-            availableProducts.map((product) => (
+          {quickAddProducts.length ? (
+            quickAddProducts.map((product) => (
               <button
                 className="pos-product"
                 type="button"
@@ -4272,7 +4655,7 @@ function PosPage({ products, activeEmployee, activeLocation, activeDeviceId, act
               </button>
             ))
           ) : (
-            <p className="empty-state">No products for this store yet. Add them in Inventory.</p>
+            <p className="empty-state">{productSearch.trim().length >= 2 ? "No matching products for this store." : "Start typing to find a product."}</p>
           )}
         </div>
       </section>
@@ -4768,14 +5151,20 @@ function ImeiLotCapture({ imeis, target, onChangeImeis, blocked = [] }) {
 
 function RestockDialog({ product, storeLocations, onClose, onAddStock }) {
   const requiresImei = Boolean(product.requiresImei);
+  const needsBarcode = !product.barcode;
   const [quantity, setQuantity] = useState("0");
   const [imeis, setImeis] = useState([]);
   const [location, setLocation] = useState(product.location || "");
+  const [barcode, setBarcode] = useState("");
   const stores = storeLocations || [];
   const currentStock = requiresImei ? product.imeis?.length || 0 : Number(product.quantity) || 0;
 
   function submit(event) {
     event.preventDefault();
+    if (needsBarcode && !barcode.trim()) {
+      window.alert("Add a barcode for this item before adding stock.");
+      return;
+    }
     const target = Number(quantity) || 0;
     if (!target) {
       window.alert("Enter how many units to add.");
@@ -4785,7 +5174,7 @@ function RestockDialog({ product, storeLocations, onClose, onAddStock }) {
       window.alert(`You are adding ${target} units but scanned ${imeis.length} IMEIs. Scan exactly ${target}.`);
       return;
     }
-    onAddStock({ addQuantity: target, newImeis: imeis, location });
+    onAddStock({ addQuantity: target, newImeis: imeis, location, barcode: barcode.trim() });
     onClose();
   }
 
@@ -4798,6 +5187,20 @@ function RestockDialog({ product, storeLocations, onClose, onAddStock }) {
           <p className="muted">In stock now: {currentStock}{requiresImei ? " IMEIs" : ""}</p>
         </div>
         <form className="form-grid dialog-form" onSubmit={submit}>
+          {needsBarcode ? (
+            <label className="field full">
+              <span>Barcode (required — this item has none)</span>
+              <input
+                value={barcode}
+                onChange={(event) => setBarcode(event.target.value)}
+                placeholder="Scan or type the item's barcode"
+                autoComplete="off"
+                spellCheck={false}
+                autoFocus
+              />
+              <small className="muted">Add a barcode so this item can be scanned at POS and on orders.</small>
+            </label>
+          ) : null}
           <label className="field">
             <span>Add stock to store</span>
             <select value={location} onChange={(event) => setLocation(event.target.value)}>
@@ -4814,7 +5217,7 @@ function RestockDialog({ product, storeLocations, onClose, onAddStock }) {
               min="0"
               value={quantity}
               onChange={(event) => setQuantity(event.target.value)}
-              autoFocus
+              autoFocus={!needsBarcode}
             />
           </label>
           {requiresImei ? (
@@ -4842,13 +5245,15 @@ function InventoryPage({
   onSaveProduct,
   onRemoveProduct,
 }) {
-  const canDelete = sessionRole === "admin";
+  const isAdmin = sessionRole === "admin";
+  const canDelete = isAdmin;
   const emptyForm = {
     id: "",
     sku: "",
     barcode: "",
     name: "",
     price: "",
+    cost: "",
     category: productCategories[0],
     requiresImei: false,
     location: storeLocations[0] || "",
@@ -4864,12 +5269,14 @@ function InventoryPage({
     setForm((current) => ({ ...current, [name]: value }));
   }
 
-  function addStock(product, { addQuantity, newImeis, location }) {
+  function addStock(product, { addQuantity, newImeis, location, barcode }) {
     const nextLocation = location === undefined ? product.location : location;
+    // If the item had no barcode, the restock dialog collected one — save it too.
+    const barcodePatch = barcode && !product.barcode ? { barcode: String(barcode).trim() } : {};
     if (product.requiresImei) {
-      onSaveProduct({ ...product, location: nextLocation, imeis: [...(product.imeis || []), ...newImeis] });
+      onSaveProduct({ ...product, location: nextLocation, ...barcodePatch, imeis: [...(product.imeis || []), ...newImeis] });
     } else {
-      onSaveProduct({ ...product, location: nextLocation, quantity: (Number(product.quantity) || 0) + addQuantity });
+      onSaveProduct({ ...product, location: nextLocation, ...barcodePatch, quantity: (Number(product.quantity) || 0) + addQuantity });
     }
   }
 
@@ -4899,6 +5306,7 @@ function InventoryPage({
       ...emptyForm,
       ...product,
       price: String(product.price ?? ""),
+      cost: String(product.cost ?? ""),
       quantity: String(product.quantity ?? 0),
       imeis: product.imeis || [],
     });
@@ -4996,6 +5404,17 @@ function InventoryPage({
               placeholder="0.00"
             />
           </label>
+          {isAdmin ? (
+            <label className="field">
+              <span>Cost of goods</span>
+              <input
+                inputMode="decimal"
+                value={form.cost}
+                onChange={(event) => updateField("cost", event.target.value)}
+                placeholder="0.00"
+              />
+            </label>
+          ) : null}
           <label className="field">
             <span>Category</span>
             <select value={form.category} onChange={(event) => updateField("category", event.target.value)}>
@@ -5072,6 +5491,7 @@ function InventoryPage({
                   <th>SKU</th>
                   <th>Category</th>
                   <th>Total stock</th>
+                  {isAdmin ? <th>Cost</th> : null}
                   <th></th>
                 </tr>
               </thead>
@@ -5083,6 +5503,9 @@ function InventoryPage({
                       <td>{item.sku || "-"}</td>
                       <td>{item.category || "-"}</td>
                       <td><strong>{item.total}</strong></td>
+                      {isAdmin ? (
+                        <td>{formatMoney(Number(item.variants[0]?.cost) || 0)}</td>
+                      ) : null}
                       <td className="pos-row-actions">
                         <button
                           className="secondary-button compact-button"
@@ -5096,7 +5519,7 @@ function InventoryPage({
                   ))
                 ) : (
                   <tr>
-                    <td colSpan="5" className="empty-state">No matching items.</td>
+                    <td colSpan={isAdmin ? 6 : 5} className="empty-state">No matching items.</td>
                   </tr>
                 )}
               </tbody>
@@ -5112,6 +5535,7 @@ function InventoryPage({
           group={selectedGroup}
           storeLocations={storeLocations}
           hasAllStores={selectedHasAllStores}
+          sessionRole={sessionRole}
           onClose={() => setSelectedKey("")}
           onRestock={(product) => {
             setSelectedKey("");
@@ -5136,7 +5560,8 @@ function InventoryPage({
 
 // Popup showing one item's stock per store plus each per-store variant, with
 // restock / edit / delete actions. Replaces the always-on inventory tables.
-function ItemDetailsDialog({ group, storeLocations, hasAllStores, onClose, onRestock, onEdit, onDelete }) {
+function ItemDetailsDialog({ group, storeLocations, hasAllStores, sessionRole, onClose, onRestock, onEdit, onDelete }) {
+  const isAdmin = sessionRole === "admin";
   const subtitle = [group.sku ? `SKU ${group.sku}` : "", group.category || "", group.requiresImei ? "IMEI tracked" : ""]
     .filter(Boolean)
     .join(" · ");
@@ -5187,7 +5612,9 @@ function ItemDetailsDialog({ group, storeLocations, hasAllStores, onClose, onRes
                 <div>
                   <strong>{product.location || "All stores"}</strong>
                   <p className="muted">
-                    {formatMoney(Number(product.price) || 0)} · {stock} in stock{product.requiresImei ? " · IMEI" : ""}
+                    {formatMoney(Number(product.price) || 0)}
+                    {isAdmin ? ` · Cost ${formatMoney(Number(product.cost) || 0)}` : ""}
+                    {" · "}{stock} in stock{product.requiresImei ? " · IMEI" : ""}
                   </p>
                 </div>
                 <div className="store-row-actions">
@@ -5244,6 +5671,7 @@ function AdminPage({
   const [handlerForm, setHandlerForm] = useState({ name: "", phone: "", location: "" });
   const [newStore, setNewStore] = useState(emptyStore);
   const [editingStore, setEditingStore] = useState(null);
+  const storeFormRef = useRef(null);
 
   function taxFor(name) {
     return (storeTax || []).find((entry) => entry?.name === name) || null;
@@ -5268,6 +5696,13 @@ function AdminPage({
       hours: tax.hours || "",
     });
     setEditingStore(location);
+    requestAnimationFrame(() => {
+      const node = storeFormRef.current;
+      if (!node) return;
+      node.scrollIntoView({ behavior: "smooth", block: "center" });
+      const firstInput = node.querySelector("input:not([readonly])");
+      if (firstInput) firstInput.focus();
+    });
   }
 
   function cancelEditStore() {
@@ -5419,6 +5854,7 @@ function AdminPage({
           </div>
         </div>
         <form
+          ref={storeFormRef}
           className="form-grid inventory-form"
           onSubmit={(event) => {
             event.preventDefault();
@@ -5547,8 +5983,13 @@ function AdminPage({
             <input inputMode="tel" value={handlerForm.phone} onChange={(event) => updateHandlerField("phone", event.target.value)} />
           </label>
           <label className="field">
-            <span>Location</span>
-            <input value={handlerForm.location} onChange={(event) => updateHandlerField("location", event.target.value)} required />
+            <span>Store</span>
+            <select value={handlerForm.location} onChange={(event) => updateHandlerField("location", event.target.value)} required>
+              <option value="">Select store</option>
+              {(storeLocations || []).map((location) => (
+                <option key={location}>{location}</option>
+              ))}
+            </select>
           </label>
           <button className="primary-button align-end" type="submit">Add handler</button>
         </form>
@@ -6015,10 +6456,23 @@ function CustomerPhoneInput({ value, onChange, customers, onSelectCustomer, onSa
         .filter((customer) => (customer.phoneDigits || "").includes(localDigits) || (customer.mobileDigits || "").includes(localDigits))
         .slice(0, 8)
     : [];
+  // A full-number match drives the read-only details summary shown beneath the
+  // field, so the phone number stays the only thing the user has to enter.
+  const exactMatch = localDigits.length >= 7
+    ? (customers || []).find((customer) => customer.phoneDigits === localDigits || customer.mobileDigits === localDigits) || null
+    : null;
+  // Once a full-looking number is typed and nothing matches, offer to add it as
+  // a new customer and attach it to the operation in progress.
+  const canAddNew = Boolean(onSaveCustomer) && localDigits.length >= 7 && matches.length === 0;
 
   function ensureCountryCode() {
     setOpen(true);
     if (!digitsOnly(value)) onChange("1");
+  }
+
+  function startAddNew() {
+    setOpen(false);
+    setDetailsPrompt({ id: "", phone: value, name: "", mobile: "", address: "" });
   }
 
   function pickCustomer(customer) {
@@ -6075,7 +6529,7 @@ function CustomerPhoneInput({ value, onChange, customers, onSelectCustomer, onSa
         onFocus={ensureCountryCode}
         onBlur={() => window.setTimeout(() => setOpen(false), 150)}
       />
-      {open && matches.length ? (
+      {open && (matches.length || canAddNew) ? (
         <div className="phone-autocomplete-menu">
           {matches.map((customer) => (
             <button
@@ -6092,6 +6546,25 @@ function CustomerPhoneInput({ value, onChange, customers, onSelectCustomer, onSa
               {customer.address ? <small>{customer.address}</small> : null}
             </button>
           ))}
+          {canAddNew ? (
+            <button
+              type="button"
+              className="phone-autocomplete-add"
+              onMouseDown={(event) => {
+                event.preventDefault();
+                startAddNew();
+              }}
+            >
+              ＋ Add new customer
+            </button>
+          ) : null}
+        </div>
+      ) : null}
+      {exactMatch && (exactMatch.name || exactMatch.address || exactMatch.mobile) ? (
+        <div className="phone-customer-summary">
+          <span className="phone-customer-name">{exactMatch.name || "(no name)"}</span>
+          {exactMatch.address ? <span>{exactMatch.address}</span> : null}
+          {exactMatch.mobile ? <span>Mobile: {exactMatch.mobile}</span> : null}
         </div>
       ) : null}
       {detailsPrompt ? (
