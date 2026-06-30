@@ -2,6 +2,14 @@ function digitsOnly(value) {
   return String(value || "").replace(/\D/g, "");
 }
 
+// Pull a usable lookup value out of whatever the caller sent. Handles SIP URIs
+// like "sip:18456370687@69.42.172.203" by keeping only the user part before "@"
+// so the host/IP digits don't get welded onto the phone number.
+function lookupDigits(value) {
+  const user = String(value || "").replace(/^sips?:/i, "").split("@")[0];
+  return digitsOnly(user);
+}
+
 function toMillis(value) {
   if (!value) return 0;
   if (typeof value.toMillis === "function") return value.toMillis();
@@ -34,6 +42,21 @@ function buildRepairMessage(report) {
   return `${ticketPart} status is ${status}. ${paidMessage}${dueDate}`;
 }
 
+// Confirmation text sent when a repair is accepted (received) in store.
+function buildRepairReceivedMessage(report) {
+  const details = report.details || {};
+  const model = details.model || "device";
+  const parts = [`Diamant Telecom: we received your ${model} for repair.`];
+
+  if (details.ticketNumber) parts.push(`Ticket #${details.ticketNumber}.`);
+  if (details.damage) parts.push(`Issue: ${details.damage}.`);
+  if (details.dueDate) parts.push(`Estimated ready: ${details.dueDate}.`);
+  parts.push(details.paymentStatus === "Paid" ? "Payment: paid, thank you." : "Payment: not paid yet.");
+  parts.push("We'll text you when it's ready.");
+
+  return parts.join(" ");
+}
+
 function phoneLookupVariants(digits) {
   const variants = new Set([digits]);
   if (digits.length === 11 && digits.startsWith("1")) {
@@ -45,10 +68,10 @@ function phoneLookupVariants(digits) {
 }
 
 async function findRepairByLookup(db, lookupValue) {
-  const lookupDigits = digitsOnly(lookupValue);
-  if (!lookupDigits) return null;
+  const digits = lookupDigits(lookupValue);
+  if (!digits) return null;
 
-  const phoneCandidates = phoneLookupVariants(lookupDigits);
+  const phoneCandidates = phoneLookupVariants(digits);
 
   const queries = [
     db.collection("reports")
@@ -58,7 +81,7 @@ async function findRepairByLookup(db, lookupValue) {
       .limit(1),
     db.collection("reports")
       .where("type", "==", "repair")
-      .where("ticketDigits", "==", lookupDigits)
+      .where("ticketDigits", "==", digits)
       .orderBy("createdAt", "desc")
       .limit(1),
   ];
@@ -73,6 +96,7 @@ async function findRepairByLookup(db, lookupValue) {
 
 module.exports = {
   buildRepairMessage,
+  buildRepairReceivedMessage,
   digitsOnly,
   findRepairByLookup,
   normalizeReportDoc,

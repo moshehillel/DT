@@ -1,6 +1,6 @@
 const crypto = require("node:crypto");
 const { onRequest, onCall, HttpsError } = require("firebase-functions/v2/https");
-const { onDocumentUpdated } = require("firebase-functions/v2/firestore");
+const { onDocumentCreated, onDocumentUpdated } = require("firebase-functions/v2/firestore");
 const { onSchedule } = require("firebase-functions/v2/scheduler");
 const logger = require("firebase-functions/logger");
 const admin = require("firebase-admin");
@@ -10,7 +10,7 @@ const {
   digitsOnly,
   normalizeRcukSimNumber,
 } = require("./rcuk");
-const { buildRepairMessage, findRepairByLookup } = require("./repairs");
+const { buildRepairMessage, buildRepairReceivedMessage, findRepairByLookup } = require("./repairs");
 const {
   buildTelebroadPendingReport,
   buildTelebroadSmsRequest,
@@ -48,6 +48,7 @@ const SOLA_CREATE_CHARGE_PATH = process.env.SOLA_CREATE_CHARGE_PATH || "/gateway
 // CloudIM cloud endpoint for card-present terminal payments (PAX A80, etc.).
 const SOLA_DEVICE_API_BASE_URL = process.env.SOLA_DEVICE_API_BASE_URL || "https://device.cardknox.com/v2";
 const RENTAL_REMINDER_TIME_ZONE = process.env.RENTAL_REMINDER_TIME_ZONE || "America/New_York";
+const MAPS_API_KEY = process.env.MAPS_API_KEY || "";
 
 function getPayload(req) {
   return {
@@ -126,6 +127,75 @@ exports.deleteEmployee = onCall({ region: REGION }, async (request) => {
   }
   await admin.auth().deleteUser(uid);
   return { uid, deleted: true };
+});
+
+// ---- Address autocomplete (Google Places, proxied so the key stays server-side) ----
+
+// Returns address suggestions for what the user has typed. Any signed-in user
+// may call it. `sessionToken` ties the autocomplete calls to the follow-up
+// placeDetails call for Google's per-session billing.
+exports.placesAutocomplete = onCall({ region: REGION }, async (request) => {
+  if (!request.auth) throw new HttpsError("unauthenticated", "Sign in required.");
+  if (!MAPS_API_KEY) throw new HttpsError("failed-precondition", "MAPS_API_KEY is not configured.");
+  const input = String(request.data?.input || "").trim();
+  if (input.length < 3) return { suggestions: [] };
+  const sessionToken = String(request.data?.sessionToken || "") || undefined;
+
+  const response = await fetch("https://places.googleapis.com/v1/places:autocomplete", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Goog-Api-Key": MAPS_API_KEY },
+    body: JSON.stringify({ input, sessionToken, includedRegionCodes: ["us"] }),
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new HttpsError("internal", data?.error?.message || "Places autocomplete failed.");
+  }
+  const suggestions = (data.suggestions || [])
+    .map((item) => item.placePrediction)
+    .filter(Boolean)
+    .map((prediction) => ({ placeId: prediction.placeId, description: prediction.text?.text || "" }))
+    .filter((item) => item.placeId && item.description);
+  return { suggestions };
+});
+
+// Resolves a selected suggestion into structured address parts.
+exports.placeDetails = onCall({ region: REGION }, async (request) => {
+  if (!request.auth) throw new HttpsError("unauthenticated", "Sign in required.");
+  if (!MAPS_API_KEY) throw new HttpsError("failed-precondition", "MAPS_API_KEY is not configured.");
+  const placeId = String(request.data?.placeId || "").trim();
+  if (!placeId) throw new HttpsError("invalid-argument", "placeId is required.");
+  const sessionToken = String(request.data?.sessionToken || "");
+
+  const url = new URL(`https://places.googleapis.com/v1/places/${encodeURIComponent(placeId)}`);
+  if (sessionToken) url.searchParams.set("sessionToken", sessionToken);
+  const response = await fetch(url, {
+    headers: {
+      "X-Goog-Api-Key": MAPS_API_KEY,
+      "X-Goog-FieldMask": "formattedAddress,addressComponents",
+    },
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new HttpsError("internal", data?.error?.message || "Place details failed.");
+  }
+  const components = data.addressComponents || [];
+  const pick = (type) => components.find((component) => (component.types || []).includes(type));
+  const streetNumber = pick("street_number")?.longText || "";
+  const route = pick("route")?.longText || "";
+  const city =
+    pick("locality")?.longText ||
+    pick("postal_town")?.longText ||
+    pick("sublocality")?.longText ||
+    "";
+  const state = pick("administrative_area_level_1")?.shortText || "";
+  const zip = pick("postal_code")?.longText || "";
+  return {
+    street: `${streetNumber} ${route}`.trim(),
+    city,
+    state,
+    zip,
+    formatted: data.formattedAddress || "",
+  };
 });
 
 function sendJson(res, status, body) {
@@ -288,7 +358,8 @@ exports.repairStatus = onRequest(HTTP_OPTIONS, async (req, res) => {
 
   try {
     const payload = getPayload(req);
-    const lookup = payload.ticketLookup || payload.phone || payload.lookup || payload.Digits || "";
+    const lookup =
+      payload.ticketLookup || payload.phone || payload.lookup || payload.Digits || payload.caller || "";
     const repair = await findRepairByLookup(db, lookup);
 
     if (!repair) {
@@ -536,6 +607,38 @@ async function writeNotificationLog(logId, reportId, report, method, status, det
     createdAt: admin.firestore.FieldValue.serverTimestamp(),
   });
 }
+
+// Text the customer their ticket + details the moment a repair is accepted in store.
+exports.notifyRepairReceived = onDocumentCreated(
+  {
+    region: REGION,
+    document: "reports/{reportId}",
+  },
+  async (event) => {
+    const report = event.data?.data();
+    if (!report || report.type !== "repair") return;
+    // Only a genuinely received repair has a ticket; drafts/other statuses are skipped.
+    if (report.details?.status !== "Received" || !report.details?.ticketNumber) return;
+
+    const to = report.customerPhone;
+    if (!to) {
+      await logNotification(event.params.reportId, report, "Skipped", "No customer phone number");
+      return;
+    }
+
+    const body = buildRepairReceivedMessage(report);
+    try {
+      const result = await sendSms({ to, body });
+      // Only log failures; a successful text needs no record.
+      if (result.status !== "Sent") {
+        await logNotification(event.params.reportId, report, result.status, result.detail);
+      }
+    } catch (error) {
+      logger.error("notifyRepairReceived failed", error);
+      await logNotification(event.params.reportId, report, "Failed", error.message);
+    }
+  },
+);
 
 exports.notifyRepairDelivered = onDocumentUpdated(
   {
