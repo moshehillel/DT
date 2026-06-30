@@ -22,9 +22,10 @@ Backend scaffold for Diamant Telecom.
   - Draft Shopify POS order webhook importer. It writes Shopify POS sales into the `pendingReports` collection for employees to claim and complete.
 
 - `telebroadCallWebhook`
-  - Telebroad **Account real time calls** webhook importer. Only calls a live agent actually talked on (`talkDuration > 0`) are written into `pendingReports` as `type: "call"` for employees to claim and complete.
-  - Voicemail-only calls, missed/unanswered calls, and IVR hang-ups are **ignored** — they never reach an agent so they never become reports.
-  - Also accepts **User end call** webhooks, applying the same `talkDuration > 0` rule. This webhook is the reliable carrier of talk duration, so enabling it ensures voicemail filtering works even if a real-time event lacks a duration.
+  - Telebroad **Account real time calls** + **User end call** webhook importer. Only genuinely answered, two-party calls are written into `pendingReports` as `type: "call"` for employees to claim and complete.
+  - A call counts as answered only when its `status` is `"ended"` (Account real time calls) or `"answer"` (User end call). Everything else is ignored.
+  - Voicemail is rejected by status: Telebroad sends `status: "mailbox"` (and a `"mailbox"` destination) for calls that roll to voicemail. These are dropped even when `talkDuration > 0` (the caller can spend time leaving a message), so duration is **not** used as the gate — status is.
+  - Cancelled (`"cancel"`), still-ringing (`"ringing"`), and unreachable (`"chanunavail"`) segments are likewise ignored.
   - Configure in Telebroad Admin Center under **App Integrations > Webhooks**. Use:
     `https://REGION-PROJECT_ID.cloudfunctions.net/telebroadCallWebhook/Account-real-time-calls`
   - Optional second webhook for richer talk duration on hang-up:

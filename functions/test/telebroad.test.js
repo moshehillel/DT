@@ -26,16 +26,20 @@ const ringingInbound = {
   talkDuration: 0,
 };
 
-// Caller rolled to voicemail: the call "ended" but no agent ever talked.
+// Caller rolled to voicemail. Telebroad uses status "mailbox", and the caller
+// can spend time leaving a message, so talkDuration is > 0 — proving we must
+// gate on status, not duration.
 const voicemailInbound = {
   ...answeredInbound,
-  status: "voicemail",
-  talkDuration: 0,
+  status: "mailbox",
+  destinationType: "mailbox",
+  talkDuration: 7,
 };
 
-// Rang an agent who never picked up, then hung up: ended with no talk time.
-const unansweredInbound = {
+// Caller hung up before anyone answered.
+const cancelledInbound = {
   ...answeredInbound,
+  status: "cancel",
   talkDuration: 0,
 };
 
@@ -58,21 +62,21 @@ test("isAnsweredCall accepts calls a live agent talked on", () => {
   assert.equal(isAnsweredCall(ringingInbound), false);
 });
 
-test("isAnsweredCall accepts user end call with talk duration", () => {
+test("isAnsweredCall accepts an answered user end call", () => {
   assert.equal(isAnsweredCall(userEndedAnswered), true);
-  assert.equal(isAnsweredCall({ ...userEndedAnswered, talkDuration: 0 }), false);
 });
 
-test("isAnsweredCall rejects voicemail and no-pickup calls", () => {
+test("isAnsweredCall rejects voicemail even with talk time, and cancelled calls", () => {
   assert.equal(isAnsweredCall(voicemailInbound), false);
-  assert.equal(isAnsweredCall(unansweredInbound), false);
+  assert.equal(isAnsweredCall({ ...userEndedAnswered, status: "mailbox" }), false);
+  assert.equal(isAnsweredCall(cancelledInbound), false);
 });
 
 test("shouldImportCall skips internal, voicemail, and unanswered calls", () => {
   assert.equal(shouldImportCall(answeredInbound), true);
   assert.equal(shouldImportCall(ringingInbound), false);
   assert.equal(shouldImportCall(voicemailInbound), false);
-  assert.equal(shouldImportCall(unansweredInbound), false);
+  assert.equal(shouldImportCall(cancelledInbound), false);
   assert.equal(shouldImportCall({ ...answeredInbound, direction: "Internal" }), false);
 });
 

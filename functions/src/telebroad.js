@@ -1,20 +1,10 @@
 const { digitsOnly } = require("./rcuk");
 
-// Terminal statuses where the caller never reached a live agent. These must
-// never become call reports even though Telebroad still fires a webhook for
-// them (e.g. the caller hung up at the IVR or was sent to voicemail).
-const NO_AGENT_STATUSES = new Set([
-  "voicemail",
-  "missed",
-  "no-answer",
-  "noanswer",
-  "busy",
-  "failed",
-  "cancel",
-  "canceled",
-  "cancelled",
-  "rejected",
-]);
+// Telebroad marks a genuinely answered two-party call as "ended" (the Account
+// real time calls webhook) or "answer" (the User end call webhook). Every other
+// status means the caller never reached a live agent: "mailbox" (voicemail),
+// "cancel" (hung up before answer), "ringing", "chanunavail" (unreachable), etc.
+const AGENT_ANSWERED_STATUSES = new Set(["ended", "answer"]);
 
 function normalizeDirection(value) {
   return String(value || "").trim().toLowerCase();
@@ -25,13 +15,16 @@ function normalizeStatus(value) {
 }
 
 // A call should only turn into a report when a live agent actually spoke with
-// the customer. Voicemail-only calls (no pickup, or rolled to voicemail) have
-// no agent talk time, so we require a positive talkDuration and reject known
-// no-agent statuses. Telebroad reports talkDuration on the call's final event
-// (the "User end call" webhook, and the real-time "ended" event).
+// the customer. A call routed to voicemail carries status "mailbox" (and/or a
+// "mailbox" destination) and can still report talkDuration > 0 from the time
+// spent leaving a message — so we key off the status, not the duration, and
+// reject mailboxes outright.
 function isAnsweredCall(payload) {
-  if (NO_AGENT_STATUSES.has(normalizeStatus(payload.status))) return false;
-  return Number(payload.talkDuration || 0) > 0;
+  const status = normalizeStatus(payload.status);
+  if (status === "mailbox" || normalizeStatus(payload.destinationType) === "mailbox") {
+    return false;
+  }
+  return AGENT_ANSWERED_STATUSES.has(status);
 }
 
 function shouldImportCall(payload) {
