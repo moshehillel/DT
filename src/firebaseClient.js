@@ -10,9 +10,12 @@ import {
   collection,
   doc,
   initializeFirestore,
+  limit,
   onSnapshot,
+  orderBy,
   persistentLocalCache,
   persistentMultipleTabManager,
+  query,
   setDoc,
   writeBatch,
 } from "firebase/firestore";
@@ -203,7 +206,10 @@ export async function attachAuthMetadata(data) {
   }
 }
 
-export function watchCollection(collectionName, onItems, onError) {
+// `options.limitTo` caps the live listener to the N most recent docs (ordered by
+// `options.orderByField`, default "createdAt", descending) so large collections
+// like notificationLogs don't re-read their whole history on every load.
+export function watchCollection(collectionName, onItems, onError, options = {}) {
   let unsubscribe = () => {};
   let cancelled = false;
 
@@ -211,8 +217,12 @@ export function watchCollection(collectionName, onItems, onError) {
     .then(() => getFirebase())
     .then(({ db }) => {
       if (cancelled) return;
+      const base = collection(db, collectionName);
+      const source = options.limitTo
+        ? query(base, orderBy(options.orderByField || "createdAt", "desc"), limit(options.limitTo))
+        : base;
       unsubscribe = onSnapshot(
-        collection(db, collectionName),
+        source,
         { includeMetadataChanges: true },
         (snapshot) => {
           reportSnapshotStatus(snapshot);

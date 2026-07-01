@@ -24,7 +24,7 @@ export function useStoredState(key, fallback) {
   return [value, setValue];
 }
 
-export function useCloudCollectionState(collectionName, localKey, fallback) {
+export function useCloudCollectionState(collectionName, localKey, fallback, options = {}) {
   const [value, setValue] = useState(() => ensureArrayIds(readJson(localKey, fallback)));
   const valueRef = useRef(value);
   const cloudReadyRef = useRef(false);
@@ -59,6 +59,7 @@ export function useCloudCollectionState(collectionName, localKey, fallback) {
       (error) => {
         logSyncError(`Firestore ${collectionName} sync failed`, error);
       },
+      options,
     );
   }, [collectionName]);
 

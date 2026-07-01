@@ -109,7 +109,15 @@ function Workspace({ currentUser, isAdmin }) {
   const [pendingReports, setPendingReports] = useCloudCollectionState("pendingReports", PENDING_REPORTS_KEY, []);
   const [phoneOrders, setPhoneOrders] = useCloudCollectionState("phoneOrders", PHONE_ORDERS_KEY, []);
   const [orderHandlers, setOrderHandlers] = useCloudCollectionState("orderHandlers", ORDER_HANDLERS_KEY, defaultOrderHandlers);
-  const [notifications, setNotifications] = useCloudCollectionState("notificationLogs", "diamant-telecom-notifications-v1", []);
+  // notificationLogs grows without bound and is only used for small previews and
+  // counts — cap the live listener to the 50 most recent so it never re-reads the
+  // whole history on load.
+  const [notifications, setNotifications] = useCloudCollectionState(
+    "notificationLogs",
+    "diamant-telecom-notifications-v1",
+    [],
+    { limitTo: 50, orderByField: "createdAt" },
+  );
   const [resetRequests, setResetRequests] = useCloudCollectionState("passwordResetRequests", RESET_REQUESTS_KEY, []);
   const [products, setProducts] = useCloudCollectionState("products", PRODUCTS_KEY, []);
   const [stores, setStores] = useCloudDocumentState("stores", STORES_KEY, []);
@@ -2729,6 +2737,11 @@ function ReportHistory({
   const hasActions = Boolean(onDeleteReport || onReturn);
   const columnCount = hasActions ? 9 : 8;
   const [returnScan, setReturnScan] = useState("");
+  // Show the log in pages of 20; "See more" reveals another 20. Reset whenever
+  // the filters change so a new search starts from the top.
+  const PAGE_SIZE = 20;
+  const [visibleCount, setVisibleCount] = useState(PAGE_SIZE);
+  useEffect(() => setVisibleCount(PAGE_SIZE), [filters]);
 
   function handleReturnScan(event) {
     event.preventDefault();
@@ -2927,7 +2940,7 @@ function ReportHistory({
           </thead>
           <tbody>
             {reports.length ? (
-              reports.map((report) => (
+              reports.slice(0, visibleCount).map((report) => (
                 <ReportRow
                   report={report}
                   key={report.id}
@@ -2945,6 +2958,14 @@ function ReportHistory({
             )}
           </tbody>
         </table>
+        {reports.length > visibleCount ? (
+          <div className="see-more-row">
+            <span className="muted">Showing {visibleCount} of {reports.length}</span>
+            <button className="secondary-button" type="button" onClick={() => setVisibleCount((count) => count + PAGE_SIZE)}>
+              See more ({Math.min(PAGE_SIZE, reports.length - visibleCount)})
+            </button>
+          </div>
+        ) : null}
       </div>
       </>
       ) : (

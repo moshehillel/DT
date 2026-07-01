@@ -1749,6 +1749,14 @@ tr:last-child td {
   margin-top: 8px;
 }
 
+.see-more-row {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  padding: 12px;
+}
+
 .pos-imei-missing {
   border-color: var(--danger);
   background: #fdecec;
