@@ -890,6 +890,23 @@ function Workspace({ currentUser, isAdmin }) {
     );
   }
 
+  // Edit a repair's fields from the queue. `patch` may carry top-level keys
+  // (customerPhone, paymentMethod, notes) and a nested `details` object; both are
+  // shallow-merged so untouched fields are preserved.
+  function updateRepair(reportId, patch) {
+    const { details: detailsPatch = {}, ...top } = patch || {};
+    if (typeof top.customerPhone === "string") {
+      top.customerPhoneDigits = digitsOnly(top.customerPhone);
+    }
+    setReports((current) =>
+      current.map((report) =>
+        report.id === reportId
+          ? { ...report, ...top, details: { ...report.details, ...detailsPatch } }
+          : report,
+      ),
+    );
+  }
+
   function queueDeliveryNotification(report) {
     const method = report.details?.notificationPreference || "Text message";
     const notification = {
@@ -1238,6 +1255,7 @@ function Workspace({ currentUser, isAdmin }) {
             onStatusChange={updateRepairStatus}
             onSetReady={markRepairReady}
             onMarkPaid={markRepairPaid}
+            onEditRepair={updateRepair}
           />
         ) : activeView === "customers" ? (
           <CustomersPage
@@ -1283,6 +1301,7 @@ function Workspace({ currentUser, isAdmin }) {
               key={`${activeType}-${formNonce}`}
               activeType={activeType}
               activeEmployee={activeEmployee}
+              activeLocation={activeLocation}
               reports={reports}
               customers={customers}
               activeStoreInfo={activeStoreInfo}
@@ -1701,7 +1720,7 @@ function buildInitialFieldValues(config) {
   return values;
 }
 
-function ReportForm({ activeType, activeEmployee, reports, customers, activeStoreInfo, onSaveCustomerName, onSaveCustomer, onSave }) {
+function ReportForm({ activeType, activeEmployee, activeLocation, reports, customers, activeStoreInfo, onSaveCustomerName, onSaveCustomer, onSave }) {
   const [now, setNow] = useState(new Date());
   const [customerPhone, setCustomerPhone] = useState("");
   const [paymentAmount, setPaymentAmount] = useState("");
@@ -1791,6 +1810,7 @@ function ReportForm({ activeType, activeEmployee, reports, customers, activeStor
     const matchedCustomer = phoneDigits
       ? (customers || []).find((entry) => entry.phoneDigits === phoneDigits || entry.mobileDigits === phoneDigits)
       : null;
+    details.location = activeLocation || "";
     details.storeAddress = activeStoreInfo?.address || "";
     details.storeHours = activeStoreInfo?.hours || "";
     details.customerName = titleCaseName(details.customerName) || matchedCustomer?.name || "";
@@ -1802,6 +1822,8 @@ function ReportForm({ activeType, activeEmployee, reports, customers, activeStor
       type: activeType,
       createdAt: new Date().toISOString(),
       servedBy: activeEmployee,
+      // Record which store took the report so it's visible on the repair queue.
+      location: activeLocation || "",
       customerPhone: String(formData.get("customerPhone") || "").trim(),
       customerPhoneDigits: digitsOnly(formData.get("customerPhone")),
       paymentAmount: String(formData.get("paymentAmount") || "").trim(),
@@ -2895,10 +2917,12 @@ function ReportHistory({
   );
 }
 
-function OpenRepairsPage({ reports, onStatusChange, onSetReady, onMarkPaid }) {
+function OpenRepairsPage({ reports, onStatusChange, onSetReady, onMarkPaid, onEditRepair }) {
   const [paying, setPaying] = useState({ id: "", status: "", message: "" });
   // When set, the final-price dialog is open for this repair before it goes Ready.
   const [finalPrompt, setFinalPrompt] = useState(null);
+  // When set, the edit dialog is open for this repair.
+  const [editing, setEditing] = useState(null);
   const openRepairs = reports.filter((report) =>
     report.type === "repair" && !["Completed", "Cancelled"].includes(report.details?.status),
   );
@@ -2976,12 +3000,14 @@ function OpenRepairsPage({ reports, onStatusChange, onSetReady, onMarkPaid }) {
             <tr>
               <th>Ticket</th>
               <th>Date</th>
+              <th>Store</th>
               <th>Customer</th>
               <th>Phone</th>
               <th>Damage</th>
               <th>Payment</th>
               <th>Served by</th>
               <th>Status</th>
+              <th></th>
             </tr>
           </thead>
           <tbody>
@@ -2994,6 +3020,7 @@ function OpenRepairsPage({ reports, onStatusChange, onSetReady, onMarkPaid }) {
                   <tr key={repair.id}>
                     <td><strong>{repair.details?.ticketNumber || "-"}</strong></td>
                     <td>{formatShortDate(repair.createdAt)}</td>
+                    <td>{repair.location || repair.details?.location || "-"}</td>
                     <td>{repair.customerPhone || "-"}</td>
                     <td>{repair.details?.model || "-"}</td>
                     <td>{repair.details?.damage || "-"}</td>
@@ -3032,12 +3059,17 @@ function OpenRepairsPage({ reports, onStatusChange, onSetReady, onMarkPaid }) {
                         ))}
                       </select>
                     </td>
+                    <td>
+                      <button className="secondary-button compact-button" type="button" onClick={() => setEditing(repair)}>
+                        Edit
+                      </button>
+                    </td>
                   </tr>
                 );
               })
             ) : (
               <tr>
-                <td colSpan="8" className="empty-state">No open repairs.</td>
+                <td colSpan="10" className="empty-state">No open repairs.</td>
               </tr>
             )}
           </tbody>
@@ -3052,7 +3084,93 @@ function OpenRepairsPage({ reports, onStatusChange, onSetReady, onMarkPaid }) {
           onClose={() => setFinalPrompt(null)}
         />
       ) : null}
+
+      {editing ? (
+        <EditRepairDialog
+          repair={editing}
+          onSave={(patch) => {
+            onEditRepair(editing.id, patch);
+            setEditing(null);
+          }}
+          onClose={() => setEditing(null)}
+        />
+      ) : null}
     </section>
+  );
+}
+
+function EditRepairDialog({ repair, onSave, onClose }) {
+  const details = repair.details || {};
+  const [form, setForm] = useState({
+    model: details.model || "",
+    damage: details.damage || "",
+    imei: details.imei || "",
+    estimatedPrice: details.estimatedPrice || repair.paymentAmount || "",
+    finalPrice: details.finalPrice || "",
+    dueDate: details.dueDate || "",
+    notificationPreference: details.notificationPreference || "Text message",
+    paymentMethod: repair.paymentMethod || "Cash",
+    customerPhone: repair.customerPhone || "",
+    notes: repair.notes || "",
+  });
+
+  const set = (name, value) => setForm((current) => ({ ...current, [name]: value }));
+
+  function submit(event) {
+    event.preventDefault();
+    event.stopPropagation();
+    // Final price, once set, is the amount owed — mirror it to paymentAmount.
+    const amount = String(form.finalPrice ?? "").trim() || String(form.estimatedPrice ?? "").trim();
+    onSave({
+      customerPhone: form.customerPhone.trim(),
+      paymentMethod: form.paymentMethod,
+      paymentAmount: amount,
+      notes: form.notes.trim(),
+      details: {
+        model: form.model.trim(),
+        damage: form.damage.trim(),
+        imei: form.imei.trim(),
+        estimatedPrice: String(form.estimatedPrice ?? "").trim(),
+        finalPrice: String(form.finalPrice ?? "").trim(),
+        dueDate: form.dueDate,
+        notificationPreference: form.notificationPreference,
+      },
+    });
+  }
+
+  return createPortal(
+    <div className="dialog-backdrop" role="presentation" onMouseDown={onClose}>
+      <div className="dialog-card dialog-card-wide" role="dialog" aria-modal="true" onMouseDown={(event) => event.stopPropagation()}>
+        <h2>Edit repair {details.ticketNumber ? `#${details.ticketNumber}` : ""}</h2>
+        <form className="form-grid" onSubmit={submit}>
+          <label className="field"><span>Phone model</span><input value={form.model} onChange={(event) => set("model", event.target.value)} autoFocus /></label>
+          <label className="field"><span>What is damaged?</span><input value={form.damage} onChange={(event) => set("damage", event.target.value)} /></label>
+          <label className="field"><span>Phone IMEI</span><input value={form.imei} inputMode="numeric" onChange={(event) => set("imei", event.target.value)} /></label>
+          <label className="field"><span>Customer phone</span><input value={form.customerPhone} inputMode="tel" onChange={(event) => set("customerPhone", event.target.value)} /></label>
+          <label className="field"><span>Estimated price</span><input value={form.estimatedPrice} inputMode="decimal" placeholder="0.00" onChange={(event) => set("estimatedPrice", event.target.value)} /></label>
+          <label className="field"><span>Final price</span><input value={form.finalPrice} inputMode="decimal" placeholder="0.00" onChange={(event) => set("finalPrice", event.target.value)} /></label>
+          <label className="field"><span>Expected ready date</span><input type="date" value={form.dueDate} onChange={(event) => set("dueDate", event.target.value)} /></label>
+          <label className="field">
+            <span>Payment method</span>
+            <select value={form.paymentMethod} onChange={(event) => set("paymentMethod", event.target.value)}>
+              {paymentMethods.map((method) => <option key={method}>{method}</option>)}
+            </select>
+          </label>
+          <label className="field">
+            <span>When ready notify by</span>
+            <select value={form.notificationPreference} onChange={(event) => set("notificationPreference", event.target.value)}>
+              {["Text message", "Phone call", "Both"].map((option) => <option key={option}>{option}</option>)}
+            </select>
+          </label>
+          <label className="field full"><span>Notes</span><textarea rows={2} value={form.notes} onChange={(event) => set("notes", event.target.value)} /></label>
+          <div className="pos-form-actions form-actions-row">
+            <button className="primary-button" type="submit">Save changes</button>
+            <button className="secondary-button" type="button" onClick={onClose}>Cancel</button>
+          </div>
+        </form>
+      </div>
+    </div>,
+    document.body,
   );
 }
 
