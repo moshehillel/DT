@@ -51,7 +51,10 @@ export function useCloudCollectionState(collectionName, localKey, fallback) {
           return;
         }
         if (pendingWritesRef.current > 0) return;
-        setValue(sortCloudItems(items));
+        const sorted = sortCloudItems(items);
+        // Skip no-op updates (e.g. metadata-only snapshots) so we don't churn
+        // identity and re-run downstream effects that can trigger more writes.
+        if (!isSameArray(sorted, valueRef.current)) setValue(sorted);
       },
       (error) => {
         logSyncError(`Firestore ${collectionName} sync failed`, error);
@@ -102,6 +105,10 @@ export function useCloudDocumentState(documentId, localKey, fallback, options = 
   mergeRef.current = merge;
   const cloudReadyRef = useRef(false);
   const bootstrappedRef = useRef(false);
+  // The last value we pushed to the cloud, so an echo of our own write (or a
+  // stable shape difference the merge keeps re-producing) can't make us heal the
+  // same value over and over — a self-sustaining write/read loop across devices.
+  const lastPushedRef = useRef(null);
 
   useEffect(() => {
     valueRef.current = value;
@@ -133,10 +140,14 @@ export function useCloudDocumentState(documentId, localKey, fallback, options = 
         }
 
         const merged = mergeRef.current(valueRef.current, items);
-        setValue(merged);
+        // Only re-render when the content actually changed — a new array with the
+        // same content still churns identity and re-runs downstream effects.
+        if (!isSameArray(merged, valueRef.current)) setValue(merged);
         // If the merge recovered entries the cloud was missing, heal the cloud so
-        // every other device converges on the union instead of the shorter list.
-        if (!isSameArray(merged, items)) {
+        // every other device converges on the union instead of the shorter list —
+        // but never re-push a value we already pushed (breaks the loop).
+        if (!isSameArray(merged, items) && !isSameArray(merged, lastPushedRef.current)) {
+          lastPushedRef.current = merged;
           replaceAppStateDocument(documentId, merged).catch((error) =>
             logSyncError(`Firestore appState/${documentId} sync failed`, error),
           );
@@ -155,6 +166,7 @@ export function useCloudDocumentState(documentId, localKey, fallback, options = 
         : nextValueOrUpdater;
 
       if (cloudReadyRef.current) {
+        lastPushedRef.current = nextValue;
         replaceAppStateDocument(documentId, nextValue).catch((error) =>
           logSyncError(`Firestore appState/${documentId} sync failed`, error),
         );
