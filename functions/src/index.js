@@ -676,7 +676,12 @@ exports.notifyRepairDelivered = onDocumentUpdated(
     };
 
     if (becameReady) {
-      const body = `Diamant Telecom: repair ticket ${after.details?.ticketNumber || ""} for ${after.details?.model || "your phone"} is ready for pickup.`;
+      const amountDue = after.details?.finalPrice || after.paymentAmount || "";
+      const dueText =
+        amountDue && after.details?.paymentStatus !== "Paid"
+          ? ` Amount due: $${(Number(amountDue) || 0).toFixed(2)}.`
+          : "";
+      const body = `Diamant Telecom: repair ticket ${after.details?.ticketNumber || ""} for ${after.details?.model || "your phone"} is ready for pickup.${dueText}`;
       await sendOne(after.details?.notificationPreference || "Text message", body);
     }
 

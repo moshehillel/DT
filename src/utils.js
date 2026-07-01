@@ -263,6 +263,25 @@ export function numberValue(value) {
   return Number.isFinite(parsed) ? parsed : 0;
 }
 
+// Parse a per-line price-adjustment code: "+35" adds $35 to the unit price,
+// "-10" subtracts $10. A bare number (e.g. "35") is treated as an add. Anything
+// unparseable (or empty) yields 0 so the base price is used unchanged.
+export function parsePriceAdjust(code) {
+  const clean = String(code || "").trim();
+  if (!clean) return 0;
+  const match = clean.match(/^([+-]?)(\d+(?:\.\d{1,2})?)$/);
+  if (!match) return 0;
+  const value = Number(match[2]);
+  return match[1] === "-" ? -value : value;
+}
+
+// The unit price actually charged for a cart line once its adjustment code is
+// applied. Never goes below $0 (a discount can zero an item but not owe money).
+export function effectiveLinePrice(line) {
+  const base = Number(line?.price) || 0;
+  return Math.max(0, base + parsePriceAdjust(line?.adjustCode));
+}
+
 export function uniqueValues(values) {
   return [...new Set(values.filter(Boolean))];
 }
@@ -302,6 +321,27 @@ export function unionStrings(local, cloud) {
     result.push(name);
   }
   return result;
+}
+
+// Union of two lists of `{ name, updatedAt?, deleted?, ... }` objects, keyed by
+// `name`. For a name present in both copies the most-recently-updated entry wins
+// (by `updatedAt`), so a fresh edit OR delete on one device always beats a stale
+// copy on another. Deleted entries are kept as tombstones so the deletion
+// propagates instead of being resurrected by a device that still has the name
+// cached — callers filter tombstones out of the visible list. Local-only names
+// are still kept so a stale device can never drop a record another device added.
+export function unionByName(local, cloud) {
+  const byName = new Map();
+  const consider = (item) => {
+    if (!item?.name) return;
+    const existing = byName.get(item.name);
+    if (!existing || (Number(item.updatedAt) || 0) >= (Number(existing.updatedAt) || 0)) {
+      byName.set(item.name, item);
+    }
+  };
+  for (const item of cloud || []) consider(item);
+  for (const item of local || []) consider(item);
+  return [...byName.values()];
 }
 
 export function calculateInclusiveDays(startDate, endDate) {

@@ -670,6 +670,48 @@ button:active {
   padding: 26px;
 }
 
+.address-autocomplete {
+  position: relative;
+}
+
+.address-suggestions {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  right: 0;
+  z-index: 30;
+  margin: 2px 0 0;
+  padding: 4px;
+  list-style: none;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  box-shadow: var(--shadow-soft);
+  max-height: 240px;
+  overflow-y: auto;
+}
+
+.address-suggestions li {
+  margin: 0;
+}
+
+.address-suggestions button {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 8px 10px;
+  border: 0;
+  background: transparent;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 13px;
+  color: var(--ink);
+}
+
+.address-suggestions button:hover {
+  background: var(--line);
+}
+
 .cloud-offline-banner {
   margin-bottom: 12px;
   padding: 12px 16px;
@@ -1663,6 +1705,14 @@ tr:last-child td {
   border: 1px solid var(--line);
   border-radius: 8px;
   padding: 6px 8px;
+}
+
+.pos-adjust {
+  width: 72px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 6px 8px;
+  text-align: center;
 }
 
 .pos-imei-missing {

@@ -5,12 +5,8 @@ import {
   ACTIVE_EMPLOYEE_KEY,
   COMPANY,
   CUSTOMERS_KEY,
-  defaultEmployees,
   defaultManualReportType,
   defaultOrderHandlers,
-  defaultStoreLocations,
-  EMPLOYEE_KEY,
-  EMPLOYEE_LOCATIONS_KEY,
   FUNCTIONS_BASE_URL,
   lookupRepairPrice,
   manualReportTypeKeys,
@@ -23,10 +19,9 @@ import {
   repairStatuses,
   reportTypes,
   RESET_REQUESTS_KEY,
+  STAFF_KEY,
   STORAGE_KEY,
-  STORE_DEVICES_KEY,
-  STORE_LOCATIONS_KEY,
-  STORE_TAX_KEY,
+  STORES_KEY,
 } from "./constants";
 import { useCloudCollectionState, useCloudDocumentState } from "./hooks/useCloudState";
 import {
@@ -49,6 +44,7 @@ import {
   code128Svg,
   createEmptyFilters,
   digitsOnly,
+  effectiveLinePrice,
   escapeHtml,
   generateReceiptCode,
   exportCsv,
@@ -63,11 +59,12 @@ import {
   isSolaPaidStatus,
   normalizeRcukSimNumber,
   numberValue,
+  parsePriceAdjust,
   playScanBeep,
   playScanError,
   titleCaseName,
   toJsDate,
-  unionStrings,
+  unionByName,
   uniqueValues,
 } from "./utils";
 import "./styles.css";
@@ -107,9 +104,7 @@ function Workspace({ currentUser, isAdmin }) {
   const employeeName = currentUser?.displayName || currentUser?.email || "";
   const sessionRole = isAdmin ? "admin" : "employee";
   const [activeType, setActiveType] = useState(defaultManualReportType);
-  const [employees, setEmployees] = useCloudDocumentState("employees", EMPLOYEE_KEY, defaultEmployees, {
-    merge: unionStrings,
-  });
+  const [staff, setStaff] = useCloudDocumentState("staff", STAFF_KEY, [], { merge: unionByName });
   const [reports, setReports] = useCloudCollectionState("reports", STORAGE_KEY, []);
   const [pendingReports, setPendingReports] = useCloudCollectionState("pendingReports", PENDING_REPORTS_KEY, []);
   const [phoneOrders, setPhoneOrders] = useCloudCollectionState("phoneOrders", PHONE_ORDERS_KEY, []);
@@ -117,11 +112,27 @@ function Workspace({ currentUser, isAdmin }) {
   const [notifications, setNotifications] = useCloudCollectionState("notificationLogs", "diamant-telecom-notifications-v1", []);
   const [resetRequests, setResetRequests] = useCloudCollectionState("passwordResetRequests", RESET_REQUESTS_KEY, []);
   const [products, setProducts] = useCloudCollectionState("products", PRODUCTS_KEY, []);
-  const [storeLocations, setStoreLocations] = useCloudDocumentState("storeLocations", STORE_LOCATIONS_KEY, defaultStoreLocations);
-  const [employeeLocations, setEmployeeLocations] = useCloudDocumentState("employeeLocations", EMPLOYEE_LOCATIONS_KEY, []);
-  const [storeDevices, setStoreDevices] = useCloudDocumentState("storeDevices", STORE_DEVICES_KEY, []);
-  const [storeTax, setStoreTax] = useCloudDocumentState("storeTax", STORE_TAX_KEY, []);
+  const [stores, setStores] = useCloudDocumentState("stores", STORES_KEY, []);
   const [customers, setCustomers] = useCloudCollectionState("customers", CUSTOMERS_KEY, []);
+
+  // `stores` and `staff` are the single sources of truth. Every store name,
+  // address, hours, tax rate and terminal device lives in one `stores` entry;
+  // every employee name + assigned store lives in one `staff` entry. The lists
+  // and the old per-concern shapes below are derived views so all screens read
+  // from one place and the documents can never drift apart again.
+  const storeLocations = useMemo(
+    () => (stores || []).map((store) => store?.name).filter(Boolean),
+    [stores],
+  );
+  const employees = useMemo(
+    () => (staff || []).filter((member) => member?.name && !member.deleted).map((member) => member.name),
+    [staff],
+  );
+  // A `store` object already carries rate/hours/address/deviceId and a `staff`
+  // object carries location, so these aliases keep every existing lookup working.
+  const storeTax = stores;
+  const storeDevices = stores;
+  const employeeLocations = staff;
   // Employees are locked to their own identity; admins can file/view as any
   // employee in the list.
   const [activeEmployee, setActiveEmployee] = useState(
@@ -134,13 +145,26 @@ function Workspace({ currentUser, isAdmin }) {
   const [formNonce, setFormNonce] = useState(0);
   const [returnTarget, setReturnTarget] = useState(null);
 
-  // Keep the signed-in employee's name in the shared list so admins can see and
-  // attribute to them.
+  // Keep the signed-in employee in the staff list so admins can see and
+  // attribute to them. Adds a bare entry (no store yet) the first time they sign
+  // in; the union merge keeps it from ever being dropped by another device.
   useEffect(() => {
     if (employeeName && !employees.includes(employeeName)) {
-      setEmployees((current) => (current.includes(employeeName) ? current : [...current, employeeName]));
+      setStaff((current) => {
+        const list = current || [];
+        const existing = list.find((member) => member?.name === employeeName);
+        // A signed-in user is active by definition, so clear any stale tombstone.
+        if (existing) {
+          return list.map((member) =>
+            member?.name === employeeName
+              ? { ...member, deleted: false, updatedAt: Date.now() }
+              : member,
+          );
+        }
+        return [...list, { name: employeeName, location: "", updatedAt: Date.now() }];
+      });
     }
-  }, [employeeName, employees, setEmployees]);
+  }, [employeeName, employees, setStaff]);
 
   useEffect(() => {
     if (!isAdmin) {
@@ -279,9 +303,8 @@ function Workspace({ currentUser, isAdmin }) {
     const name = String((typeof store === "string" ? store : store?.name) || "").trim();
     if (!name || storeLocations.includes(name)) return;
     const address = typeof store === "string" ? {} : store || {};
-    setStoreLocations((current) => [...current, name]);
-    setStoreTax((current) => [
-      ...current.filter((entry) => entry?.name !== name),
+    setStores((current) => [
+      ...(current || []).filter((entry) => entry?.name !== name),
       {
         name,
         street: String(address.street || "").trim(),
@@ -290,6 +313,7 @@ function Workspace({ currentUser, isAdmin }) {
         zip: String(address.zip || "").trim(),
         hours: String(address.hours || "").trim(),
         rate: 0,
+        deviceId: "",
       },
     ]);
   }
@@ -300,20 +324,19 @@ function Workspace({ currentUser, isAdmin }) {
       return;
     }
     if (!window.confirm(`Remove ${name}? This also removes its tax and address settings.`)) return;
-    setStoreLocations((current) => current.filter((location) => location !== name));
-    setStoreTax((current) => current.filter((entry) => entry?.name !== name));
+    setStores((current) => (current || []).filter((entry) => entry?.name !== name));
   }
 
   function setStoreTaxRate(name, rate) {
     const value = Number.parseFloat(rate);
-    setStoreTax((current) =>
-      current.map((entry) => (entry?.name === name ? { ...entry, rate: Number.isFinite(value) ? value : 0 } : entry)),
+    setStores((current) =>
+      (current || []).map((entry) => (entry?.name === name ? { ...entry, rate: Number.isFinite(value) ? value : 0 } : entry)),
     );
   }
 
   // Edit any store config field (hours, address parts) for an existing store.
   function updateStoreInfo(name, patch) {
-    setStoreTax((current) => current.map((entry) => (entry?.name === name ? { ...entry, ...patch } : entry)));
+    setStores((current) => (current || []).map((entry) => (entry?.name === name ? { ...entry, ...patch } : entry)));
   }
 
   // Auto-add/merge a customer into the CRM from any sale/call/order. Only fills
@@ -456,20 +479,24 @@ function Workspace({ currentUser, isAdmin }) {
   }
 
   function setEmployeeLocation(name, location) {
-    setEmployeeLocations((current) => {
-      const others = (current || []).filter((entry) => entry?.name !== name);
-      if (!location) return others;
-      return [...others, { name, location }];
+    const cleanName = String(name || "").trim();
+    if (!cleanName) return;
+    setStaff((current) => {
+      const list = current || [];
+      // Update the assigned store in place, keeping the staff entry itself so
+      // clearing a location never removes the employee from the list.
+      if (list.some((entry) => entry?.name === cleanName)) {
+        return list.map((entry) => (entry?.name === cleanName ? { ...entry, location, updatedAt: Date.now() } : entry));
+      }
+      return [...list, { name: cleanName, location, updatedAt: Date.now() }];
     });
   }
 
   function setStoreDevice(name, deviceId) {
     const cleanDeviceId = String(deviceId || "").trim();
-    setStoreDevices((current) => {
-      const others = (current || []).filter((entry) => entry?.name !== name);
-      if (!cleanDeviceId) return others;
-      return [...others, { name, deviceId: cleanDeviceId }];
-    });
+    setStores((current) =>
+      (current || []).map((entry) => (entry?.name === name ? { ...entry, deviceId: cleanDeviceId } : entry)),
+    );
   }
 
   function saveProduct(product) {
@@ -826,6 +853,30 @@ function Workspace({ currentUser, isAdmin }) {
     }
   }
 
+  // Mark a repair Ready with the final price the customer actually owes. The
+  // final price becomes the charge/paid amount; the estimate stays on record.
+  function markRepairReady(reportId, finalPrice) {
+    const report = reports.find((item) => item.id === reportId);
+    const oldStatus = report?.details?.status;
+    const amount = String(finalPrice ?? "").trim();
+
+    setReports((current) =>
+      current.map((item) =>
+        item.id === reportId
+          ? {
+              ...item,
+              paymentAmount: amount || item.paymentAmount,
+              details: { ...item.details, status: "Ready", finalPrice: amount },
+            }
+          : item,
+      ),
+    );
+
+    if (oldStatus !== "Ready" && report?.customerPhone && !FUNCTIONS_BASE_URL) {
+      queueDeliveryNotification(report);
+    }
+  }
+
   // Mark a repair paid (optionally storing card-charge details). Persisting the
   // status change triggers the notifyRepairPaid Cloud Function, which texts the
   // customer that their repair is marked paid.
@@ -929,18 +980,44 @@ function Workspace({ currentUser, isAdmin }) {
     setNotifications((current) => [notification, ...current]);
   }
 
-  // Keep the shared employee-name list in step with the real user accounts so
-  // attribution and admin filters keep working.
+  // Keep the staff list in step with the real user accounts so attribution and
+  // admin filters keep working.
   function syncEmployeeName(name) {
     const cleanName = String(name || "").trim();
     if (!cleanName) return;
-    setEmployees((current) => (current.includes(cleanName) ? current : [...current, cleanName]));
+    setStaff((current) => {
+      const list = current || [];
+      const existing = list.find((member) => member?.name === cleanName);
+      if (existing && !existing.deleted) return current; // already active, nothing to do
+      // Re-adding a previously deleted name clears the tombstone with a fresh stamp.
+      if (existing) {
+        return list.map((member) =>
+          member?.name === cleanName
+            ? { ...member, deleted: false, updatedAt: Date.now() }
+            : member,
+        );
+      }
+      return [...list, { name: cleanName, location: "", updatedAt: Date.now() }];
+    });
   }
 
   function unsyncEmployeeName(name) {
     const cleanName = String(name || "").trim();
     if (!cleanName) return;
-    setEmployees((current) => current.filter((employee) => employee !== cleanName));
+    // Tombstone the entry (with a fresh timestamp) rather than dropping it, so the
+    // delete wins the union merge and propagates instead of being resurrected by
+    // another device that still has the name cached. Re-creating the user clears it.
+    setStaff((current) => {
+      const list = current || [];
+      if (list.some((member) => member?.name === cleanName)) {
+        return list.map((member) =>
+          member?.name === cleanName
+            ? { ...member, deleted: true, updatedAt: Date.now() }
+            : member,
+        );
+      }
+      return [...list, { name: cleanName, location: "", deleted: true, updatedAt: Date.now() }];
+    });
   }
 
   function clearReports() {
@@ -1159,6 +1236,7 @@ function Workspace({ currentUser, isAdmin }) {
           <OpenRepairsPage
             reports={filteredReports}
             onStatusChange={updateRepairStatus}
+            onSetReady={markRepairReady}
             onMarkPaid={markRepairPaid}
           />
         ) : activeView === "customers" ? (
@@ -1703,6 +1781,9 @@ function ReportForm({ activeType, activeEmployee, reports, customers, activeStor
       }
       details.ticketNumber = generateRepairTicketNumber(reports);
       details.ticketDigits = digitsOnly(details.ticketNumber);
+      // The intake amount is the quote; the real price is set when the repair is
+      // marked Ready. Record it explicitly as the estimated price.
+      details.estimatedPrice = String(formData.get("paymentAmount") || "").trim();
     }
 
     // Snapshot store + customer details so the printed ticket is self-contained.
@@ -1769,7 +1850,7 @@ function ReportForm({ activeType, activeEmployee, reports, customers, activeStor
           </label>
 
           <label className="field">
-            <span>Payment amount</span>
+            <span>{isRepair ? "Estimated price" : "Payment amount"}</span>
             <input
               name="paymentAmount"
               inputMode="decimal"
@@ -2814,11 +2895,33 @@ function ReportHistory({
   );
 }
 
-function OpenRepairsPage({ reports, onStatusChange, onMarkPaid }) {
+function OpenRepairsPage({ reports, onStatusChange, onSetReady, onMarkPaid }) {
   const [paying, setPaying] = useState({ id: "", status: "", message: "" });
+  // When set, the final-price dialog is open for this repair before it goes Ready.
+  const [finalPrompt, setFinalPrompt] = useState(null);
   const openRepairs = reports.filter((report) =>
     report.type === "repair" && !["Completed", "Cancelled"].includes(report.details?.status),
   );
+
+  // Marking a repair "Ready" requires the final price. Open the dialog first (any
+  // other status change just persists). The estimate pre-fills the dialog.
+  function handleStatusChange(repair, status) {
+    if (status === "Ready" && repair.details?.status !== "Ready") {
+      setFinalPrompt({
+        id: repair.id,
+        ticket: repair.details?.ticketNumber || "",
+        value: repair.details?.finalPrice || repair.details?.estimatedPrice || repair.paymentAmount || "",
+      });
+      return;
+    }
+    onStatusChange(repair.id, status);
+  }
+
+  function confirmFinalPrice() {
+    if (!finalPrompt) return;
+    onSetReady(finalPrompt.id, finalPrompt.value);
+    setFinalPrompt(null);
+  }
 
   // Mark a repair paid. For card payments, run the charge on the local terminal
   // first and only mark paid once the card is approved. The "paid" SMS to the
@@ -2896,6 +2999,11 @@ function OpenRepairsPage({ reports, onStatusChange, onMarkPaid }) {
                     <td>{repair.details?.damage || "-"}</td>
                     <td>
                       <div>{formatPayment(repair.paymentAmount)} · {isPaid ? "Paid" : "Not paid"}{repair.paymentMethod ? ` · ${repair.paymentMethod}` : ""}</div>
+                      <div className="muted">
+                        {repair.details?.finalPrice
+                          ? `Final ${formatPayment(repair.details.finalPrice)}`
+                          : `Est. ${formatPayment(repair.details?.estimatedPrice || repair.paymentAmount)}`}
+                      </div>
                       {isPaid ? null : (
                         <div className="pos-row-actions">
                           <button
@@ -2917,7 +3025,7 @@ function OpenRepairsPage({ reports, onStatusChange, onMarkPaid }) {
                       <select
                         className="status-select"
                         value={repair.details?.status || repairStatuses[0]}
-                        onChange={(event) => onStatusChange(repair.id, event.target.value)}
+                        onChange={(event) => handleStatusChange(repair, event.target.value)}
                       >
                         {repairStatuses.map((status) => (
                           <option key={status}>{status}</option>
@@ -2935,7 +3043,53 @@ function OpenRepairsPage({ reports, onStatusChange, onMarkPaid }) {
           </tbody>
         </table>
       </div>
+
+      {finalPrompt ? (
+        <FinalPriceDialog
+          prompt={finalPrompt}
+          onChange={(value) => setFinalPrompt((current) => ({ ...current, value }))}
+          onConfirm={confirmFinalPrice}
+          onClose={() => setFinalPrompt(null)}
+        />
+      ) : null}
     </section>
+  );
+}
+
+function FinalPriceDialog({ prompt, onChange, onConfirm, onClose }) {
+  function submit(event) {
+    event.preventDefault();
+    event.stopPropagation();
+    onConfirm();
+  }
+
+  return createPortal(
+    <div className="dialog-backdrop" role="presentation" onMouseDown={onClose}>
+      <div className="dialog-card" role="dialog" aria-modal="true" onMouseDown={(event) => event.stopPropagation()}>
+        <h2>Final price</h2>
+        <p className="muted">
+          Enter the final price for repair {prompt.ticket ? `#${prompt.ticket}` : ""} before marking it Ready.
+          This becomes the amount the customer owes.
+        </p>
+        <form className="form-grid" onSubmit={submit}>
+          <label className="field">
+            <span>Final price</span>
+            <input
+              inputMode="decimal"
+              placeholder="0.00"
+              value={prompt.value}
+              onChange={(event) => onChange(event.target.value)}
+              autoFocus
+            />
+          </label>
+          <div className="pos-form-actions form-actions-row">
+            <button className="primary-button" type="submit">Save &amp; mark Ready</button>
+            <button className="secondary-button" type="button" onClick={onClose}>Cancel</button>
+          </div>
+        </form>
+      </div>
+    </div>,
+    document.body,
   );
 }
 
@@ -3383,6 +3537,7 @@ function PhoneOrderPage({ activeEmployee, sessionRole, activeLocation, storeLoca
       requiresImei: Boolean(product.requiresImei),
       imei: "",
       category: product.category || "",
+      adjustCode: "",
     };
   }
 
@@ -3451,11 +3606,16 @@ function PhoneOrderPage({ activeEmployee, sessionRole, activeLocation, storeLoca
   function updateImei(lineId, value) {
     setCart((current) => current.map((line) => (line.lineId === lineId ? { ...line, imei: value.trim() } : line)));
   }
+  // Price code: keep only a leading +/- and digits/decimal (see PosPage).
+  function updateAdjust(lineId, value) {
+    const code = String(value || "").replace(/[^\d.+-]/g, "").replace(/(?!^)[+-]/g, "").slice(0, 10);
+    setCart((current) => current.map((line) => (line.lineId === lineId ? { ...line, adjustCode: code } : line)));
+  }
   function removeLine(lineId) {
     setCart((current) => current.filter((line) => line.lineId !== lineId));
   }
 
-  const subtotal = cart.reduce((sum, line) => sum + line.price * line.qty, 0);
+  const subtotal = cart.reduce((sum, line) => sum + effectiveLinePrice(line) * line.qty, 0);
   const taxRate = Number((storeTax || []).find((entry) => entry?.name === form.location)?.rate) || 0;
   const taxApplies = !outOfState && taxRate > 0;
   const taxAmount = taxApplies ? subtotal * (taxRate / 100) : 0;
@@ -3516,7 +3676,10 @@ function PhoneOrderPage({ activeEmployee, sessionRole, activeLocation, storeLoca
         productId: line.productId,
         sku: line.sku,
         name: line.name,
-        price: line.price,
+        // Store the adjusted price actually owed; keep the base + code for audit.
+        price: effectiveLinePrice(line),
+        basePrice: line.price,
+        priceAdjust: parsePriceAdjust(line.adjustCode),
         qty: line.qty,
         imei: "",
         requiresImei: line.requiresImei,
@@ -3698,13 +3861,22 @@ function PhoneOrderPage({ activeEmployee, sessionRole, activeLocation, storeLoca
             <div className="table-wrap">
               <table>
                 <thead>
-                  <tr><th>Item</th><th>Price</th><th>Qty</th><th>IMEI</th><th>Line</th><th></th></tr>
+                  <tr><th>Item</th><th>Price</th><th>Code</th><th>Qty</th><th>IMEI</th><th>Line</th><th></th></tr>
                 </thead>
                 <tbody>
-                  {cart.map((line) => (
+                  {cart.map((line) => {
+                    const adjust = parsePriceAdjust(line.adjustCode);
+                    const unitPrice = effectiveLinePrice(line);
+                    return (
                     <tr key={line.lineId}>
                       <td><strong>{line.name}</strong><p className="muted">{line.sku}</p></td>
-                      <td>{formatMoney(line.price)}</td>
+                      <td>
+                        {formatMoney(line.price)}
+                        {adjust ? <p className="muted">→ {formatMoney(unitPrice)}</p> : null}
+                      </td>
+                      <td>
+                        <input className="pos-adjust" value={line.adjustCode} onChange={(event) => updateAdjust(line.lineId, event.target.value)} placeholder="+/- $" autoComplete="off" spellCheck={false} />
+                      </td>
                       <td>
                         {line.requiresImei ? <span className="muted">1</span> : (
                           <input className="pos-qty" type="number" min="1" value={line.qty} onChange={(event) => updateQty(line.lineId, event.target.value)} />
@@ -3713,10 +3885,11 @@ function PhoneOrderPage({ activeEmployee, sessionRole, activeLocation, storeLoca
                       <td>
                         {line.requiresImei ? <span className="muted">At store</span> : <span className="muted">-</span>}
                       </td>
-                      <td>{formatMoney(line.price * line.qty)}</td>
+                      <td>{formatMoney(unitPrice * line.qty)}</td>
                       <td><button className="secondary-button" type="button" onClick={() => removeLine(line.lineId)}>Remove</button></td>
                     </tr>
-                  ))}
+                    );
+                  })}
                 </tbody>
               </table>
             </div>
@@ -4201,6 +4374,7 @@ function PosPage({ products, activeEmployee, activeLocation, activeDeviceId, act
       requiresImei: Boolean(product.requiresImei),
       imei: "",
       category: product.category || "",
+      adjustCode: "",
     };
   }
 
@@ -4276,11 +4450,18 @@ function PosPage({ products, activeEmployee, activeLocation, activeDeviceId, act
     setCart((current) => current.map((line) => (line.lineId === lineId ? { ...line, imei: digits } : line)));
   }
 
+  // Price code: keep only a leading +/- and digits/decimal so the field can't
+  // hold anything parsePriceAdjust would reject.
+  function updateAdjust(lineId, value) {
+    const code = String(value || "").replace(/[^\d.+-]/g, "").replace(/(?!^)[+-]/g, "").slice(0, 10);
+    setCart((current) => current.map((line) => (line.lineId === lineId ? { ...line, adjustCode: code } : line)));
+  }
+
   function removeLine(lineId) {
     setCart((current) => current.filter((line) => line.lineId !== lineId));
   }
 
-  const subtotal = cart.reduce((sum, line) => sum + line.price * line.qty, 0);
+  const subtotal = cart.reduce((sum, line) => sum + effectiveLinePrice(line) * line.qty, 0);
   const taxRate = Number(activeTaxRate) || 0;
   const taxApplies = !outOfState && taxRate > 0;
   const taxAmount = taxApplies ? subtotal * (taxRate / 100) : 0;
@@ -4360,7 +4541,10 @@ function PosPage({ products, activeEmployee, activeLocation, activeDeviceId, act
       productId: line.productId,
       sku: line.sku,
       name: line.name,
-      price: line.price,
+      // Store the price actually charged (base + code); keep the base + code for audit.
+      price: effectiveLinePrice(line),
+      basePrice: line.price,
+      priceAdjust: parsePriceAdjust(line.adjustCode),
       qty: line.qty,
       imei: line.imei,
       requiresImei: line.requiresImei,
@@ -4503,6 +4687,7 @@ function PosPage({ products, activeEmployee, activeLocation, activeDeviceId, act
                   <tr>
                     <th>Item</th>
                     <th>Price</th>
+                    <th>Code</th>
                     <th>Qty</th>
                     <th>IMEI</th>
                     <th>Line</th>
@@ -4510,13 +4695,30 @@ function PosPage({ products, activeEmployee, activeLocation, activeDeviceId, act
                   </tr>
                 </thead>
                 <tbody>
-                  {cart.map((line) => (
+                  {cart.map((line) => {
+                    const adjust = parsePriceAdjust(line.adjustCode);
+                    const unitPrice = effectiveLinePrice(line);
+                    return (
                     <tr key={line.lineId}>
                       <td>
                         <strong>{line.name}</strong>
                         <p className="muted">{line.sku}</p>
                       </td>
-                      <td>{formatMoney(line.price)}</td>
+                      <td>
+                        {formatMoney(line.price)}
+                        {adjust ? <p className="muted">→ {formatMoney(unitPrice)}</p> : null}
+                      </td>
+                      <td>
+                        <input
+                          className="pos-adjust"
+                          value={line.adjustCode}
+                          onChange={(event) => updateAdjust(line.lineId, event.target.value)}
+                          placeholder="+/- $"
+                          inputMode="text"
+                          autoComplete="off"
+                          spellCheck={false}
+                        />
+                      </td>
                       <td>
                         {line.requiresImei ? (
                           <span className="muted">1</span>
@@ -4545,14 +4747,15 @@ function PosPage({ products, activeEmployee, activeLocation, activeDeviceId, act
                           <span className="muted">-</span>
                         )}
                       </td>
-                      <td>{formatMoney(line.price * line.qty)}</td>
+                      <td>{formatMoney(unitPrice * line.qty)}</td>
                       <td>
                         <button className="secondary-button" type="button" onClick={() => removeLine(line.lineId)}>
                           Remove
                         </button>
                       </td>
                     </tr>
-                  ))}
+                    );
+                  })}
                 </tbody>
               </table>
             </div>
@@ -4728,6 +4931,145 @@ function PosPage({ products, activeEmployee, activeLocation, activeDeviceId, act
   );
 }
 
+// Google-backed address field: type a street address, pick a suggestion to fill
+// it in, and add a unit/apt number separately (Google rarely captures the unit).
+// Emits a single combined address string so every existing consumer is unchanged.
+function AddressAutocomplete({ value, onChange, autoFocus }) {
+  const [base, setBase] = useState(value || "");
+  const [unit, setUnit] = useState("");
+  const [suggestions, setSuggestions] = useState([]);
+  const [open, setOpen] = useState(false);
+  const sessionTokenRef = useRef(crypto.randomUUID());
+  const skipNextFetchRef = useRef(false);
+  const boxRef = useRef(null);
+
+  function combine(nextBase, nextUnit) {
+    const trimmedBase = nextBase.trim();
+    const trimmedUnit = nextUnit.trim();
+    return trimmedUnit ? `${trimmedBase}, ${trimmedUnit}` : trimmedBase;
+  }
+
+  // Debounced lookup as the street address is typed (skipped right after we fill
+  // the field from a chosen suggestion, so it doesn't immediately re-query).
+  useEffect(() => {
+    if (skipNextFetchRef.current) {
+      skipNextFetchRef.current = false;
+      return;
+    }
+    const query = base.trim();
+    if (query.length < 3) {
+      setSuggestions([]);
+      setOpen(false);
+      return;
+    }
+    let cancelled = false;
+    const handle = setTimeout(async () => {
+      try {
+        const result = await callFunction("placesAutocomplete", {
+          input: query,
+          sessionToken: sessionTokenRef.current,
+        });
+        if (cancelled) return;
+        const items = result?.suggestions || [];
+        setSuggestions(items);
+        setOpen(items.length > 0);
+      } catch {
+        if (!cancelled) {
+          setSuggestions([]);
+          setOpen(false);
+        }
+      }
+    }, 300);
+    return () => {
+      cancelled = true;
+      clearTimeout(handle);
+    };
+  }, [base]);
+
+  useEffect(() => {
+    function onDocMouseDown(event) {
+      if (boxRef.current && !boxRef.current.contains(event.target)) setOpen(false);
+    }
+    document.addEventListener("mousedown", onDocMouseDown);
+    return () => document.removeEventListener("mousedown", onDocMouseDown);
+  }, []);
+
+  async function selectSuggestion(suggestion) {
+    let line = suggestion.description;
+    try {
+      const details = await callFunction("placeDetails", {
+        placeId: suggestion.placeId,
+        sessionToken: sessionTokenRef.current,
+      });
+      const composed = [
+        details.street,
+        details.city,
+        [details.state, details.zip].filter(Boolean).join(" "),
+      ]
+        .filter(Boolean)
+        .join(", ");
+      if (composed) line = composed;
+    } catch {
+      // Fall back to the suggestion text if details lookup fails.
+    }
+    skipNextFetchRef.current = true;
+    setBase(line);
+    setSuggestions([]);
+    setOpen(false);
+    sessionTokenRef.current = crypto.randomUUID();
+    onChange(combine(line, unit));
+  }
+
+  return (
+    <>
+      <label className="field full address-autocomplete" ref={boxRef}>
+        <span>Address</span>
+        <input
+          value={base}
+          autoFocus={autoFocus}
+          autoComplete="off"
+          placeholder="Start typing the street address"
+          onChange={(event) => {
+            setBase(event.target.value);
+            onChange(combine(event.target.value, unit));
+          }}
+          onFocus={() => {
+            if (suggestions.length) setOpen(true);
+          }}
+        />
+        {open ? (
+          <ul className="address-suggestions">
+            {suggestions.map((suggestion) => (
+              <li key={suggestion.placeId}>
+                <button
+                  type="button"
+                  onMouseDown={(event) => {
+                    event.preventDefault();
+                    selectSuggestion(suggestion);
+                  }}
+                >
+                  {suggestion.description}
+                </button>
+              </li>
+            ))}
+          </ul>
+        ) : null}
+      </label>
+      <label className="field">
+        <span>Unit / Apt # (optional)</span>
+        <input
+          value={unit}
+          placeholder="e.g. Apt 4B"
+          onChange={(event) => {
+            setUnit(event.target.value);
+            onChange(combine(base, event.target.value));
+          }}
+        />
+      </label>
+    </>
+  );
+}
+
 // Prompt shown at checkout when the entered phone is a new customer or is missing
 // a name / address — captures those for the receipt and the CRM.
 function CustomerInfoDialog({ phone, customer, onSave, onSkip, onClose }) {
@@ -4760,7 +5102,7 @@ function CustomerInfoDialog({ phone, customer, onSave, onSkip, onClose }) {
           <label className="field"><span>Phone</span><input value={phone} disabled /></label>
           <label className="field"><span>Name</span><input value={name} onChange={(event) => setName(event.target.value)} autoFocus /></label>
           <label className="field"><span>Mobile (optional)</span><input value={mobile} inputMode="tel" onChange={(event) => setMobile(event.target.value)} /></label>
-          <label className="field full"><span>Address</span><input value={address} onChange={(event) => setAddress(event.target.value)} /></label>
+          <AddressAutocomplete value={address} onChange={setAddress} />
           <div className="pos-form-actions form-actions-row">
             <button className="primary-button" type="submit">Save &amp; complete sale</button>
             <button className="secondary-button" type="button" onClick={onSkip}>Skip</button>
@@ -5006,11 +5348,14 @@ function printRepairTicket(report) {
   const createdAt = (toJsDate(report.createdAt) || new Date()).toLocaleString();
   const location = report.location || details.location || "";
 
+  const estimatedPrice = details.estimatedPrice || report.paymentAmount;
   const rowsSource = [
     ["Phone", report.customerPhone],
     ["Model", details.model],
     ["IMEI", details.imei],
     ["Issue", details.damage],
+    ["Estimated price", estimatedPrice ? formatMoney(Number(estimatedPrice) || 0) : ""],
+    ["Final price", details.finalPrice ? formatMoney(Number(details.finalPrice) || 0) : ""],
     ["Paid", details.paymentStatus],
     ["Expected ready", details.dueDate],
     ["Notify by", details.notificationPreference],
@@ -6202,8 +6547,18 @@ function ReportRow({ report, onStatusChange, onDeleteReport, onReturn, hasAction
   );
 }
 
+// Every IMEI captured on a report — all phone lines (deduped), falling back to
+// the single stored imei. Lets sale/phone-order reports show the device IDs even
+// when more than one phone was on the ticket.
+function collectReportImeis(details) {
+  const fromLines = (details.lineItems || []).map((line) => line.imei).filter(Boolean);
+  if (fromLines.length) return [...new Set(fromLines)].join(", ");
+  return details.imei || "";
+}
+
 function ReportDetails({ report }) {
   const details = report.details || {};
+  const imeis = collectReportImeis(details);
   const lines = {
     sale: [
       ["Request", details.request],
@@ -6211,7 +6566,7 @@ function ReportDetails({ report }) {
       ["Store", details.location],
       ["Items", details.itemsText],
       ["Model", details.model],
-      ["IMEI", details.imei],
+      ["IMEI", imeis],
       ["Subtotal", Number(details.taxAmount) > 0 && details.subtotal ? formatMoney(Number(details.subtotal)) : ""],
       ["Tax", Number(details.taxAmount) > 0 ? `${formatMoney(Number(details.taxAmount))}${details.taxRate ? ` (${details.taxRate}%)` : ""}` : ""],
       ["Out of state", details.outOfState === "Yes" ? "Yes" : ""],
@@ -6267,6 +6622,7 @@ function ReportDetails({ report }) {
       ["Assigned", details.assignedTo],
       ["Customer", details.customerName],
       ["Order", details.model],
+      ["IMEI", imeis],
       ["Address", details.address],
       ["Contact", details.contactDetails],
       ["Payment", details.paymentStatus],
@@ -6276,7 +6632,7 @@ function ReportDetails({ report }) {
     ],
     return: [
       ["Items", details.itemsText],
-      ["IMEI", details.imei],
+      ["IMEI", imeis],
       ["Refund method", details.refundMethod],
       ["Card refund", details.solaRefundRef],
       ["Original sale", details.originalReportId],
