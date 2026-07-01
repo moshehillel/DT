@@ -42,6 +42,7 @@ const RCUK_API_BASE_URL = process.env.RCUK_API_BASE_URL || "https://myaccount.rc
 const RCUK_ADD_RENTAL_PATH = process.env.RCUK_ADD_RENTAL_PATH || "/add-rental";
 const RCUK_GET_RENTAL_PATH = process.env.RCUK_GET_RENTAL_PATH || "/get-rental";
 const RCUK_CHECK_SIM_PATH = process.env.RCUK_CHECK_SIM_PATH || "/check-sim";
+const RCUK_CANCEL_RENTAL_PATH = process.env.RCUK_CANCEL_RENTAL_PATH || "/cancel-rental";
 const SOLA_API_KEY = process.env.SOLA_API_KEY || "";
 const SOLA_API_BASE_URL = process.env.SOLA_API_BASE_URL || "https://x1.cardknox.com";
 const SOLA_CREATE_CHARGE_PATH = process.env.SOLA_CREATE_CHARGE_PATH || "/gatewayjson";
@@ -1001,6 +1002,56 @@ exports.rcukGetRental = onRequest(HTTP_OPTIONS, async (req, res) => {
       ok: false,
       message: error.message || "RCUK get rental failed.",
     });
+  }
+});
+
+exports.rcukCancelRental = onRequest(HTTP_OPTIONS, async (req, res) => {
+  if (handleCors(req, res)) return;
+  if (req.method !== "POST") {
+    sendJson(res, 405, { error: "POST required" });
+    return;
+  }
+
+  try {
+    const payload = getPayload(req);
+    const rentalId = payload.rental_id || payload.rentalId || payload.id;
+
+    if (!rentalId) {
+      sendJson(res, 400, { ok: false, message: "rental_id is required." });
+      return;
+    }
+
+    // RCUK requires a reason, and the day allocations for active rentals. Default
+    // to "immediate" so the SIM is freed right away.
+    const cancelPayload = {
+      rental_id: rentalId,
+      reason: String(payload.reason || "Cancelled in store").slice(0, 255),
+      cancel_type: payload.cancel_type || "immediate",
+      uk_days: Number(payload.uk_days) || 0,
+      eu_days: Number(payload.eu_days) || 0,
+      wts_days: Number(payload.wts_days) || 0,
+      tp_days: Number(payload.tp_days) || 0,
+    };
+
+    const result = await callRcuk(RCUK_CANCEL_RENTAL_PATH, cancelPayload);
+
+    if (!result.ok) {
+      sendJson(res, 400, {
+        ok: false,
+        message: result.data.message || "RCUK cancel rental failed.",
+        raw: result.data,
+      });
+      return;
+    }
+
+    sendJson(res, 200, {
+      ok: true,
+      message: result.data.message || "Rental cancelled.",
+      raw: result.data,
+    });
+  } catch (error) {
+    logger.error("rcukCancelRental failed", error);
+    sendJson(res, 500, { ok: false, message: error.message || "RCUK cancel rental failed." });
   }
 });
 

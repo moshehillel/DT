@@ -1741,6 +1741,13 @@ tr:last-child td {
 .report-detail-row > td {
   background: var(--surface-muted, #f6f7f9);
 }
+.rental-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+}
 
 .pos-imei-missing {
   border-color: var(--danger);

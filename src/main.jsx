@@ -1270,6 +1270,8 @@ function Workspace({ currentUser, isAdmin }) {
             <RentalReportForm
               key={`${activeType}-${formNonce}`}
               activeEmployee={activeEmployee}
+              activeLocation={activeLocation}
+              activeStoreInfo={activeStoreInfo}
               customers={customers}
               onSaveCustomerName={saveCustomerName}
               onSaveCustomer={saveCustomer}
@@ -1319,6 +1321,7 @@ function Workspace({ currentUser, isAdmin }) {
             onFiltersChange={setFilters}
             onClearFilters={() => setFilters(createEmptyFilters())}
             onStatusChange={updateRepairStatus}
+            onUpdateReport={updateRepair}
             onExport={() => exportCsv(filteredReports)}
             onExportAll={() => exportCsv(visibleReports)}
             onClearReports={sessionRole === "admin" ? clearReports : null}
@@ -2002,7 +2005,7 @@ function NotificationCenter({ notifications }) {
   );
 }
 
-function RentalReportForm({ activeEmployee, customers, onSaveCustomerName, onSaveCustomer, onSave }) {
+function RentalReportForm({ activeEmployee, activeLocation, activeStoreInfo, customers, onSaveCustomerName, onSaveCustomer, onSave }) {
   const [now, setNow] = useState(new Date());
   const [form, setForm] = useState({
     rentalRegion: "RCUK",
@@ -2049,6 +2052,8 @@ function RentalReportForm({ activeEmployee, customers, onSaveCustomerName, onSav
     raw: null,
   });
   const solaTokenRef = useRef("");
+  // Card-present terminal state (Verifone P200 / Sola BBPOS), same as the POS.
+  const [card, setCard] = useState({ status: "idle", message: "", refNum: "", cardType: "", maskedCardNumber: "" });
 
   useEffect(() => {
     const timer = window.setInterval(() => setNow(new Date()), 30000);
@@ -2067,8 +2072,9 @@ function RentalReportForm({ activeEmployee, customers, onSaveCustomerName, onSav
   const needsUsNumber = form.usaNumber;
   const rentalSubmitted = submitState.status === "submitted" || submitState.status === "numbers-ready";
   const minimumDaysValid = getMinimumRentalDays(form.rentalRegion) <= totalDays;
-  const requiresSolaCharge = ["CC", "Card"].includes(form.paymentMethod);
-  const solaChargeComplete = !requiresSolaCharge || solaState.status === "paid";
+  // CC/Card rentals must be charged on the in-store terminal before saving.
+  const requiresCardCharge = ["CC", "Card"].includes(form.paymentMethod);
+  const cardChargeComplete = !requiresCardCharge || card.status === "paid";
   const canSubmitRental = isRentalFormComplete(form)
     && zoneDaysValid
     && minimumDaysValid
@@ -2076,20 +2082,15 @@ function RentalReportForm({ activeEmployee, customers, onSaveCustomerName, onSav
     && normalizedSimNumber
     && isRcukRental;
   const canSave = isSimpleRental
-    ? isRentalFormComplete(form) && minimumDaysValid && totalPrice > 0 && solaChargeComplete
-    : rentalSubmitted && submitState.getNumbersAttempted && solaChargeComplete;
+    ? isRentalFormComplete(form) && minimumDaysValid && totalPrice > 0 && cardChargeComplete
+    : rentalSubmitted && submitState.getNumbersAttempted && cardChargeComplete;
 
   function updateField(name, value) {
     setForm((current) => ({ ...current, [name]: value }));
-    if (["paymentMethod", "customerPhone", "startDate", "endDate", "serviceType", "addSms", "rentalRegion"].includes(name)) {
-      setSolaState({
-        status: "idle",
-        message: "",
-        paymentToken: "",
-        transactionId: "",
-        paymentUrl: "",
-        raw: null,
-      });
+    // A change that moves the price or the payment method invalidates any card
+    // charge already taken — force it to be run again for the new amount.
+    if (["paymentMethod", "customerPhone", "startDate", "endDate", "serviceType", "addSms", "rentalRegion", "ukDays", "euDays", "wtsDays"].includes(name)) {
+      setCard({ status: "idle", message: "", refNum: "", cardType: "", maskedCardNumber: "" });
     }
     setSubmitState((current) => (
       current.status === "idle" ? current : { ...current, message: "Rental changed. Submit to RCUK again before saving.", status: "idle", rentalId: "", cli: "", usDdi: "", getNumbersAttempted: false, raw: null }
@@ -2378,14 +2379,39 @@ function RentalReportForm({ activeEmployee, customers, onSaveCustomerName, onSav
     }
   }
 
+  // Card-present charge on the in-store terminal (Verifone P200), same as POS.
+  async function chargeRentalCard() {
+    if (!requiresCardCharge || !totalPrice) return;
+    try {
+      setCard({ status: "charging", message: "Follow the terminal: tap, insert, or swipe the card.", refNum: "", cardType: "", maskedCardNumber: "" });
+      const result = await chargeOnLocalTerminal({
+        amount: Number(totalPrice).toFixed(2),
+        externalRequestId: `rental-${Date.now()}`,
+        onStatus: (text) => setCard((current) => ({ ...current, message: text })),
+      });
+      setCard({
+        status: "paid",
+        message: result.maskedCardNumber
+          ? `Card approved (${result.cardType || "card"} ${result.maskedCardNumber}).`
+          : "Card approved.",
+        refNum: result.refNum || "",
+        cardType: result.cardType || "",
+        maskedCardNumber: result.maskedCardNumber || "",
+      });
+    } catch (error) {
+      setCard({ status: "error", message: error.message || "Card payment failed.", refNum: "", cardType: "", maskedCardNumber: "" });
+    }
+  }
+
   function saveRentalReport() {
     if (!canSave) return;
 
-    onSave({
+    const report = {
       id: crypto.randomUUID(),
       type: "rental",
       createdAt: new Date().toISOString(),
       servedBy: activeEmployee,
+      location: activeLocation || "",
       customerPhone: form.customerPhone.trim(),
       customerPhoneDigits: digitsOnly(form.customerPhone),
       paymentAmount: String(totalPrice),
@@ -2416,10 +2442,18 @@ function RentalReportForm({ activeEmployee, customers, onSaveCustomerName, onSav
         dailyRate,
         totalPrice,
         pricingLabel: rentalPricing.label,
-        solaStatus: requiresSolaCharge ? solaState.status : "",
-        solaTransactionId: requiresSolaCharge ? solaState.transactionId : "",
+        location: activeLocation || "",
+        storeAddress: activeStoreInfo?.address || "",
+        storeHours: activeStoreInfo?.hours || "",
+        cardStatus: requiresCardCharge ? card.status : "",
+        cardRefNum: requiresCardCharge ? card.refNum : "",
+        cardType: requiresCardCharge ? card.cardType : "",
+        maskedCardNumber: requiresCardCharge ? card.maskedCardNumber : "",
       },
-    });
+    };
+
+    onSave(report);
+    printRentalReceipt(report);
   }
 
   return (
@@ -2583,20 +2617,25 @@ function RentalReportForm({ activeEmployee, customers, onSaveCustomerName, onSav
             </label>
           </div>
 
-          {requiresSolaCharge ? (
-            <div className="payment-panel">
+          {requiresCardCharge ? (
+            <div className="payment-panel payment-panel-stack">
               <div>
-                <p className="eyebrow">Card payment</p>
-                <h3>Sola charge</h3>
+                <p className="eyebrow">Card payment (Verifone P200)</p>
+                <h3>Charge {formatMoney(totalPrice)} on the terminal</h3>
               </div>
-              <label className="field">
-                <span>Sola token / SUT</span>
-                <input value={solaState.paymentToken} onChange={(event) => updateSolaToken(event.target.value)} />
-              </label>
-              <button className="secondary-button" type="button" onClick={chargeWithSola} disabled={!totalPrice || !solaState.paymentToken || solaState.status === "charging"}>
-                Charge with Sola
+              <div className="card-reader-row">
+                <span className={`reader-dot ${card.status === "paid" ? "connected" : ""}`} aria-hidden="true" />
+                <span className="muted">Sola BBPOS · local terminal</span>
+              </div>
+              <button
+                className="secondary-button"
+                type="button"
+                onClick={chargeRentalCard}
+                disabled={!totalPrice || card.status === "charging" || card.status === "paid"}
+              >
+                {card.status === "paid" ? "Card charged ✓" : card.status === "charging" ? "Charging…" : `Charge ${formatMoney(totalPrice)}`}
               </button>
-              <p className={solaState.status === "error" ? "summary-error" : "muted"}>{solaState.message}</p>
+              <p className={card.status === "error" ? "summary-error" : "muted"}>{card.message}</p>
             </div>
           ) : null}
 
@@ -2639,8 +2678,8 @@ function RentalReportForm({ activeEmployee, customers, onSaveCustomerName, onSav
           {(isRcukRental ? !canSubmitRental : !canSave) ? (
             <div className="summary-error">{isRcukRental ? "Complete all rental fields before submitting." : "Complete all rental fields before saving."}</div>
           ) : null}
-          {requiresSolaCharge && !solaChargeComplete ? (
-            <div className="summary-error">Sola payment approval is required before saving a CC rental.</div>
+          {requiresCardCharge && !cardChargeComplete ? (
+            <div className="summary-error">Charge the card on the terminal before saving a CC rental.</div>
           ) : null}
           {isRcukRental ? (
             <div className="rental-result">
@@ -2674,6 +2713,7 @@ function ReportHistory({
   onFiltersChange,
   onClearFilters,
   onStatusChange,
+  onUpdateReport,
   onExport,
   onExportAll,
   onClearReports,
@@ -2888,6 +2928,7 @@ function ReportHistory({
                   report={report}
                   key={report.id}
                   onStatusChange={onStatusChange}
+                  onUpdateReport={onUpdateReport}
                   onDeleteReport={onDeleteReport}
                   onReturn={onReturn}
                   hasActions={hasActions}
@@ -5523,6 +5564,62 @@ function printRepairTicket(report) {
   openThermalReceipt(`Repair ticket ${details.ticketNumber || ""}`, css, body);
 }
 
+// Customer rental receipt: device + SIM, numbers, dates, total, return date and
+// the overdue late fee. Printed right after the rental is saved/paid.
+function printRentalReceipt(report) {
+  const details = report.details || {};
+  const createdAt = (toJsDate(report.createdAt) || new Date()).toLocaleString();
+  const location = report.location || details.location || "";
+  const lateFee = Number(details.lateFeeWeekly) || 0;
+  const total = Number(details.totalPrice) || Number(report.paymentAmount) || 0;
+
+  const rowsSource = [
+    ["Rental ID", details.rentalId],
+    ["Region", details.rentalRegion],
+    ["Service", details.serviceType],
+    ["Device", details.rentalType],
+    ["Model", details.model],
+    ["IMEI", details.imei],
+    ["SIM", details.simNumber],
+    ["Phone number", details.cli],
+    ["US number", details.usDdi && String(details.usDdi).toLowerCase() !== "no" ? details.usDdi : ""],
+    ["Start", details.startDate],
+    ["End", details.endDate],
+    ["Return by", details.returnDueDate || details.endDate],
+    ["Rental days", details.totalDays],
+    ["Rate", details.dailyRate ? `${formatMoney(Number(details.dailyRate))}/day` : details.pricingLabel],
+    ["Late fee", lateFee > 0 ? `${formatMoney(lateFee)}/wk (${formatMoney(lateFee / 7)}/day overdue)` : ""],
+    ["Served by", report.servedBy],
+  ];
+  const rows = rowsSource
+    .filter(([, value]) => value)
+    .map(([label, value]) => `<tr><td>${escapeHtml(label)}</td><td style="text-align:right">${escapeHtml(String(value))}</td></tr>`)
+    .join("");
+
+  const css = `
+    .eyebrow { text-align: center; font-size: 11px; text-transform: uppercase; letter-spacing: 1px; }
+    .total { display: flex; justify-content: space-between; font-weight: 800; font-size: 14px; margin-top: 6px; }
+    .paid { text-align: center; font-size: 11.5px; margin-top: 2px; }
+    .notes { font-size: 11.5px; margin-top: 10px; }`;
+  const body = `
+    ${receiptHeaderHtml(location, details.storeAddress)}
+    <div class="divider"></div>
+    <div class="eyebrow">Phone rental</div>
+    <div class="meta">${escapeHtml(createdAt)}</div>
+    ${receiptCustomerHtml(details.customerName, report.customerPhone, details.customerMobile, details.customerAddress)}
+    <div class="divider"></div>
+    <table>${rows}</table>
+    <div class="divider"></div>
+    <div class="total"><span>Total</span><span>${formatMoney(total)}</span></div>
+    <div class="paid">${escapeHtml(report.paymentMethod || "")}${details.maskedCardNumber ? ` · ${escapeHtml(details.maskedCardNumber)}` : ""}</div>
+    ${report.notes ? `<div class="notes">Notes: ${escapeHtml(report.notes)}</div>` : ""}
+    <div class="divider"></div>
+    <div class="thanks">Please return by ${escapeHtml(details.returnDueDate || details.endDate || "the due date")}.</div>
+    ${receiptFooterHtml(details.storeHours)}`;
+
+  openThermalReceipt(`Rental ${details.rentalId || report.id}`, css, body);
+}
+
 function SaleReceiptDialog({ sale, onClose }) {
   const details = sale.details || {};
   const lines = details.lineItems || [];
@@ -6626,7 +6723,7 @@ function AdminPage({
   );
 }
 
-function ReportRow({ report, onStatusChange, onDeleteReport, onReturn, hasActions }) {
+function ReportRow({ report, onStatusChange, onUpdateReport, onDeleteReport, onReturn, hasActions }) {
   const [open, setOpen] = useState(false);
   const saleLineItems = report.details?.lineItems || [];
   const returnableType = report.type === "sale" || report.type === "phoneOrder";
@@ -6692,10 +6789,106 @@ function ReportRow({ report, onStatusChange, onDeleteReport, onReturn, hasAction
       </tr>
       {open ? (
         <tr className="report-detail-row">
-          <td colSpan={columnCount}><ReportDetails report={report} /></td>
+          <td colSpan={columnCount}>
+            <ReportDetails report={report} />
+            {report.type === "rental" && onUpdateReport ? (
+              <RentalReportActions report={report} onUpdate={onUpdateReport} />
+            ) : null}
+          </td>
         </tr>
       ) : null}
     </>
+  );
+}
+
+// Post-sale RCUK actions on a saved rental: fetch the assigned numbers if they
+// weren't ready at creation, and cancel the rental (frees the SIM immediately).
+function RentalReportActions({ report, onUpdate }) {
+  const details = report.details || {};
+  const [busy, setBusy] = useState("");
+  const [message, setMessage] = useState("");
+  const rentalId = details.rentalId;
+  const cancelled = details.rentalStatus === "Cancelled";
+  const hasNumbers = Boolean(details.cli);
+
+  async function getNumbers() {
+    if (!FUNCTIONS_BASE_URL) { setMessage("Functions URL not configured."); return; }
+    if (!rentalId) { setMessage("This rental has no RCUK rental ID."); return; }
+    setBusy("numbers");
+    setMessage("Fetching numbers from RCUK…");
+    try {
+      const response = await fetch(`${FUNCTIONS_BASE_URL}/rcukGetRental`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ rental_id: rentalId }),
+      });
+      const data = await response.json();
+      if (!response.ok || !data.ok || !data.cli) {
+        setMessage(data.message || "Numbers are not ready yet. Try again shortly.");
+        return;
+      }
+      onUpdate(report.id, { details: { cli: data.cli, usDdi: data.usDdi || "", rcukStatus: data.status || "" } });
+      setMessage(`Numbers updated: ${data.cli}`);
+    } catch (error) {
+      setMessage(error.message || "Could not reach RCUK.");
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function cancelRental() {
+    if (!FUNCTIONS_BASE_URL) { setMessage("Functions URL not configured."); return; }
+    if (!rentalId) { setMessage("This rental has no RCUK rental ID."); return; }
+    const reason = window.prompt("Reason for cancelling this rental?", "Cancelled in store");
+    if (reason === null) return;
+    if (!window.confirm("Cancel this rental with RCUK now? The SIM will be freed immediately.")) return;
+    setBusy("cancel");
+    setMessage("Cancelling rental with RCUK…");
+    try {
+      const response = await fetch(`${FUNCTIONS_BASE_URL}/rcukCancelRental`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          rental_id: rentalId,
+          reason,
+          cancel_type: "immediate",
+          uk_days: details.ukDays || 0,
+          eu_days: details.euDays || 0,
+          wts_days: details.wtsDays || 0,
+        }),
+      });
+      const data = await response.json();
+      if (!response.ok || !data.ok) {
+        setMessage(data.message || "RCUK could not cancel the rental.");
+        return;
+      }
+      onUpdate(report.id, { details: { rentalStatus: "Cancelled", cancelledAt: new Date().toISOString(), cancelReason: reason } });
+      setMessage("Rental cancelled.");
+    } catch (error) {
+      setMessage(error.message || "Could not reach RCUK.");
+    } finally {
+      setBusy("");
+    }
+  }
+
+  return (
+    <div className="rental-actions">
+      {cancelled ? (
+        <span className="status-pill returned">Cancelled</span>
+      ) : (
+        <>
+          {!hasNumbers ? (
+            <button className="secondary-button compact-button" type="button" disabled={busy === "numbers"} onClick={getNumbers}>
+              {busy === "numbers" ? "Getting numbers…" : "Get numbers"}
+            </button>
+          ) : null}
+          <button className="secondary-button compact-button" type="button" disabled={busy === "cancel"} onClick={cancelRental}>
+            {busy === "cancel" ? "Cancelling…" : "Cancel rental"}
+          </button>
+        </>
+      )}
+      {message ? <span className="muted">{message}</span> : null}
+    </div>
   );
 }
 
@@ -6745,6 +6938,7 @@ function ReportDetails({ report, compact }) {
     ],
     rental: [
       ["Rental ID", details.rentalId],
+      ["Status", details.rentalStatus],
       ["Region", details.rentalRegion],
       ["Service", details.serviceType],
       ["Rental", details.rentalType],
