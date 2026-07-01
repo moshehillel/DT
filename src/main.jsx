@@ -167,14 +167,12 @@ function Workspace({ currentUser, isAdmin }) {
   }, [employeeName, employees, setStaff]);
 
   useEffect(() => {
-    if (!isAdmin) {
+    // The active employee is always the signed-in user — nobody (not even an
+    // admin) may file or view as someone else.
+    if (employeeName && activeEmployee !== employeeName) {
       setActiveEmployee(employeeName);
-      return;
     }
-    if (activeEmployee && !employees.includes(activeEmployee)) {
-      setActiveEmployee(employees[0] || employeeName || "");
-    }
-  }, [activeEmployee, employees, employeeName, isAdmin]);
+  }, [activeEmployee, employeeName]);
 
   useEffect(() => {
     if (isAdmin) localStorage.setItem(ACTIVE_EMPLOYEE_KEY, activeEmployee);
@@ -1051,7 +1049,7 @@ function Workspace({ currentUser, isAdmin }) {
 
   function deleteReport(reportId) {
     if (sessionRole !== "admin") {
-      window.alert("Only admin can delete reports.");
+      showAccessRestricted();
       return;
     }
     const report = reports.find((item) => item.id === reportId);
@@ -1325,7 +1323,7 @@ function Workspace({ currentUser, isAdmin }) {
             onExport={() => exportCsv(filteredReports)}
             onExportAll={() => exportCsv(visibleReports)}
             onClearReports={sessionRole === "admin" ? clearReports : null}
-            onDeleteReport={sessionRole === "admin" ? deleteReport : null}
+            onDeleteReport={deleteReport}
             onReturn={setReturnTarget}
             onScanReturn={returnByCode}
             notifications={visibleNotifications}
@@ -1558,6 +1556,11 @@ function PoweredByFooter() {
   );
 }
 
+// Friendly gate shown when a non-admin taps an admin-only control.
+function showAccessRestricted() {
+  window.alert("Access restricted. Please contact the program administrator.");
+}
+
 function Sidebar({
   activeType,
   activeView,
@@ -1672,35 +1675,24 @@ function Sidebar({
           </span>
         </button>
 
-        {sessionRole === "admin" ? (
-          <>
-            <button
-              className={`tab ${activeView === "admin" ? "active" : ""}`}
-              type="button"
-              onClick={() => onViewChange("admin")}
-            >
-              <span className="tab-mark">A</span>
-              <span>
-                <strong>Admin</strong>
-                <small>Activity, audit & access</small>
-              </span>
-            </button>
-          </>
-        ) : null}
+        <button
+          className={`tab ${activeView === "admin" ? "active" : ""}`}
+          type="button"
+          onClick={() => (sessionRole === "admin" ? onViewChange("admin") : showAccessRestricted())}
+        >
+          <span className="tab-mark">A</span>
+          <span>
+            <strong>Admin</strong>
+            <small>Activity, audit & access</small>
+          </span>
+        </button>
       </nav>
 
       <div className="sidebar-account">
         <label className="field">
-          <span>{sessionRole === "admin" ? "Active employee" : "Signed in employee"}</span>
-          {sessionRole === "admin" ? (
-            <select value={activeEmployee} onChange={(event) => onEmployeeChange(event.target.value)}>
-              {employees.map((employee) => (
-                <option key={employee}>{employee}</option>
-              ))}
-            </select>
-          ) : (
-            <input value={activeEmployee} disabled readOnly />
-          )}
+          <span>Signed in employee</span>
+          {/* Locked to the signed-in identity — nobody can file as someone else. */}
+          <input value={activeEmployee} disabled readOnly />
         </label>
         <button className="ghost-button" type="button" onClick={onLogout}>
           Sign out
