@@ -1715,6 +1715,33 @@ tr:last-child td {
   text-align: center;
 }
 
+/* Collapsible report rows: compact by default, expand on click. */
+.report-row {
+  cursor: pointer;
+}
+.report-row:hover {
+  background: var(--surface-muted, #f6f7f9);
+}
+.row-toggle {
+  border: none;
+  background: none;
+  cursor: pointer;
+  font-size: 12px;
+  color: var(--muted, #667);
+  margin-right: 6px;
+  padding: 0 2px;
+}
+.details-compact {
+  display: inline;
+  color: var(--muted, #667);
+}
+.details-compact span {
+  margin-right: 10px;
+}
+.report-detail-row > td {
+  background: var(--surface-muted, #f6f7f9);
+}
+
 .pos-imei-missing {
   border-color: var(--danger);
   background: #fdecec;

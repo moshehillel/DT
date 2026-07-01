@@ -383,6 +383,7 @@ export function isRentalFormComplete(form) {
 
 export function getMinimumRentalDays(region) {
   if (region === "Israel") return 7;
+  if (region === "Local") return 1;
   return 4;
 }
 
@@ -391,7 +392,7 @@ export function calculateRentalPrice(form, totalDays) {
     return { dailyRate: 0, totalPrice: 0, label: "-" };
   }
 
-  if (form.rentalRegion === "Israel") {
+  if (form.rentalRegion === "Israel" || form.rentalRegion === "Local") {
     return {
       dailyRate: 5,
       totalPrice: totalDays * 5,

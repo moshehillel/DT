@@ -1805,6 +1805,15 @@ function ReportForm({ activeType, activeEmployee, activeLocation, reports, custo
       details.estimatedPrice = String(formData.get("paymentAmount") || "").trim();
     }
 
+    // Require a payment method whenever money is being recorded, so nothing is
+    // ever saved as paid under an accidental default method.
+    const paymentAmountValue = String(formData.get("paymentAmount") || "").trim();
+    const paymentMethodValue = String(formData.get("paymentMethod") || "").trim();
+    if (paymentAmountValue && !paymentMethodValue) {
+      window.alert("Choose a payment method before saving.");
+      return;
+    }
+
     // Snapshot store + customer details so the printed ticket is self-contained.
     const phoneDigits = localPhoneDigits(formData.get("customerPhone"));
     const matchedCustomer = phoneDigits
@@ -1887,7 +1896,8 @@ function ReportForm({ activeType, activeEmployee, activeLocation, reports, custo
 
           <label className="field">
             <span>Payment method</span>
-            <select name="paymentMethod" defaultValue="Cash">
+            <select name="paymentMethod" defaultValue="">
+              <option value="" disabled>Select one</option>
               {paymentMethods.map((method) => (
                 <option key={method}>{method}</option>
               ))}
@@ -2009,7 +2019,7 @@ function RentalReportForm({ activeEmployee, customers, onSaveCustomerName, onSav
     imei: "",
     simNumber: "",
     returnDays: "",
-    paymentMethod: "Cash",
+    paymentMethod: "",
     returnReminderPreference: "Text message",
     lateFeeWeekly: "",
     customerPhone: "",
@@ -2431,6 +2441,7 @@ function RentalReportForm({ activeEmployee, customers, onSaveCustomerName, onSav
                 <option>RCUK</option>
                 <option>Canada</option>
                 <option>Israel</option>
+                <option>Local</option>
               </select>
             </label>
             <label className="field">
@@ -2542,6 +2553,7 @@ function RentalReportForm({ activeEmployee, customers, onSaveCustomerName, onSav
             <label className="field">
               <span>Payment method</span>
               <select value={form.paymentMethod} onChange={(event) => updateField("paymentMethod", event.target.value)}>
+                <option value="" disabled>Select one</option>
                 {paymentMethods.map((method) => <option key={method}>{method}</option>)}
               </select>
             </label>
@@ -3109,7 +3121,7 @@ function EditRepairDialog({ repair, onSave, onClose }) {
     finalPrice: details.finalPrice || "",
     dueDate: details.dueDate || "",
     notificationPreference: details.notificationPreference || "Text message",
-    paymentMethod: repair.paymentMethod || "Cash",
+    paymentMethod: repair.paymentMethod || "",
     customerPhone: repair.customerPhone || "",
     notes: repair.notes || "",
   });
@@ -3153,6 +3165,7 @@ function EditRepairDialog({ repair, onSave, onClose }) {
           <label className="field">
             <span>Payment method</span>
             <select value={form.paymentMethod} onChange={(event) => set("paymentMethod", event.target.value)}>
+              <option value="" disabled>Select one</option>
               {paymentMethods.map((method) => <option key={method}>{method}</option>)}
             </select>
           </label>
@@ -3285,7 +3298,7 @@ function PendingReportCard({ pendingReport, activeEmployee, customers, onSaveCus
     paymentMethod:
       pendingReport.paymentMethod && pendingReport.paymentMethod !== "Shopify POS"
         ? pendingReport.paymentMethod
-        : "Cash",
+        : "",
   }));
 
   function updateField(name, value) {
@@ -3520,6 +3533,7 @@ function PendingReportCard({ pendingReport, activeEmployee, customers, onSaveCus
               <label className="field">
                 <span>Payment method</span>
                 <select value={fields.paymentMethod} onChange={(event) => updateField("paymentMethod", event.target.value)}>
+                  <option value="" disabled>Select one</option>
                   {paymentMethods.map((method) => <option key={method}>{method}</option>)}
                 </select>
               </label>
@@ -3552,7 +3566,7 @@ function PhoneOrderPage({ activeEmployee, sessionRole, activeLocation, storeLoca
     customerAddress: "",
     deliveryAddress: "",
     paymentStatus: "Paid",
-    paymentMethod: "Cash",
+    paymentMethod: "",
     notes: "",
   });
   const [cart, setCart] = useState([]);
@@ -3747,6 +3761,7 @@ function PhoneOrderPage({ activeEmployee, sessionRole, activeLocation, storeLoca
   const canCreate = Boolean(form.location.trim())
     && localPhoneDigits(form.customerPhone).length >= 6
     && Boolean(form.deliveryAddress.trim())
+    && Boolean(form.paymentMethod)
     && cart.length > 0;
 
   function updateField(name, value) {
@@ -4045,6 +4060,7 @@ function PhoneOrderPage({ activeEmployee, sessionRole, activeLocation, storeLoca
             <label className="field">
               <span>Payment method</span>
               <select value={form.paymentMethod} onChange={(event) => updateField("paymentMethod", event.target.value)}>
+                <option value="" disabled>Select one</option>
                 {paymentMethods.map((method) => <option key={method}>{method}</option>)}
               </select>
             </label>
@@ -4430,7 +4446,7 @@ function PosPage({ products, activeEmployee, activeLocation, activeDeviceId, act
   const [scanMode, setScanMode] = useState(true);
   const [productSearch, setProductSearch] = useState("");
   const [customerPhone, setCustomerPhone] = useState("");
-  const [paymentMethod, setPaymentMethod] = useState(paymentMethods[0]);
+  const [paymentMethod, setPaymentMethod] = useState("");
   const [outOfState, setOutOfState] = useState(false);
   const [notes, setNotes] = useState("");
   const [message, setMessage] = useState("");
@@ -4599,7 +4615,7 @@ function PosPage({ products, activeEmployee, activeLocation, activeDeviceId, act
     }
     return "";
   })();
-  const canCheckout = cart.length > 0 && !imeiIssue && cardChargeComplete;
+  const canCheckout = cart.length > 0 && !imeiIssue && cardChargeComplete && Boolean(paymentMethod);
 
   useEffect(() => {
     setCard((current) =>
@@ -4640,6 +4656,7 @@ function PosPage({ products, activeEmployee, activeLocation, activeDeviceId, act
   function handleCheckout() {
     if (!canCheckout) {
       if (imeiIssue) setMessage(imeiIssue);
+      else if (!paymentMethod) setMessage("Choose a payment method before completing the sale.");
       else if (!cardChargeComplete) setMessage("Charge the card before completing the sale.");
       return;
     }
@@ -4712,7 +4729,7 @@ function PosPage({ products, activeEmployee, activeLocation, activeDeviceId, act
     setCart([]);
     setCustomerPhone("");
     setNotes("");
-    setPaymentMethod(paymentMethods[0]);
+    setPaymentMethod("");
     setOutOfState(false);
     setCard({ status: "idle", message: "", refNum: "" });
     setMessage("");
@@ -4905,6 +4922,7 @@ function PosPage({ products, activeEmployee, activeLocation, activeDeviceId, act
             <label className="field">
               <span>Payment method</span>
               <select value={paymentMethod} onChange={(event) => setPaymentMethod(event.target.value)}>
+                <option value="" disabled>Select one</option>
                 {paymentMethods.map((method) => (
                   <option key={method}>{method}</option>
                 ))}
@@ -6609,59 +6627,75 @@ function AdminPage({
 }
 
 function ReportRow({ report, onStatusChange, onDeleteReport, onReturn, hasActions }) {
+  const [open, setOpen] = useState(false);
   const saleLineItems = report.details?.lineItems || [];
   const returnableType = report.type === "sale" || report.type === "phoneOrder";
   const fullyReturned = report.details?.returnStatus === "Fully returned";
   const canReturn = Boolean(onReturn) && returnableType && saleLineItems.length > 0 && !fullyReturned;
+  const columnCount = hasActions ? 9 : 8;
+  // Stop clicks on interactive controls (status, buttons) from toggling the row.
+  const stop = (event) => event.stopPropagation();
   return (
-    <tr>
-      <td>{formatShortDate(report.createdAt)}</td>
-      <td><span className={`badge ${report.type}`}>{reportTypes[report.type].label}</span></td>
-      <td>{report.customerPhone || "-"}</td>
-      <td><ReportDetails report={report} /></td>
-      <td>{formatPayment(report.paymentAmount)}</td>
-      <td>{report.paymentMethod || "-"}</td>
-      <td>{report.servedBy || "-"}</td>
-      <td>
-        {report.type === "repair" ? (
-          <select
-            className="status-select"
-            value={report.details?.status || repairStatuses[0]}
-            onChange={(event) => onStatusChange(report.id, event.target.value)}
-          >
-            {repairStatuses.map((status) => (
-              <option key={status}>{status}</option>
-            ))}
-          </select>
-        ) : report.details?.returnStatus ? (
-          <span className="status-pill returned">{report.details.returnStatus}</span>
-        ) : (
-          <span className="muted">-</span>
-        )}
-      </td>
-      {hasActions ? (
-        <td className="pos-row-actions">
-          {canReturn ? (
-            <button
-              className="secondary-button compact-button"
-              type="button"
-              onClick={() => onReturn(report)}
-            >
-              Return
-            </button>
-          ) : null}
-          {onDeleteReport ? (
-            <button
-              className="secondary-button compact-button"
-              type="button"
-              onClick={() => onDeleteReport(report.id)}
-            >
-              Delete
-            </button>
-          ) : null}
+    <>
+      <tr className="report-row" onClick={() => setOpen((value) => !value)}>
+        <td>{formatShortDate(report.createdAt)}</td>
+        <td><span className={`badge ${report.type}`}>{reportTypes[report.type].label}</span></td>
+        <td>{report.customerPhone || "-"}</td>
+        <td>
+          <button type="button" className="row-toggle" aria-expanded={open} onClick={(event) => { stop(event); setOpen((value) => !value); }}>
+            {open ? "▾" : "▸"}
+          </button>
+          {open ? null : <ReportDetails report={report} compact />}
         </td>
+        <td>{formatPayment(report.paymentAmount)}</td>
+        <td>{report.paymentMethod || "-"}</td>
+        <td>{report.servedBy || "-"}</td>
+        <td onClick={stop}>
+          {report.type === "repair" ? (
+            <select
+              className="status-select"
+              value={report.details?.status || repairStatuses[0]}
+              onChange={(event) => onStatusChange(report.id, event.target.value)}
+            >
+              {repairStatuses.map((status) => (
+                <option key={status}>{status}</option>
+              ))}
+            </select>
+          ) : report.details?.returnStatus ? (
+            <span className="status-pill returned">{report.details.returnStatus}</span>
+          ) : (
+            <span className="muted">-</span>
+          )}
+        </td>
+        {hasActions ? (
+          <td className="pos-row-actions" onClick={stop}>
+            {canReturn ? (
+              <button
+                className="secondary-button compact-button"
+                type="button"
+                onClick={() => onReturn(report)}
+              >
+                Return
+              </button>
+            ) : null}
+            {onDeleteReport ? (
+              <button
+                className="secondary-button compact-button"
+                type="button"
+                onClick={() => onDeleteReport(report.id)}
+              >
+                Delete
+              </button>
+            ) : null}
+          </td>
+        ) : null}
+      </tr>
+      {open ? (
+        <tr className="report-detail-row">
+          <td colSpan={columnCount}><ReportDetails report={report} /></td>
+        </tr>
       ) : null}
-    </tr>
+    </>
   );
 }
 
@@ -6674,7 +6708,7 @@ function collectReportImeis(details) {
   return details.imei || "";
 }
 
-function ReportDetails({ report }) {
+function ReportDetails({ report, compact }) {
   const details = report.details || {};
   const imeis = collectReportImeis(details);
   const lines = {
@@ -6762,23 +6796,25 @@ function ReportDetails({ report }) {
     ? callRecordingUrl(details.telebroadCallId, details.telebroadUniqueId)
     : "";
 
+  const filled = lines.filter(([, value]) => value);
+  // Collapsed rows show just the first couple of fields as a one-line teaser.
+  const shown = compact ? filled.slice(0, 2) : filled;
+
   return (
-    <div className="details">
-      {lines.filter(([, value]) => value).length ? (
-        lines
-          .filter(([, value]) => value)
-          .map(([label, value]) => (
-            <span key={label}><strong>{label}:</strong> {value}</span>
-          ))
+    <div className={compact ? "details details-compact" : "details"}>
+      {shown.length ? (
+        shown.map(([label, value]) => (
+          <span key={label}><strong>{label}:</strong> {value}</span>
+        ))
       ) : (
         <span>-</span>
       )}
-      {recordingUrl ? (
+      {!compact && recordingUrl ? (
         <a className="secondary-button compact-button" href={recordingUrl} target="_blank" rel="noopener noreferrer">
           ▶ Call recording
         </a>
       ) : null}
-      {report.notes ? <span className="muted">{report.notes}</span> : null}
+      {!compact && report.notes ? <span className="muted">{report.notes}</span> : null}
     </div>
   );
 }
