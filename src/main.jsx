@@ -167,12 +167,16 @@ function Workspace({ currentUser, isAdmin }) {
   }, [employeeName, employees, setStaff]);
 
   useEffect(() => {
-    // The active employee is always the signed-in user — nobody (not even an
-    // admin) may file or view as someone else.
-    if (employeeName && activeEmployee !== employeeName) {
+    // Employees are locked to their own identity; admins may switch who they
+    // file/view as.
+    if (!isAdmin) {
       setActiveEmployee(employeeName);
+      return;
     }
-  }, [activeEmployee, employeeName]);
+    if (activeEmployee && !employees.includes(activeEmployee)) {
+      setActiveEmployee(employees[0] || employeeName || "");
+    }
+  }, [activeEmployee, employees, employeeName, isAdmin]);
 
   useEffect(() => {
     if (isAdmin) localStorage.setItem(ACTIVE_EMPLOYEE_KEY, activeEmployee);
@@ -1690,9 +1694,17 @@ function Sidebar({
 
       <div className="sidebar-account">
         <label className="field">
-          <span>Signed in employee</span>
-          {/* Locked to the signed-in identity — nobody can file as someone else. */}
-          <input value={activeEmployee} disabled readOnly />
+          <span>{sessionRole === "admin" ? "Active employee" : "Signed in employee"}</span>
+          {/* Employees are locked to themselves; admins can switch. */}
+          {sessionRole === "admin" ? (
+            <select value={activeEmployee} onChange={(event) => onEmployeeChange(event.target.value)}>
+              {employees.map((employee) => (
+                <option key={employee}>{employee}</option>
+              ))}
+            </select>
+          ) : (
+            <input value={activeEmployee} disabled readOnly />
+          )}
         </label>
         <button className="ghost-button" type="button" onClick={onLogout}>
           Sign out
