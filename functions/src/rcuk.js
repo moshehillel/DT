@@ -47,7 +47,8 @@ function buildRcukRentalPayload(payload) {
     il_ddi: toFlag(payload.il_ddi ?? payload.israel_number ?? payload.il_number),
     us_ddi: toFlag(payload.us_ddi ?? payload.usa_number ?? payload.usaNumber),
     sms: toFlag(payload.sms ?? payload.add_sms ?? payload.addSms),
-    Notes: payload.customer_phone || payload.customerPhone || payload.notes || "",
+    // RCUK's field is lowercase `notes`; sending `Notes` fails schema validation.
+    notes: payload.customer_phone || payload.customerPhone || payload.notes || "",
   };
 
   if (isMonthly) {

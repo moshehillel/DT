@@ -95,7 +95,7 @@ RCUK params:
 - `start_date`, and `end_date` (daily) or `no_of_months` (monthly).
 - `uk_days`, `eu_days`, `wts_days` — ints. `tp_days` is always `0`.
 - `il_ddi`, `us_ddi`, `sms` — int flags (`0` or `1`).
-- `Notes` — set to the customer phone number.
+- `notes` — set to the customer phone number.
 
 Optional Sola config:
 
