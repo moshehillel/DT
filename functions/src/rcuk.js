@@ -49,13 +49,12 @@ function buildRcukRentalPayload(payload) {
     sms: toFlag(payload.sms ?? payload.add_sms ?? payload.addSms),
     // RCUK's field is lowercase `notes`; sending `Notes` fails schema validation.
     notes: payload.customer_phone || payload.customerPhone || payload.notes || "",
+    // RCUK's schema requires BOTH end_date and no_of_months present on every
+    // request (a working reference always sends no_of_months: 0 for daily).
+    // Omitting either one is rejected as "invalid request body".
+    end_date: payload.end_date || "",
+    no_of_months: isMonthly ? numberOrZero(payload.no_of_months) : 0,
   };
-
-  if (isMonthly) {
-    rcukPayload.no_of_months = numberOrZero(payload.no_of_months);
-  } else {
-    rcukPayload.end_date = payload.end_date || "";
-  }
 
   return rcukPayload;
 }
