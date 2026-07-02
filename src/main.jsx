@@ -8,6 +8,7 @@ import {
   defaultManualReportType,
   defaultOrderHandlers,
   FUNCTIONS_BASE_URL,
+  isCardPayment,
   lookupRepairPrice,
   manualReportTypeKeys,
   ORDER_HANDLERS_KEY,
@@ -2063,7 +2064,7 @@ function RentalReportForm({ activeEmployee, activeLocation, activeStoreInfo, onS
   const rentalSubmitted = submitState.status === "submitted" || submitState.status === "numbers-ready";
   const minimumDaysValid = getMinimumRentalDays(form.rentalRegion) <= totalDays;
   // CC/Card rentals must be charged on the in-store terminal before saving.
-  const requiresCardCharge = ["CC", "Card"].includes(form.paymentMethod);
+  const requiresCardCharge = isCardPayment(form.paymentMethod);
   const cardChargeComplete = !requiresCardCharge || card.status === "paid";
   const canSubmitRental = isRentalFormComplete(form)
     && zoneDaysValid
@@ -3012,7 +3013,7 @@ function OpenRepairsPage({ reports, onStatusChange, onSetReady, onMarkPaid, onEd
   // customer is sent by the notifyRepairPaid Cloud Function on the status change.
   async function handleMarkPaid(repair, manualEntry = false) {
     if (repair.details?.paymentStatus === "Paid") return;
-    const needsTerminal = ["CC", "Card"].includes(repair.paymentMethod);
+    const needsTerminal = isCardPayment(repair.paymentMethod);
 
     if (!needsTerminal) {
       onMarkPaid(repair.id);
@@ -3076,7 +3077,7 @@ function OpenRepairsPage({ reports, onStatusChange, onSetReady, onMarkPaid, onEd
               openRepairs.map((repair) => {
                 const isPaid = repair.details?.paymentStatus === "Paid";
                 const isCharging = paying.id === repair.id && paying.status === "charging";
-                const needsTerminal = ["CC", "Card"].includes(repair.paymentMethod);
+                const needsTerminal = isCardPayment(repair.paymentMethod);
                 return (
                   <tr key={repair.id}>
                     <td><strong>{repair.details?.ticketNumber || "-"}</strong></td>
@@ -3625,7 +3626,7 @@ function PhoneOrderPage({ activeEmployee, sessionRole, activeLocation, storeLoca
     contactDetails: "",
     customerAddress: "",
     deliveryAddress: "",
-    paymentStatus: "Paid",
+    paymentStatus: "",
     paymentMethod: "",
     notes: "",
   });
@@ -3821,6 +3822,7 @@ function PhoneOrderPage({ activeEmployee, sessionRole, activeLocation, storeLoca
   const canCreate = Boolean(form.location.trim())
     && localPhoneDigits(form.customerPhone).length >= 6
     && Boolean(form.deliveryAddress.trim())
+    && Boolean(form.paymentStatus)
     && Boolean(form.paymentMethod)
     && cart.length > 0;
 
@@ -3904,6 +3906,8 @@ function PhoneOrderPage({ activeEmployee, sessionRole, activeLocation, storeLoca
       contactDetails: "",
       customerAddress: "",
       deliveryAddress: "",
+      paymentStatus: "",
+      paymentMethod: "",
       notes: "",
     }));
     setMessage(`Order created and sent to ${order.location || "the store"}.`);
@@ -4115,6 +4119,7 @@ function PhoneOrderPage({ activeEmployee, sessionRole, activeLocation, storeLoca
             <label className="field">
               <span>Payment status</span>
               <select value={form.paymentStatus} onChange={(event) => updateField("paymentStatus", event.target.value)}>
+                <option value="" disabled>Select one</option>
                 <option>Paid</option>
                 <option>Collect on delivery</option>
               </select>
@@ -4132,7 +4137,7 @@ function PhoneOrderPage({ activeEmployee, sessionRole, activeLocation, storeLoca
             </label>
           </div>
 
-          {form.paymentStatus === "Paid" && ["CC", "Card"].includes(form.paymentMethod) ? (
+          {form.paymentStatus === "Paid" && isCardPayment(form.paymentMethod) ? (
             <p className="muted pos-warning">The store will charge the card on its terminal before marking the order ready.</p>
           ) : null}
           <p className="muted pos-checkout-hint">Use the Create order bar at the bottom of the screen.</p>
@@ -4175,6 +4180,8 @@ function PhoneOrderPage({ activeEmployee, sessionRole, activeLocation, storeLoca
         </div>
         <div className="pos-action-bar-cta">
           {!form.location.trim() ? <span className="pos-action-warn">Pick a store</span> : null}
+          {!form.paymentStatus ? <span className="pos-action-warn">Choose payment status</span> : null}
+          {!form.paymentMethod ? <span className="pos-action-warn">Choose payment method</span> : null}
           <button className="primary-button pos-complete-button" type="button" disabled={!canCreate} onClick={handleCreateOrder}>
             {cart.length ? `Create order · ${formatMoney(orderTotal)}` : "Scan items to start"}
           </button>
@@ -4276,7 +4283,7 @@ function StoreOrderCard({ order, products, onMarkReady, onCancel }) {
   const [cardEntryMode, setCardEntryMode] = useState("terminal");
   const [card, setCard] = useState({ status: "idle", message: "", refNum: "" });
 
-  const requiresCardCharge = order.paymentStatus === "Paid" && ["CC", "Card"].includes(order.paymentMethod);
+  const requiresCardCharge = order.paymentStatus === "Paid" && isCardPayment(order.paymentMethod);
   const cardCharged = !requiresCardCharge || card.status === "paid";
 
   function imeiStatus(index) {
@@ -4516,6 +4523,7 @@ function PosPage({ products, activeEmployee, activeLocation, activeDeviceId, act
   const [message, setMessage] = useState("");
   const [completedSale, setCompletedSale] = useState(null);
   const [customerPrompt, setCustomerPrompt] = useState(null);
+  const [customAmountOpen, setCustomAmountOpen] = useState(false);
   const [cardEntryMode, setCardEntryMode] = useState("terminal");
   const [card, setCard] = useState({ status: "idle", message: "", refNum: "" });
   const scanRef = useRef(null);
@@ -4574,6 +4582,45 @@ function PosPage({ products, activeEmployee, activeLocation, activeDeviceId, act
       category: product.category || "",
       adjustCode: "",
     };
+  }
+
+  function makeCustomLine(amount) {
+    const price = Number.parseFloat(String(amount || "").replace(/[^\d.]/g, ""));
+    if (!Number.isFinite(price) || price <= 0) return null;
+    return {
+      lineId: crypto.randomUUID(),
+      productId: "",
+      sku: "CUSTOM",
+      name: "Custom item",
+      price,
+      qty: 1,
+      requiresImei: false,
+      imei: "",
+      category: "Custom",
+      adjustCode: "",
+      isCustom: true,
+    };
+  }
+
+  function addCustomItemToCart(amount) {
+    const line = makeCustomLine(amount);
+    if (!line) {
+      playScanError();
+      setMessage("Enter a valid custom amount greater than zero.");
+      return false;
+    }
+    setCart((current) => [...current, line]);
+    playScanBeep();
+    setMessage(`Added Custom item for ${formatMoney(line.price)}.`);
+    return true;
+  }
+
+  function updateCustomPrice(lineId, value) {
+    const price = Number.parseFloat(String(value || "").replace(/[^\d.]/g, ""));
+    if (!Number.isFinite(price) || price <= 0) return;
+    setCart((current) =>
+      current.map((line) => (line.lineId === lineId && line.isCustom ? { ...line, price } : line)),
+    );
   }
 
   function findProductBySku(sku) {
@@ -4665,7 +4712,7 @@ function PosPage({ products, activeEmployee, activeLocation, activeDeviceId, act
   const taxAmount = taxApplies ? subtotal * (taxRate / 100) : 0;
   const total = subtotal + taxAmount;
   const itemCount = cart.reduce((sum, line) => sum + line.qty, 0);
-  const requiresCardCharge = ["CC", "Card"].includes(paymentMethod);
+  const requiresCardCharge = isCardPayment(paymentMethod);
   const cardChargeComplete = !requiresCardCharge || card.status === "paid";
   const imeiIssue = (() => {
     if (cart.some((line) => imeiLineStatus(line) === "missing")) {
@@ -4768,7 +4815,11 @@ function PosPage({ products, activeEmployee, activeLocation, activeDeviceId, act
       createdAt: new Date().toISOString(),
       details: {
         request: "POS sale",
-        productType: cart.length === 1 ? cart[0].category || "Item" : "Mixed",
+        productType: cart.every((line) => line.isCustom)
+          ? "Custom"
+          : cart.length === 1
+            ? cart[0].category || "Item"
+            : "Mixed",
         location: activeLocation,
         itemsText,
         model: cart.length === 1 ? cart[0].name : itemsText,
@@ -4902,13 +4953,29 @@ function PosPage({ products, activeEmployee, activeLocation, activeDeviceId, act
                     <tr key={line.lineId}>
                       <td>
                         <strong>{line.name}</strong>
-                        <p className="muted">{line.sku}</p>
+                        <p className="muted">{line.isCustom ? "Custom charge" : line.sku}</p>
                       </td>
                       <td>
-                        {formatMoney(line.price)}
-                        {adjust ? <p className="muted">→ {formatMoney(unitPrice)}</p> : null}
+                        {line.isCustom ? (
+                          <input
+                            className="pos-adjust"
+                            type="number"
+                            min="0.01"
+                            step="0.01"
+                            value={line.price}
+                            onChange={(event) => updateCustomPrice(line.lineId, event.target.value)}
+                          />
+                        ) : (
+                          <>
+                            {formatMoney(line.price)}
+                            {adjust ? <p className="muted">→ {formatMoney(unitPrice)}</p> : null}
+                          </>
+                        )}
                       </td>
                       <td>
+                        {line.isCustom ? (
+                          <span className="muted">—</span>
+                        ) : (
                         <input
                           className="pos-adjust"
                           value={line.adjustCode}
@@ -4918,6 +4985,7 @@ function PosPage({ products, activeEmployee, activeLocation, activeDeviceId, act
                           autoComplete="off"
                           spellCheck={false}
                         />
+                        )}
                       </td>
                       <td>
                         {line.requiresImei ? (
@@ -5073,6 +5141,11 @@ function PosPage({ products, activeEmployee, activeLocation, activeDeviceId, act
             spellCheck={false}
           />
         </div>
+        <div className="pos-quick-actions">
+          <button className="secondary-button" type="button" onClick={() => setCustomAmountOpen(true)}>
+            Custom item
+          </button>
+        </div>
         <div className="pos-product-grid">
           {quickAddProducts.length ? (
             quickAddProducts.map((product) => (
@@ -5114,6 +5187,18 @@ function PosPage({ products, activeEmployee, activeLocation, activeDeviceId, act
           </button>
         </div>
       </div>
+
+      {customAmountOpen ? (
+        <CustomAmountDialog
+          onAdd={(amount) => {
+            if (addCustomItemToCart(amount)) {
+              setCustomAmountOpen(false);
+              scanRef.current?.focus();
+            }
+          }}
+          onClose={() => setCustomAmountOpen(false)}
+        />
+      ) : null}
 
       {customerPrompt ? (
         <CustomerInfoDialog
@@ -5268,6 +5353,43 @@ function AddressAutocomplete({ value, onChange, autoFocus }) {
         />
       </label>
     </>
+  );
+}
+
+// Enter a one-off charge that prints on the receipt as Custom item.
+function CustomAmountDialog({ onAdd, onClose }) {
+  const [amount, setAmount] = useState("");
+
+  function submit(event) {
+    event.preventDefault();
+    event.stopPropagation();
+    onAdd(amount);
+  }
+
+  return createPortal(
+    <div className="dialog-backdrop" role="presentation" onMouseDown={onClose}>
+      <div className="dialog-card" role="dialog" aria-modal="true" onMouseDown={(event) => event.stopPropagation()}>
+        <h2>Custom item</h2>
+        <p className="muted">Enter the amount to charge. The receipt will list it as Custom item.</p>
+        <form className="form-grid" onSubmit={submit}>
+          <label className="field">
+            <span>Amount</span>
+            <input
+              value={amount}
+              onChange={(event) => setAmount(event.target.value)}
+              inputMode="decimal"
+              autoFocus
+              placeholder="0.00"
+            />
+          </label>
+          <div className="pos-form-actions form-actions-row">
+            <button className="primary-button" type="submit">Add to cart</button>
+            <button className="secondary-button" type="button" onClick={onClose}>Cancel</button>
+          </div>
+        </form>
+      </div>
+    </div>,
+    document.body,
   );
 }
 
@@ -7073,7 +7195,7 @@ function ReturnDialog({ report, onClose, onSubmit }) {
   const imeiNeedsScan = lines.some(
     (line) => line.requiresImei && line.returnQty > 0 && line.scanImei !== line.soldImei,
   );
-  const requiresSolaRefund = ["CC", "Card"].includes(refundMethod) && Boolean(originalRefNum);
+  const requiresSolaRefund = isCardPayment(refundMethod) && Boolean(originalRefNum);
   const canSubmit = anySelected && refundTotal > 0 && !imeiNeedsScan && refundState.status !== "refunding";
 
   async function handleConfirm() {

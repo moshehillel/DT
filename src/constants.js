@@ -63,7 +63,12 @@ export const defaultOrderHandlers = [
 ];
 export const defaultStoreLocations = ["Main store"];
 export const productCategories = ["Phone", "Accessory", "SIM", "Other"];
-export const paymentMethods = ["Cash", "CC", "Card", "Check", "Zelle", "Cash App", "Apple Pay", "Other"];
+export const paymentMethods = ["Cash", "Card", "Check", "Zelle", "Cash App", "Apple Pay", "Other"];
+
+// Saved reports may still say "CC" from before the duplicate was removed.
+export function isCardPayment(method) {
+  return method === "Card" || method === "CC";
+}
 export const repairStatuses = [
   "Received",
   "Diagnosing",

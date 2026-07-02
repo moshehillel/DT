@@ -1715,6 +1715,10 @@ tr:last-child td {
   text-align: center;
 }
 
+.pos-quick-actions {
+  margin-bottom: 12px;
+}
+
 /* Collapsible report rows: compact by default, expand on click. */
 .report-row {
   cursor: pointer;
