@@ -27,7 +27,12 @@ import { useCloudCollectionState, useCloudDocumentState } from "./hooks/useCloud
 import {
   attachAuthMetadata,
   callFunction,
+  deleteCustomerDoc,
   ensureFirebaseAuth,
+  findCustomerByPhone,
+  listCustomersPage,
+  saveCustomerDoc,
+  searchCustomersByPhonePrefix,
   sendReset,
   signInWithEmail,
   signOutUser,
@@ -121,7 +126,8 @@ function Workspace({ currentUser, isAdmin }) {
   const [resetRequests, setResetRequests] = useCloudCollectionState("passwordResetRequests", RESET_REQUESTS_KEY, []);
   const [products, setProducts] = useCloudCollectionState("products", PRODUCTS_KEY, []);
   const [stores, setStores] = useCloudDocumentState("stores", STORES_KEY, []);
-  const [customers, setCustomers] = useCloudCollectionState("customers", CUSTOMERS_KEY, []);
+  // Customers are queried on demand (see findCustomerByPhone / CustomersPage) —
+  // never bulk-loaded — so a 10k+ CRM doesn't cost a read on every app load.
 
   // `stores` and `staff` are the single sources of truth. Every store name,
   // address, hours, tax rate and terminal device lives in one `stores` entry;
@@ -175,16 +181,12 @@ function Workspace({ currentUser, isAdmin }) {
   }, [employeeName, employees, setStaff]);
 
   useEffect(() => {
-    // Employees are locked to their own identity; admins may switch who they
-    // file/view as.
-    if (!isAdmin) {
+    // The active employee is always the signed-in user — nobody (not even an
+    // admin) can file or view as someone else.
+    if (employeeName && activeEmployee !== employeeName) {
       setActiveEmployee(employeeName);
-      return;
     }
-    if (activeEmployee && !employees.includes(activeEmployee)) {
-      setActiveEmployee(employees[0] || employeeName || "");
-    }
-  }, [activeEmployee, employees, employeeName, isAdmin]);
+  }, [activeEmployee, employeeName]);
 
   useEffect(() => {
     if (isAdmin) localStorage.setItem(ACTIVE_EMPLOYEE_KEY, activeEmployee);
@@ -351,62 +353,65 @@ function Workspace({ currentUser, isAdmin }) {
 
   // Auto-add/merge a customer into the CRM from any sale/call/order. Only fills
   // blank fields on an existing customer — never overwrites entered details.
-  function upsertCustomer(info) {
+  // Query-on-demand: look the number up, then write just that one doc.
+  async function upsertCustomer(info) {
     const phone = String(info?.phone || "").trim();
     const digits = localPhoneDigits(phone);
     if (!digits) return;
-    setCustomers((current) => {
-      const index = current.findIndex((entry) => entry.phoneDigits === digits);
-      const now = new Date().toISOString();
-      if (index === -1) {
-        return [
-          {
-            id: crypto.randomUUID(),
-            name: String(info.name || "").trim(),
-            phone,
-            phoneDigits: digits,
-            address: String(info.address || "").trim(),
-            email: String(info.email || "").trim(),
-            contactDetails: String(info.contactDetails || "").trim(),
-            notes: "",
-            createdAt: now,
-            updatedAt: now,
-          },
-          ...current,
-        ];
-      }
-      const existing = current[index];
-      const merged = {
-        ...existing,
-        phone: existing.phone || phone,
-        name: existing.name || String(info.name || "").trim(),
-        address: existing.address || String(info.address || "").trim(),
-        email: existing.email || String(info.email || "").trim(),
-        contactDetails: existing.contactDetails || String(info.contactDetails || "").trim(),
-      };
-      if (
-        merged.phone === existing.phone &&
-        merged.name === existing.name &&
-        merged.address === existing.address &&
-        merged.email === existing.email &&
-        merged.contactDetails === existing.contactDetails
-      ) {
-        return current;
-      }
-      merged.updatedAt = now;
-      const next = [...current];
-      next[index] = merged;
-      return next;
-    });
+    const now = new Date().toISOString();
+    const existing = await findCustomerByPhone(digits);
+    if (!existing) {
+      await saveCustomerDoc({
+        name: String(info.name || "").trim(),
+        phone,
+        phoneDigits: digits,
+        mobile: "",
+        mobileDigits: "",
+        address: String(info.address || "").trim(),
+        email: String(info.email || "").trim(),
+        contactDetails: String(info.contactDetails || "").trim(),
+        notes: "",
+        createdAt: now,
+        updatedAt: now,
+      });
+      return;
+    }
+    const merged = {
+      ...existing,
+      phone: existing.phone || phone,
+      name: existing.name || String(info.name || "").trim(),
+      address: existing.address || String(info.address || "").trim(),
+      email: existing.email || String(info.email || "").trim(),
+      contactDetails: existing.contactDetails || String(info.contactDetails || "").trim(),
+    };
+    if (
+      merged.phone === existing.phone &&
+      merged.name === existing.name &&
+      merged.address === existing.address &&
+      merged.email === existing.email &&
+      merged.contactDetails === existing.contactDetails
+    ) {
+      return;
+    }
+    merged.updatedAt = now;
+    await saveCustomerDoc(merged);
   }
 
-  // Manual create/edit from the CRM page.
-  function saveCustomer(customer) {
+  // Manual create/edit from the CRM page (or the point-of-sale add dialog).
+  async function saveCustomer(customer) {
     const phone = String(customer.phone || "").trim();
     const digits = localPhoneDigits(phone);
     const now = new Date().toISOString();
     const mobile = String(customer.mobile || "").trim();
-    const normalized = {
+    let id = customer.id || "";
+    let createdAt = customer.createdAt || now;
+    // No id but a known phone: fold into the existing record instead of duplicating.
+    if (!id && digits) {
+      const existing = await findCustomerByPhone(digits);
+      if (existing) { id = existing.id; createdAt = existing.createdAt || now; }
+    }
+    await saveCustomerDoc({
+      id: id || undefined,
       phone,
       phoneDigits: digits,
       mobile,
@@ -416,76 +421,58 @@ function Workspace({ currentUser, isAdmin }) {
       email: String(customer.email || "").trim(),
       contactDetails: String(customer.contactDetails || "").trim(),
       notes: String(customer.notes || "").trim(),
+      createdAt,
       updatedAt: now,
-    };
-    setCustomers((current) => {
-      if (customer.id && current.some((entry) => entry.id === customer.id)) {
-        return current.map((entry) => (entry.id === customer.id ? { ...entry, ...normalized } : entry));
-      }
-      const index = digits ? current.findIndex((entry) => entry.phoneDigits === digits) : -1;
-      if (index !== -1) {
-        const next = [...current];
-        next[index] = { ...next[index], ...normalized };
-        return next;
-      }
-      return [{ ...normalized, id: customer.id || crypto.randomUUID(), createdAt: now }, ...current];
     });
   }
 
-  function removeCustomer(customerId) {
+  async function removeCustomer(customerId) {
     if (sessionRole !== "admin") {
-      window.alert("Only admin can delete customers.");
+      showAccessRestricted();
       return;
     }
-    const customer = customers.find((entry) => entry.id === customerId);
-    const label = customer?.name || customer?.phone || "this customer";
-    if (!window.confirm(`Delete ${label}? This cannot be undone.`)) return;
-    setCustomers((current) => current.filter((entry) => entry.id !== customerId));
+    if (!window.confirm("Delete this customer? This cannot be undone.")) return;
+    await deleteCustomerDoc(customerId);
   }
 
   // Fill in a name for a customer that has none yet (prompted at point of sale).
-  function saveCustomerName(customer, name) {
+  async function saveCustomerName(customer, name) {
     const cleanName = titleCaseName(name);
     if (!cleanName || !customer) return;
-    setCustomers((current) =>
-      current.map((entry) =>
-        entry.id === customer.id || (customer.phoneDigits && entry.phoneDigits === customer.phoneDigits)
-          ? { ...entry, name: entry.name || cleanName, updatedAt: new Date().toISOString() }
-          : entry,
-      ),
-    );
+    const target = customer.id
+      ? customer
+      : (customer.phoneDigits ? await findCustomerByPhone(customer.phoneDigits) : null);
+    if (!target || target.name) return;
+    await saveCustomerDoc({ ...target, name: cleanName, updatedAt: new Date().toISOString() });
   }
 
-  // Backfill the CRM with any customer phone seen in reports but not yet saved.
-  function syncCustomersFromReports() {
-    const existing = new Set(customers.map((entry) => entry.phoneDigits));
+  // Backfill the CRM with any customer phone seen in the loaded reports. Uses the
+  // deduping upsert (one lookup per unique number), so it never creates dupes.
+  async function syncCustomersFromReports() {
     const seen = new Set();
-    const additions = [];
-    const now = new Date().toISOString();
+    const unique = [];
     reports.forEach((report) => {
       const digits = report.customerPhoneDigits || digitsOnly(report.customerPhone);
-      if (!digits || existing.has(digits) || seen.has(digits)) return;
+      if (!digits || seen.has(digits)) return;
       seen.add(digits);
       const details = report.details || {};
-      additions.push({
-        id: crypto.randomUUID(),
-        name: titleCaseName(details.customerName || details.callerName),
+      unique.push({
         phone: String(report.customerPhone || "").trim(),
-        phoneDigits: digits,
-        address: String(details.address || "").trim(),
-        email: "",
-        contactDetails: String(details.contactDetails || "").trim(),
-        notes: "",
-        createdAt: now,
-        updatedAt: now,
+        name: details.customerName || details.callerName || "",
+        address: details.address || "",
+        contactDetails: details.contactDetails || "",
       });
     });
-    if (!additions.length) {
-      window.alert("All customers from reports are already in the CRM.");
+    if (!unique.length) {
+      window.alert("No phone numbers in the current reports to sync.");
       return;
     }
-    setCustomers((current) => [...additions, ...current]);
-    window.alert(`Added ${additions.length} customer${additions.length === 1 ? "" : "s"} from reports.`);
+    if (!window.confirm(`Sync ${unique.length} phone number(s) from the loaded reports into the CRM?`)) return;
+    for (const info of unique) {
+      // eslint-disable-next-line no-await-in-loop
+      await upsertCustomer(info);
+    }
+    window.alert(`Synced ${unique.length} number(s) into the CRM.`);
   }
 
   function setEmployeeLocation(name, location) {
@@ -1253,7 +1240,6 @@ function Workspace({ currentUser, isAdmin }) {
           <PendingReportsPage
             pendingReports={pendingReports}
             activeEmployee={activeEmployee}
-            customers={customers}
             onSaveCustomerName={saveCustomerName}
             onSaveCustomer={saveCustomer}
             onClaim={claimPendingReport}
@@ -1269,7 +1255,6 @@ function Workspace({ currentUser, isAdmin }) {
           />
         ) : activeView === "customers" ? (
           <CustomersPage
-            customers={customers}
             sessionRole={sessionRole}
             onSave={saveCustomer}
             onRemove={removeCustomer}
@@ -1282,7 +1267,6 @@ function Workspace({ currentUser, isAdmin }) {
               activeEmployee={activeEmployee}
               activeLocation={activeLocation}
               activeStoreInfo={activeStoreInfo}
-              customers={customers}
               onSaveCustomerName={saveCustomerName}
               onSaveCustomer={saveCustomer}
               onSave={saveReport}
@@ -1299,7 +1283,6 @@ function Workspace({ currentUser, isAdmin }) {
               storeTax={storeTax}
               storeDevices={storeDevices}
               products={products}
-              customers={customers}
               onSaveCustomerName={saveCustomerName}
               onSaveCustomer={saveCustomer}
               onCreate={createPhoneOrder}
@@ -1315,7 +1298,6 @@ function Workspace({ currentUser, isAdmin }) {
               activeEmployee={activeEmployee}
               activeLocation={activeLocation}
               reports={reports}
-              customers={customers}
               activeStoreInfo={activeStoreInfo}
               onSaveCustomerName={saveCustomerName}
               onSaveCustomer={saveCustomer}
@@ -1349,7 +1331,6 @@ function Workspace({ currentUser, isAdmin }) {
             activeDeviceId={activeDeviceId}
             activeTaxRate={activeTaxRate}
             activeStoreInfo={activeStoreInfo}
-            customers={customers}
             onSaveCustomerName={saveCustomerName}
             onSaveCustomer={saveCustomer}
             onCompleteSale={savePosSale}
@@ -1702,17 +1683,9 @@ function Sidebar({
 
       <div className="sidebar-account">
         <label className="field">
-          <span>{sessionRole === "admin" ? "Active employee" : "Signed in employee"}</span>
-          {/* Employees are locked to themselves; admins can switch. */}
-          {sessionRole === "admin" ? (
-            <select value={activeEmployee} onChange={(event) => onEmployeeChange(event.target.value)}>
-              {employees.map((employee) => (
-                <option key={employee}>{employee}</option>
-              ))}
-            </select>
-          ) : (
-            <input value={activeEmployee} disabled readOnly />
-          )}
+          <span>Signed in employee</span>
+          {/* Locked to the signed-in identity — nobody (incl. admin) can switch. */}
+          <input value={activeEmployee} disabled readOnly />
         </label>
         <button className="ghost-button" type="button" onClick={onLogout}>
           Sign out
@@ -1735,9 +1708,12 @@ function buildInitialFieldValues(config) {
   return values;
 }
 
-function ReportForm({ activeType, activeEmployee, activeLocation, reports, customers, activeStoreInfo, onSaveCustomerName, onSaveCustomer, onSave }) {
+function ReportForm({ activeType, activeEmployee, activeLocation, reports, activeStoreInfo, onSaveCustomerName, onSaveCustomer, onSave }) {
   const [now, setNow] = useState(new Date());
   const [customerPhone, setCustomerPhone] = useState("");
+  // The customer the phone field resolved to (queried on demand), used to snapshot
+  // name/address onto the report without loading the whole CRM.
+  const [resolvedCustomer, setResolvedCustomer] = useState(null);
   const [paymentAmount, setPaymentAmount] = useState("");
   const [repairPriceHint, setRepairPriceHint] = useState("");
   const repairSelectionRef = useRef({ model: "", damage: "" });
@@ -1831,8 +1807,9 @@ function ReportForm({ activeType, activeEmployee, activeLocation, reports, custo
 
     // Snapshot store + customer details so the printed ticket is self-contained.
     const phoneDigits = localPhoneDigits(formData.get("customerPhone"));
-    const matchedCustomer = phoneDigits
-      ? (customers || []).find((entry) => entry.phoneDigits === phoneDigits || entry.mobileDigits === phoneDigits)
+    const matchedCustomer = phoneDigits && resolvedCustomer
+      && (resolvedCustomer.phoneDigits === phoneDigits || resolvedCustomer.mobileDigits === phoneDigits)
+      ? resolvedCustomer
       : null;
     details.location = activeLocation || "";
     details.storeAddress = activeStoreInfo?.address || "";
@@ -1886,10 +1863,10 @@ function ReportForm({ activeType, activeEmployee, activeLocation, reports, custo
               name="customerPhone"
               value={customerPhone}
               onChange={setCustomerPhone}
-              customers={customers}
               onSaveCustomerName={onSaveCustomerName}
               onSaveCustomer={onSaveCustomer}
-              onSelectCustomer={(customer) => setCustomerPhone(customer.phone)}
+              onResolveCustomer={setResolvedCustomer}
+              onSelectCustomer={(customer) => { setCustomerPhone(customer.phone); setResolvedCustomer(customer); }}
               placeholder="(555) 123-4567"
               required
             />
@@ -2017,7 +1994,7 @@ function NotificationCenter({ notifications }) {
   );
 }
 
-function RentalReportForm({ activeEmployee, activeLocation, activeStoreInfo, customers, onSaveCustomerName, onSaveCustomer, onSave }) {
+function RentalReportForm({ activeEmployee, activeLocation, activeStoreInfo, onSaveCustomerName, onSaveCustomer, onSave }) {
   const [now, setNow] = useState(new Date());
   const [form, setForm] = useState({
     rentalRegion: "RCUK",
@@ -2066,6 +2043,7 @@ function RentalReportForm({ activeEmployee, activeLocation, activeStoreInfo, cus
   const solaTokenRef = useRef("");
   // Card-present terminal state (Verifone P200 / Sola BBPOS), same as the POS.
   const [card, setCard] = useState({ status: "idle", message: "", refNum: "", cardType: "", maskedCardNumber: "" });
+  const [cardEntryMode, setCardEntryMode] = useState("terminal");
 
   useEffect(() => {
     const timer = window.setInterval(() => setNow(new Date()), 30000);
@@ -2395,10 +2373,11 @@ function RentalReportForm({ activeEmployee, activeLocation, activeStoreInfo, cus
   async function chargeRentalCard() {
     if (!requiresCardCharge || !totalPrice) return;
     try {
-      setCard({ status: "charging", message: "Follow the terminal: tap, insert, or swipe the card.", refNum: "", cardType: "", maskedCardNumber: "" });
+      setCard({ status: "charging", message: "Follow the terminal…", refNum: "", cardType: "", maskedCardNumber: "" });
       const result = await chargeOnLocalTerminal({
         amount: Number(totalPrice).toFixed(2),
         externalRequestId: `rental-${Date.now()}`,
+        manualEntry: cardEntryMode === "manual",
         onStatus: (text) => setCard((current) => ({ ...current, message: text })),
       });
       setCard({
@@ -2585,7 +2564,6 @@ function RentalReportForm({ activeEmployee, activeLocation, activeStoreInfo, cus
               <CustomerPhoneInput
                 value={form.customerPhone}
                 onChange={(value) => updateField("customerPhone", value)}
-                customers={customers}
                 onSaveCustomerName={onSaveCustomerName}
                 onSaveCustomer={onSaveCustomer}
                 onSelectCustomer={(customer) => updateField("customerPhone", customer.phone)}
@@ -2639,13 +2617,17 @@ function RentalReportForm({ activeEmployee, activeLocation, activeStoreInfo, cus
                 <span className={`reader-dot ${card.status === "paid" ? "connected" : ""}`} aria-hidden="true" />
                 <span className="muted">Sola BBPOS · local terminal</span>
               </div>
+              <div className="segmented-control" role="tablist" aria-label="Card entry mode">
+                <button type="button" className={cardEntryMode === "terminal" ? "selected" : ""} onClick={() => setCardEntryMode("terminal")} disabled={card.status === "charging" || card.status === "paid"}>Tap / dip / swipe</button>
+                <button type="button" className={cardEntryMode === "manual" ? "selected" : ""} onClick={() => setCardEntryMode("manual")} disabled={card.status === "charging" || card.status === "paid"}>Manual entry</button>
+              </div>
               <button
                 className="secondary-button"
                 type="button"
                 onClick={chargeRentalCard}
                 disabled={!totalPrice || card.status === "charging" || card.status === "paid"}
               >
-                {card.status === "paid" ? "Card charged ✓" : card.status === "charging" ? "Charging…" : `Charge ${formatMoney(totalPrice)}`}
+                {card.status === "paid" ? "Card charged ✓" : card.status === "charging" ? "Charging…" : cardEntryMode === "manual" ? `Charge ${formatMoney(totalPrice)} (manual entry)` : `Charge ${formatMoney(totalPrice)}`}
               </button>
               <p className={card.status === "error" ? "summary-error" : "muted"}>{card.message}</p>
             </div>
@@ -3028,7 +3010,7 @@ function OpenRepairsPage({ reports, onStatusChange, onSetReady, onMarkPaid, onEd
   // Mark a repair paid. For card payments, run the charge on the local terminal
   // first and only mark paid once the card is approved. The "paid" SMS to the
   // customer is sent by the notifyRepairPaid Cloud Function on the status change.
-  async function handleMarkPaid(repair) {
+  async function handleMarkPaid(repair, manualEntry = false) {
     if (repair.details?.paymentStatus === "Paid") return;
     const needsTerminal = ["CC", "Card"].includes(repair.paymentMethod);
 
@@ -3045,10 +3027,11 @@ function OpenRepairsPage({ reports, onStatusChange, onSetReady, onMarkPaid, onEd
     }
 
     try {
-      setPaying({ id: repair.id, status: "charging", message: "Follow the terminal: tap, insert, or swipe the card." });
+      setPaying({ id: repair.id, status: "charging", message: manualEntry ? "Follow the terminal: key in the card by hand." : "Follow the terminal: tap, insert, or swipe the card." });
       const result = await chargeOnLocalTerminal({
         amount: amount.toFixed(2),
         externalRequestId: `repair-${repair.id}`.slice(0, 32),
+        manualEntry,
         onStatus: (text) => setPaying((current) => ({ ...current, message: text })),
       });
       onMarkPaid(repair.id, {
@@ -3119,6 +3102,16 @@ function OpenRepairsPage({ reports, onStatusChange, onSetReady, onMarkPaid, onEd
                           >
                             {isCharging ? "Charging…" : needsTerminal ? "Charge card & mark paid" : "Mark paid"}
                           </button>
+                          {needsTerminal ? (
+                            <button
+                              className="secondary-button compact-button"
+                              type="button"
+                              disabled={isCharging}
+                              onClick={() => handleMarkPaid(repair, true)}
+                            >
+                              Manual entry
+                            </button>
+                          ) : null}
                         </div>
                       )}
                       {paying.id === repair.id && paying.message ? (
@@ -3290,7 +3283,7 @@ function FinalPriceDialog({ prompt, onChange, onConfirm, onClose }) {
   );
 }
 
-function PendingReportsPage({ pendingReports, activeEmployee, customers, onSaveCustomerName, onSaveCustomer, onClaim, onSave }) {
+function PendingReportsPage({ pendingReports, activeEmployee, onSaveCustomerName, onSaveCustomer, onClaim, onSave }) {
   return (
     <section className="history">
       <div className="history-header">
@@ -3308,7 +3301,6 @@ function PendingReportsPage({ pendingReports, activeEmployee, customers, onSaveC
               key={pendingReport.id}
               pendingReport={pendingReport}
               activeEmployee={activeEmployee}
-              customers={customers}
               onSaveCustomerName={onSaveCustomerName}
               onSaveCustomer={onSaveCustomer}
               onClaim={onClaim}
@@ -3323,7 +3315,7 @@ function PendingReportsPage({ pendingReports, activeEmployee, customers, onSaveC
   );
 }
 
-function PendingReportCard({ pendingReport, activeEmployee, customers, onSaveCustomerName, onSaveCustomer, onClaim, onSave }) {
+function PendingReportCard({ pendingReport, activeEmployee, onSaveCustomerName, onSaveCustomer, onClaim, onSave }) {
   const imported = pendingReport.imported || {};
   const isCallReport = pendingReport.type === "call" || pendingReport.source === "telebroad";
   const isShopifySale = pendingReport.source === "shopify_pos";
@@ -3338,15 +3330,16 @@ function PendingReportCard({ pendingReport, activeEmployee, customers, onSaveCus
   const imeiInputRef = useRef(null);
   // If the caller's number is already in the CRM, pull their saved name and
   // address so the employee only has to add the call reason.
-  const crmMatch = useMemo(() => {
+  const [crmMatch, setCrmMatch] = useState(null);
+  useEffect(() => {
     const digits = localPhoneDigits(
       pendingReport.customerPhone || imported.customerPhone || imported.callerIdExternal || "",
     );
-    if (!digits) return null;
-    return (customers || []).find(
-      (entry) => entry.phoneDigits === digits || entry.mobileDigits === digits,
-    ) || null;
-  }, [customers, pendingReport.customerPhone, imported.customerPhone, imported.callerIdExternal]);
+    if (!digits) { setCrmMatch(null); return undefined; }
+    let cancelled = false;
+    findCustomerByPhone(digits).then((c) => { if (!cancelled) setCrmMatch(c || null); }).catch(() => {});
+    return () => { cancelled = true; };
+  }, [pendingReport.customerPhone, imported.customerPhone, imported.callerIdExternal]);
   const [fields, setFields] = useState(() => ({
     customerPhone: pendingReport.customerPhone || imported.customerPhone || imported.callerIdExternal || "",
     callerName: pendingReport.details?.callerName || imported.callerNameExternal || "",
@@ -3533,7 +3526,6 @@ function PendingReportCard({ pendingReport, activeEmployee, customers, onSaveCus
             <CustomerPhoneInput
               value={fields.customerPhone}
               onChange={(value) => updateField("customerPhone", value)}
-              customers={customers}
               onSaveCustomerName={onSaveCustomerName}
               onSaveCustomer={onSaveCustomer}
               onSelectCustomer={(customer) => setFields((current) => ({
@@ -3622,8 +3614,10 @@ function PendingReportCard({ pendingReport, activeEmployee, customers, onSaveCus
   );
 }
 
-function PhoneOrderPage({ activeEmployee, sessionRole, activeLocation, storeLocations, phoneOrders, orderHandlers, storeTax, storeDevices, products, customers, onSaveCustomerName, onSaveCustomer, onCreate, onMarkReady, onAssignDriver, onCancel, onDelivered }) {
+function PhoneOrderPage({ activeEmployee, sessionRole, activeLocation, storeLocations, phoneOrders, orderHandlers, storeTax, storeDevices, products, onSaveCustomerName, onSaveCustomer, onCreate, onMarkReady, onAssignDriver, onCancel, onDelivered }) {
   const [outOfState, setOutOfState] = useState(false);
+  // Customer resolved by the phone field (queried on demand), for prompts/snapshot.
+  const [resolvedCustomer, setResolvedCustomer] = useState(null);
   const [form, setForm] = useState({
     location: activeLocation || (storeLocations || [])[0] || "",
     customerName: "",
@@ -3836,9 +3830,11 @@ function PhoneOrderPage({ activeEmployee, sessionRole, activeLocation, storeLoca
 
   function handleCreateOrder() {
     if (!canCreate) return;
-    const matched = (customers || []).find(
-      (entry) => entry.phoneDigits === localPhoneDigits(form.customerPhone) || entry.mobileDigits === localPhoneDigits(form.customerPhone),
-    ) || null;
+    const digits = localPhoneDigits(form.customerPhone);
+    const matched = resolvedCustomer
+      && (resolvedCustomer.phoneDigits === digits || resolvedCustomer.mobileDigits === digits)
+      ? resolvedCustomer
+      : null;
     // Prompt for a new/incomplete customer, just like POS, before creating.
     if (!matched || !matched.name) {
       setCustomerPrompt({ phone: form.customerPhone.trim(), customer: matched });
@@ -3970,10 +3966,10 @@ function PhoneOrderPage({ activeEmployee, sessionRole, activeLocation, storeLoca
             <CustomerPhoneInput
               value={form.customerPhone}
               onChange={(value) => updateField("customerPhone", value)}
-              customers={customers}
               onSaveCustomerName={onSaveCustomerName}
               onSaveCustomer={onSaveCustomer}
-              onSelectCustomer={fillFromCustomer}
+              onResolveCustomer={setResolvedCustomer}
+              onSelectCustomer={(customer) => { fillFromCustomer(customer); setResolvedCustomer(customer); }}
               required
             />
           </label>
@@ -4506,10 +4502,12 @@ function DeliveryBoard({ orders, activeEmployee, sessionRole, activeLocation, on
   );
 }
 
-function PosPage({ products, activeEmployee, activeLocation, activeDeviceId, activeTaxRate, activeStoreInfo, customers, onSaveCustomerName, onSaveCustomer, onCompleteSale }) {
+function PosPage({ products, activeEmployee, activeLocation, activeDeviceId, activeTaxRate, activeStoreInfo, onSaveCustomerName, onSaveCustomer, onCompleteSale }) {
   const [cart, setCart] = useState([]);
   const [scan, setScan] = useState("");
   const [scanMode, setScanMode] = useState(true);
+  // Customer resolved by the phone field (queried on demand) for the receipt/CRM.
+  const [resolvedCustomer, setResolvedCustomer] = useState(null);
   const [productSearch, setProductSearch] = useState("");
   const [customerPhone, setCustomerPhone] = useState("");
   const [paymentMethod, setPaymentMethod] = useState("");
@@ -4714,9 +4712,10 @@ function PosPage({ products, activeEmployee, activeLocation, activeDeviceId, act
   function findSaleCustomer() {
     const localDigits = localPhoneDigits(customerPhone);
     if (localDigits.length < 6) return null;
-    return (customers || []).find(
-      (entry) => entry.phoneDigits === localDigits || entry.mobileDigits === localDigits,
-    ) || null;
+    return resolvedCustomer
+      && (resolvedCustomer.phoneDigits === localDigits || resolvedCustomer.mobileDigits === localDigits)
+      ? resolvedCustomer
+      : null;
   }
 
   function handleCheckout() {
@@ -4978,10 +4977,10 @@ function PosPage({ products, activeEmployee, activeLocation, activeDeviceId, act
               <CustomerPhoneInput
                 value={customerPhone}
                 onChange={setCustomerPhone}
-                customers={customers}
                 onSaveCustomerName={onSaveCustomerName}
                 onSaveCustomer={onSaveCustomer}
-                onSelectCustomer={(customer) => setCustomerPhone(customer.phone)}
+                onResolveCustomer={setResolvedCustomer}
+                onSelectCustomer={(customer) => { setCustomerPhone(customer.phone); setResolvedCustomer(customer); }}
                 placeholder="For receipt / follow-up"
               />
             </label>
@@ -6587,17 +6586,6 @@ function AdminPage({
                   <strong>{location}</strong>
                   <p className="muted">{address || "No address on file"}</p>
                 </div>
-                <label className="field">
-                  <span>Sola device ID</span>
-                  <input
-                    key={`device-${location}-${deviceFor(location)}`}
-                    defaultValue={deviceFor(location)}
-                    placeholder="CloudIM device ID"
-                    autoComplete="off"
-                    spellCheck={false}
-                    onBlur={(event) => onSetStoreDevice(location, event.target.value)}
-                  />
-                </label>
                 <label className="field tax-rate-field">
                   <span>Tax rate %</span>
                   <input
@@ -7237,22 +7225,47 @@ function friendlyCallError(error) {
 
 // Phone input with a CRM type-ahead. As digits are typed, matching customers
 // appear; picking one fills the customer's other details via onSelectCustomer.
-function CustomerPhoneInput({ value, onChange, customers, onSelectCustomer, onSaveCustomerName, onSaveCustomer, placeholder, required, name, autoFocus }) {
+function CustomerPhoneInput({ value, onChange, onSelectCustomer, onResolveCustomer, onSaveCustomerName, onSaveCustomer, placeholder, required, name, autoFocus }) {
   const [open, setOpen] = useState(false);
   const [detailsPrompt, setDetailsPrompt] = useState(null);
+  // Query on demand instead of scanning a preloaded list: a debounced prefix
+  // query fills the dropdown, and an exact query (7+ digits) drives the summary
+  // and reports the resolved customer to the parent form for save-time snapshots.
+  const [matches, setMatches] = useState([]);
+  const [exactMatch, setExactMatch] = useState(null);
   // The leading US "1" is pre-filled and ignored. localDigits is the 10-digit
   // local number (area code included); searching starts after 5 of those digits.
   const localDigits = localPhoneDigits(value);
-  const matches = localDigits.length >= 5
-    ? (customers || [])
-        .filter((customer) => (customer.phoneDigits || "").includes(localDigits) || (customer.mobileDigits || "").includes(localDigits))
-        .slice(0, 8)
-    : [];
-  // A full-number match drives the read-only details summary shown beneath the
-  // field, so the phone number stays the only thing the user has to enter.
-  const exactMatch = localDigits.length >= 7
-    ? (customers || []).find((customer) => customer.phoneDigits === localDigits || customer.mobileDigits === localDigits) || null
-    : null;
+  const resolveRef = useRef(onResolveCustomer);
+  resolveRef.current = onResolveCustomer;
+
+  useEffect(() => {
+    let cancelled = false;
+    if (localDigits.length < 5) {
+      setMatches([]);
+      setExactMatch(null);
+      resolveRef.current?.(null);
+      return undefined;
+    }
+    const timer = window.setTimeout(async () => {
+      try {
+        const found = await searchCustomersByPhonePrefix(localDigits, 8);
+        if (cancelled) return;
+        setMatches(found);
+        const exact = localDigits.length >= 7
+          ? found.find((c) => c.phoneDigits === localDigits || c.mobileDigits === localDigits)
+            || (await findCustomerByPhone(localDigits))
+          : null;
+        if (cancelled) return;
+        setExactMatch(exact || null);
+        resolveRef.current?.(exact || null);
+      } catch {
+        if (!cancelled) { setMatches([]); setExactMatch(null); }
+      }
+    }, 250);
+    return () => { cancelled = true; window.clearTimeout(timer); };
+  }, [localDigits]);
+
   // Once a full-looking number is typed and nothing matches, offer to add it as
   // a new customer and attach it to the operation in progress.
   const canAddNew = Boolean(onSaveCustomer) && localDigits.length >= 7 && matches.length === 0;
@@ -7372,21 +7385,63 @@ function CustomerPhoneInput({ value, onChange, customers, onSelectCustomer, onSa
   );
 }
 
-function CustomersPage({ customers, sessionRole, onSave, onRemove, onSync }) {
+function CustomersPage({ sessionRole, onSave, onRemove, onSync }) {
   const emptyCustomer = { id: "", name: "", phone: "", mobile: "", address: "", email: "", contactDetails: "", notes: "" };
   const [form, setForm] = useState(emptyCustomer);
   const [search, setSearch] = useState("");
+  const [rows, setRows] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [hasMore, setHasMore] = useState(false);
   const isAdmin = sessionRole === "admin";
+  const PAGE = 25;
 
   function update(field, value) {
     setForm((current) => ({ ...current, [field]: value }));
   }
 
-  function submit(event) {
+  // One page from Firestore (search by phone digits or name prefix); never loads
+  // the whole CRM. Debounced on the search box; "Load more" pages with startAfter.
+  async function runSearch(term) {
+    setLoading(true);
+    try {
+      const page = await listCustomersPage({ pageSize: PAGE, search: term });
+      setRows(page);
+      setHasMore(page.length === PAGE);
+    } catch {
+      setRows([]);
+      setHasMore(false);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => runSearch(search), 300);
+    return () => window.clearTimeout(timer);
+  }, [search]);
+
+  async function loadMore() {
+    if (!rows.length) return;
+    setLoading(true);
+    try {
+      const page = await listCustomersPage({ pageSize: PAGE, search, afterId: rows[rows.length - 1].id });
+      setRows((current) => [...current, ...page]);
+      setHasMore(page.length === PAGE);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  function reload() {
+    runSearch(search);
+  }
+
+  async function submit(event) {
     event.preventDefault();
     if (!form.phone.trim() && !form.name.trim()) return;
-    onSave(form);
+    await onSave(form);
     setForm(emptyCustomer);
+    reload();
   }
 
   function editCustomer(customer) {
@@ -7394,20 +7449,10 @@ function CustomersPage({ customers, sessionRole, onSave, onRemove, onSync }) {
     window.scrollTo({ top: 0, behavior: "smooth" });
   }
 
-  const filtered = useMemo(() => {
-    const query = search.trim().toLowerCase();
-    const queryDigits = digitsOnly(query);
-    return [...customers]
-      .filter((customer) => {
-        if (!query) return true;
-        const text = [customer.name, customer.phone, customer.address, customer.email, customer.contactDetails]
-          .filter(Boolean)
-          .join(" ")
-          .toLowerCase();
-        return text.includes(query) || (queryDigits && (customer.phoneDigits || "").includes(queryDigits));
-      })
-      .sort((a, b) => String(a.name || a.phone || "").localeCompare(String(b.name || b.phone || "")));
-  }, [customers, search]);
+  async function handleRemove(id) {
+    await onRemove(id);
+    reload();
+  }
 
   return (
     <>
@@ -7437,10 +7482,10 @@ function CustomersPage({ customers, sessionRole, onSave, onRemove, onSync }) {
         <div className="history-header">
           <div>
             <p className="eyebrow">Customers</p>
-            <h2>{customers.length} total</h2>
+            <h2>Search the CRM</h2>
           </div>
           <div className="history-actions">
-            <input className="pos-search" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search name, phone, address" />
+            <input className="pos-search" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search by phone or name" />
             {isAdmin ? <button className="secondary-button" type="button" onClick={onSync}>Sync from reports</button> : null}
           </div>
         </div>
@@ -7450,8 +7495,8 @@ function CustomersPage({ customers, sessionRole, onSave, onRemove, onSync }) {
               <tr><th>Name</th><th>Phone</th><th>Address</th><th>Email</th><th>Notes</th><th></th></tr>
             </thead>
             <tbody>
-              {filtered.length ? (
-                filtered.map((customer) => (
+              {rows.length ? (
+                rows.map((customer) => (
                   <tr key={customer.id}>
                     <td><strong>{customer.name || "-"}</strong></td>
                     <td>{customer.phone || "-"}</td>
@@ -7460,16 +7505,24 @@ function CustomersPage({ customers, sessionRole, onSave, onRemove, onSync }) {
                     <td className="muted">{customer.notes || ""}</td>
                     <td className="pos-row-actions">
                       <button className="secondary-button compact-button" type="button" onClick={() => editCustomer(customer)}>Edit</button>
-                      {isAdmin ? <button className="secondary-button compact-button" type="button" onClick={() => onRemove(customer.id)}>Delete</button> : null}
+                      {isAdmin ? <button className="secondary-button compact-button" type="button" onClick={() => handleRemove(customer.id)}>Delete</button> : null}
                     </td>
                   </tr>
                 ))
               ) : (
-                <tr><td colSpan="6" className="empty-state">No customers yet.</td></tr>
+                <tr><td colSpan="6" className="empty-state">{loading ? "Loading…" : search ? "No matches." : "Type a phone number or name to search."}</td></tr>
               )}
             </tbody>
           </table>
         </div>
+        {hasMore ? (
+          <div className="see-more-row">
+            <span className="muted">Showing {rows.length}</span>
+            <button className="secondary-button" type="button" onClick={loadMore} disabled={loading}>
+              {loading ? "Loading…" : `Load more (${PAGE})`}
+            </button>
+          </div>
+        ) : null}
       </section>
     </>
   );

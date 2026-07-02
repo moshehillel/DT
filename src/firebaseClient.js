@@ -8,7 +8,9 @@ import {
 } from "firebase/auth";
 import {
   collection,
+  deleteDoc,
   doc,
+  getDocs,
   initializeFirestore,
   limit,
   onSnapshot,
@@ -17,6 +19,8 @@ import {
   persistentMultipleTabManager,
   query,
   setDoc,
+  startAfter,
+  where,
   writeBatch,
 } from "firebase/firestore";
 import { getFunctions, httpsCallable } from "firebase/functions";
@@ -336,4 +340,81 @@ export async function replaceAppStateDocument(documentId, items) {
   await ensureFirebaseAuth();
   const { db } = await getFirebase();
   await setDoc(doc(db, "appState", documentId), { items });
+}
+
+// ---- Customers: query on demand instead of loading the whole collection ----
+
+function toDoc(snap) {
+  return normalizeFirestoreDoc(snap.id, snap.data());
+}
+
+// Exact lookup by the local 10-digit number — tries phoneDigits then mobileDigits.
+export async function findCustomerByPhone(digits) {
+  const clean = String(digits || "").trim();
+  if (!clean) return null;
+  await ensureFirebaseAuth();
+  const { db } = await getFirebase();
+  const customers = collection(db, "customers");
+  for (const field of ["phoneDigits", "mobileDigits"]) {
+    const snap = await getDocs(query(customers, where(field, "==", clean), limit(1)));
+    if (!snap.empty) return toDoc(snap.docs[0]);
+  }
+  return null;
+}
+
+// Type-ahead: customers whose phoneDigits start with `prefix` (prefix match).
+export async function searchCustomersByPhonePrefix(prefix, max = 8) {
+  const clean = String(prefix || "").trim();
+  if (!clean) return [];
+  await ensureFirebaseAuth();
+  const { db } = await getFirebase();
+  const customers = collection(db, "customers");
+  const snap = await getDocs(
+    query(customers, where("phoneDigits", ">=", clean), where("phoneDigits", "<", `${clean}`), limit(max)),
+  );
+  return snap.docs.map(toDoc);
+}
+
+// CRM page: one page at a time. `search` (digits) does a phone-prefix query;
+// otherwise lists by name. `afterDoc` is the last doc from the previous page.
+export async function listCustomersPage({ pageSize = 25, afterId = "", search = "" } = {}) {
+  await ensureFirebaseAuth();
+  const { db } = await getFirebase();
+  const customers = collection(db, "customers");
+  const clean = String(search || "").trim();
+  const digits = clean.replace(/\D/g, "");
+
+  let q;
+  if (digits) {
+    q = query(customers, where("phoneDigits", ">=", digits), where("phoneDigits", "<", `${digits}`), limit(pageSize));
+  } else if (clean) {
+    // Name prefix (case-sensitive on the stored, title-cased name).
+    const cap = clean.charAt(0).toUpperCase() + clean.slice(1);
+    q = query(customers, orderBy("name"), where("name", ">=", cap), where("name", "<", `${cap}`), limit(pageSize));
+  } else {
+    q = query(customers, orderBy("name"), limit(pageSize));
+  }
+
+  if (afterId) {
+    const cursor = await getDocs(query(customers, where("__name__", "==", afterId), limit(1)));
+    if (!cursor.empty) q = query(q, startAfter(cursor.docs[0]));
+  }
+
+  const snap = await getDocs(q);
+  return snap.docs.map(toDoc);
+}
+
+export async function saveCustomerDoc(customer) {
+  await ensureFirebaseAuth();
+  const { db } = await getFirebase();
+  const id = customer.id || doc(collection(db, "customers")).id;
+  await setDoc(doc(db, "customers", id), { ...customer, id });
+  return id;
+}
+
+export async function deleteCustomerDoc(id) {
+  if (!id) return;
+  await ensureFirebaseAuth();
+  const { db } = await getFirebase();
+  await deleteDoc(doc(db, "customers", id));
 }

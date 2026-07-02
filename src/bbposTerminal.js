@@ -10,7 +10,19 @@
 // single request to the agent stays open until the customer taps / dips / swipes
 // (or it times out).
 
-const BBPOS_URL = "https://localemv.com:8887/";
+const DEFAULT_BBPOS_URL = "https://localemv.com:8887/";
+
+// Overridable without a rebuild: localStorage "bbposUrl" or VITE_BBPOS_URL at build time.
+function bbposUrl() {
+  try {
+    const override = localStorage.getItem("bbposUrl");
+    if (override && override.trim()) return override.trim();
+  } catch {
+    /* localStorage may be unavailable */
+  }
+  return (import.meta.env && import.meta.env.VITE_BBPOS_URL) || DEFAULT_BBPOS_URL;
+}
+
 const SOFTWARE_NAME = "Diamant Telecom Reports";
 const SOFTWARE_VERSION = "0.1.0";
 // Cardknox PaymentEngine request schema version.
@@ -51,6 +63,16 @@ function interpret(data) {
   };
 }
 
+function bbposConnectionError(error) {
+  if (error?.name === "AbortError") {
+    return "Timed out waiting for the terminal. Check the card was presented and try again.";
+  }
+  return (
+    "Can't reach Sola BBPOS (PaymentEngineExt) on this computer. " +
+    "Confirm it's running and run npm run setup:bbpos as Administrator (maps localemv.com to 127.0.0.1)."
+  );
+}
+
 // Start a sale on the local Verifone P200 and resolve once it is approved
 // (throws on decline / error / timeout). `onStatus` receives progress text.
 export async function chargeOnLocalTerminal({
@@ -73,6 +95,7 @@ export async function chargeOnLocalTerminal({
     xAmount: cleanAmount,
     xExternalRequestId: String(externalRequestId || `pos-${Date.now()}`).slice(0, 32),
   });
+  if (manualEntry) body.append("xManualEntry", "true");
 
   onStatus?.(manualEntry
     ? "Follow the terminal: key in the card number by hand."
@@ -82,18 +105,14 @@ export async function chargeOnLocalTerminal({
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   let response;
   try {
-    response = await fetch(BBPOS_URL, {
+    response = await fetch(bbposUrl(), {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body: body.toString(),
       signal: controller.signal,
     });
   } catch (error) {
-    if (error.name === "AbortError") {
-      throw new Error("Timed out waiting for the terminal. Check the card was presented and try again.");
-    }
-    // A failed fetch to localhost almost always means the agent isn't running.
-    throw new Error("Can't reach the card terminal app (Sola BBPOS). Make sure it's installed and running on this computer.");
+    throw new Error(bbposConnectionError(error));
   } finally {
     clearTimeout(timer);
   }

@@ -10,6 +10,11 @@ export const STORE_LOCATIONS_KEY = "diamant-telecom-store-locations-v1";
 export const EMPLOYEE_LOCATIONS_KEY = "diamant-telecom-employee-locations-v1";
 export const STORE_DEVICES_KEY = "diamant-telecom-store-devices-v1";
 export const STORE_TAX_KEY = "diamant-telecom-store-tax-v1";
+// Consolidated single-source-of-truth documents. `stores` merges the old
+// storeLocations + storeTax + storeDevices; `staff` merges employees +
+// employeeLocations. New cache keys so a device picks up the clean model.
+export const STORES_KEY = "diamant-telecom-stores-v2";
+export const STAFF_KEY = "diamant-telecom-staff-v2";
 export const CUSTOMERS_KEY = "diamant-telecom-customers-v1";
 export const FUNCTIONS_BASE_URL = import.meta.env.VITE_FUNCTIONS_BASE_URL || "";
 

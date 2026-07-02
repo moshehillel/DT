@@ -28,6 +28,23 @@ Set these on Firebase Functions (`firebase functions:secrets:set` or `.env`):
 
 In-person card payments use **Sola BBPOS** against a **Verifone P200** terminal. BBPOS ("PaymentEngineExt") is a small tray app installed on each register that runs a local HTTPS server at `https://localemv.com:8887`; the browser POS posts the sale to it and it drives the P200 over USB/LAN. The Cardknox API key is configured inside the tray app, so it never reaches the browser, and there is no per-store device ID to set. SMS is sent through the **Telebroad REST API**; voice-call notifications remain on Twilio.
 
+### BBPOS setup on each register PC (Windows)
+
+Browsers prefer IPv6, but `localemv.com` also resolves to a public IPv6 address that is **not** the local BBPOS agent. Each register must map the hostname to IPv4 loopback:
+
+1. Install and start **PaymentEngineExt** (Sola BBPOS tray app) and enter the Cardknox API key in its settings.
+2. Open **PowerShell as Administrator**, `cd` to this repo, and run:
+
+   ```powershell
+   npm run setup:bbpos
+   ```
+
+   This adds `127.0.0.1 localemv.com` to `C:\Windows\System32\drivers\etc\hosts`, removes stale IPv6 lines for that hostname, and flushes DNS.
+3. Fully quit and reopen Chrome (or Edge).
+4. Connect the Verifone P200 (USB/LAN) and run a small test sale.
+
+Optional: override the agent URL without rebuilding via `localStorage.setItem("bbposUrl","https://localemv.com:8887/")` or `VITE_BBPOS_URL` at build time. Port **8887** is the HTTPS endpoint; do not use 8889 unless Sola support confirms it for your install.
+
 ## Included features
 
 - Employee selector and employee manager

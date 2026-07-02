@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "setup:bbpos": "powershell -ExecutionPolicy Bypass -File scripts/setup-bbpos-windows.ps1"
   },
   "dependencies": {
     "@vitejs/plugin-react": "^5.1.2",
