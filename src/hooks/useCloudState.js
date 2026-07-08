@@ -25,6 +25,7 @@ export function useStoredState(key, fallback) {
 }
 
 export function useCloudCollectionState(collectionName, localKey, fallback, options = {}) {
+  const enabled = options.enabled !== false;
   const [value, setValue] = useState(() => ensureArrayIds(readJson(localKey, fallback)));
   const valueRef = useRef(value);
   const cloudReadyRef = useRef(false);
@@ -37,6 +38,7 @@ export function useCloudCollectionState(collectionName, localKey, fallback, opti
   }, [localKey, value]);
 
   useEffect(() => {
+    if (!enabled) return undefined;
     return watchCollection(
       collectionName,
       (items) => {
@@ -61,7 +63,7 @@ export function useCloudCollectionState(collectionName, localKey, fallback, opti
       },
       options,
     );
-  }, [collectionName]);
+  }, [collectionName, enabled]);
 
   function updateValue(nextValueOrUpdater, options = {}) {
     setValue((current) => {

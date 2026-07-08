@@ -13,6 +13,9 @@ import {
   manualReportTypeKeys,
   ORDER_HANDLERS_KEY,
   paymentMethods,
+  PAYMENT_REMINDER_CONTACT_EMAIL,
+  PAYMENT_REMINDER_ENABLED,
+  PAYMENT_REMINDER_TEXT,
   PENDING_REPORTS_KEY,
   PHONE_ORDERS_KEY,
   productCategories,
@@ -58,6 +61,7 @@ import {
   formatDateTime,
   formatMoney,
   formatPayment,
+  formatReceiptPhone,
   formatShortDate,
   generateRepairTicketNumber,
   getMinimumRentalDays,
@@ -106,6 +110,20 @@ function App() {
   return <LoginPage authError={auth.status === "error" ? auth.error : null} />;
 }
 
+function PaymentReminderBanner() {
+  if (!PAYMENT_REMINDER_ENABLED) return null;
+  return (
+    <div className="payment-reminder-banner" role="status">
+      <strong>{PAYMENT_REMINDER_TEXT}</strong>
+      <span>
+        {" "}
+        Contact{" "}
+        <a href={`mailto:${PAYMENT_REMINDER_CONTACT_EMAIL}`}>{PAYMENT_REMINDER_CONTACT_EMAIL}</a>
+      </span>
+    </div>
+  );
+}
+
 function Workspace({ currentUser, isAdmin }) {
   const employeeName = currentUser?.displayName || currentUser?.email || "";
   const sessionRole = isAdmin ? "admin" : "employee";
@@ -124,7 +142,12 @@ function Workspace({ currentUser, isAdmin }) {
     [],
     { limitTo: 50, orderByField: "createdAt" },
   );
-  const [resetRequests, setResetRequests] = useCloudCollectionState("passwordResetRequests", RESET_REQUESTS_KEY, []);
+  const [resetRequests, setResetRequests] = useCloudCollectionState(
+    "passwordResetRequests",
+    RESET_REQUESTS_KEY,
+    [],
+    { enabled: isAdmin },
+  );
   const [products, setProducts] = useCloudCollectionState("products", PRODUCTS_KEY, []);
   const [stores, setStores] = useCloudDocumentState("stores", STORES_KEY, []);
   // Customers are queried on demand (see findCustomerByPhone / CustomersPage) —
@@ -640,6 +663,13 @@ function Workspace({ currentUser, isAdmin }) {
       name: completedReport.details?.callerName || completedReport.details?.customerName,
     });
     setReports((current) => [enriched, ...current]);
+    setPendingReports((current) => current.filter((report) => report.id !== pendingReportId));
+  }
+
+  // Missed calls and voicemails don't get completed into a report — once an
+  // employee has called the customer back they just dismiss the card, which
+  // deletes the pending doc from Firestore (syncCollectionItems removes it).
+  function dismissPendingReport(pendingReportId) {
     setPendingReports((current) => current.filter((report) => report.id !== pendingReportId));
   }
 
@@ -1216,7 +1246,8 @@ function Workspace({ currentUser, isAdmin }) {
         onLogout={logout}
       />
 
-      <main className="main">
+      <main className={`main${activeView === "pos" ? " main-pos" : ""}`}>
+        <PaymentReminderBanner />
         {cloudOnline === false ? (
           <div className="cloud-offline-banner" role="alert">
             ⚠️ Can't reach the cloud — changes you make now are <strong>not being saved</strong> and won't sync to other devices. Check the internet/filter and reload before editing.
@@ -1245,6 +1276,7 @@ function Workspace({ currentUser, isAdmin }) {
             onSaveCustomer={saveCustomer}
             onClaim={claimPendingReport}
             onSave={savePendingReport}
+            onDismiss={dismissPendingReport}
           />
         ) : activeView === "openRepairs" ? (
           <OpenRepairsPage
@@ -1371,7 +1403,7 @@ function Workspace({ currentUser, isAdmin }) {
           />
         )}
 
-        <PoweredByFooter />
+        {activeView !== "pos" ? <PoweredByFooter /> : null}
       </main>
 
       {returnTarget && (
@@ -3284,7 +3316,7 @@ function FinalPriceDialog({ prompt, onChange, onConfirm, onClose }) {
   );
 }
 
-function PendingReportsPage({ pendingReports, activeEmployee, onSaveCustomerName, onSaveCustomer, onClaim, onSave }) {
+function PendingReportsPage({ pendingReports, activeEmployee, onSaveCustomerName, onSaveCustomer, onClaim, onSave, onDismiss }) {
   return (
     <section className="history">
       <div className="history-header">
@@ -3306,6 +3338,7 @@ function PendingReportsPage({ pendingReports, activeEmployee, onSaveCustomerName
               onSaveCustomer={onSaveCustomer}
               onClaim={onClaim}
               onSave={onSave}
+              onDismiss={onDismiss}
             />
           ))
         ) : (
@@ -3316,10 +3349,17 @@ function PendingReportsPage({ pendingReports, activeEmployee, onSaveCustomerName
   );
 }
 
-function PendingReportCard({ pendingReport, activeEmployee, onSaveCustomerName, onSaveCustomer, onClaim, onSave }) {
+function PendingReportCard({ pendingReport, activeEmployee, onSaveCustomerName, onSaveCustomer, onClaim, onSave, onDismiss }) {
   const imported = pendingReport.imported || {};
   const isCallReport = pendingReport.type === "call" || pendingReport.source === "telebroad";
   const isShopifySale = pendingReport.source === "shopify_pos";
+  // Legacy call imports have no callResult — treat them as answered.
+  const callResult = isCallReport ? (pendingReport.callResult || "answered") : "";
+  const isVoicemailCall = callResult === "voicemail";
+  const isMissedCall = callResult === "missed";
+  // Missed calls and voicemails are just a "call them back, then dismiss" card —
+  // no claim, no completion form. Answered calls keep the full report flow.
+  const isReturnableCall = isVoicemailCall || isMissedCall;
   const importedAgentName = (
     imported.employeeName
     || pendingReport.details?.handledBy
@@ -3329,6 +3369,9 @@ function PendingReportCard({ pendingReport, activeEmployee, onSaveCustomerName, 
   const claimedBySomeoneElse = !readyToComplete && pendingReport.claimedBy && pendingReport.claimedBy !== activeEmployee;
   const isClaimedByMe = readyToComplete || pendingReport.claimedBy === activeEmployee;
   const imeiInputRef = useRef(null);
+  // Missed/voicemail cards stay collapsed so a long backlog doesn't need much
+  // scrolling; the employee expands one to see the details.
+  const [expanded, setExpanded] = useState(false);
   // If the caller's number is already in the CRM, pull their saved name and
   // address so the employee only has to add the call reason.
   const [crmMatch, setCrmMatch] = useState(null);
@@ -3452,14 +3495,54 @@ function PendingReportCard({ pendingReport, activeEmployee, onSaveCustomerName, 
     Promise.resolve(onSave(pendingReport.id, payload));
   }
 
+  const callTypeLabel = isMissedCall ? "Missed call" : isVoicemailCall ? "Voicemail" : "Call";
   const sourceLabel = isCallReport
-    ? "Telebroad call"
+    ? `Telebroad · ${callTypeLabel}`
     : isShopifySale
       ? "Shopify POS"
       : "Pending";
   const cardTitle = pendingReport.title
     || imported.shopifyOrderName
     || (isCallReport ? "Pending call report" : "Pending sale");
+
+  // Missed calls and voicemails: a compact row (badge + who + when + Returned)
+  // that expands for details, so a long backlog stays short. "Returned" just
+  // dismisses the card — no claim, no completion form.
+  if (isReturnableCall) {
+    const recordingHref = imported.recordingUrl || callRecordingUrl(imported.callId, imported.uniqueId);
+    const who = crmMatch?.name || fields.callerName || fields.customerPhone || "Unknown caller";
+    return (
+      <article className={`pending-card returnable compact ${isMissedCall ? "missed" : "voicemail"} ${expanded ? "open" : ""}`}>
+        <div className="returnable-row">
+          <button type="button" className="returnable-summary" onClick={() => setExpanded((value) => !value)} aria-expanded={expanded}>
+            <span className="expand-caret">{expanded ? "▾" : "▸"}</span>
+            <span className={`badge call ${isMissedCall ? "missed" : "voicemail"}`}>{callTypeLabel}</span>
+            <span className="returnable-who">{who}</span>
+            <span className="returnable-phone">{fields.customerPhone || "-"}</span>
+            <span className="returnable-when">{pendingReport.createdAt ? formatShortDate(pendingReport.createdAt) : ""}</span>
+          </button>
+          <button className="primary-button compact-button" type="button" onClick={() => onDismiss(pendingReport.id)}>
+            Returned
+          </button>
+        </div>
+
+        {expanded ? (
+          <div className="pending-import returnable-detail">
+            <span><strong>Direction:</strong> {imported.direction || pendingReport.details?.direction || "-"}</span>
+            <span><strong>Customer:</strong> {fields.customerPhone || "-"}</span>
+            {crmMatch ? <span><strong>Name:</strong> {crmMatch.name || "-"}</span> : <span className="muted">Not in CRM</span>}
+            {crmMatch?.address ? <span><strong>Address:</strong> {crmMatch.address}</span> : null}
+            <span><strong>Received:</strong> {pendingReport.createdAt ? formatShortDate(pendingReport.createdAt) : "-"}</span>
+            {recordingHref ? (
+              <a className="secondary-button compact-button" href={recordingHref} target="_blank" rel="noopener noreferrer">
+                {isVoicemailCall ? "▶ Voicemail" : "▶ Recording"}
+              </a>
+            ) : null}
+          </div>
+        ) : null}
+      </article>
+    );
+  }
 
   return (
     <article className={`pending-card ${isClaimedByMe ? "claimed" : ""}`}>
@@ -3468,7 +3551,7 @@ function PendingReportCard({ pendingReport, activeEmployee, onSaveCustomerName, 
           <p className="eyebrow">{sourceLabel}</p>
           <h3>{cardTitle}</h3>
         </div>
-        <span className={`badge ${isCallReport ? "call" : "sale"}`}>{pendingReport.type || "sale"}</span>
+        <span className={`badge ${isCallReport ? "call" : "sale"}`}>{isCallReport ? callTypeLabel : (pendingReport.type || "sale")}</span>
       </div>
 
       <div className="pending-import">
@@ -4726,7 +4809,15 @@ function PosPage({ products, activeEmployee, activeLocation, activeDeviceId, act
     }
     return "";
   })();
-  const canCheckout = cart.length > 0 && !imeiIssue && cardChargeComplete && Boolean(paymentMethod);
+  const customerDigits = localPhoneDigits(customerPhone);
+  const saleCustomer = findSaleCustomer();
+  const customerIssue = customerDigits.length < 6 ? "Add the customer's phone number." : "";
+  const canCheckout =
+    cart.length > 0
+    && !imeiIssue
+    && !customerIssue
+    && cardChargeComplete
+    && Boolean(paymentMethod);
 
   useEffect(() => {
     setCard((current) =>
@@ -4768,16 +4859,14 @@ function PosPage({ products, activeEmployee, activeLocation, activeDeviceId, act
   function handleCheckout() {
     if (!canCheckout) {
       if (imeiIssue) setMessage(imeiIssue);
+      else if (customerIssue) setMessage(customerIssue);
       else if (!paymentMethod) setMessage("Choose a payment method before completing the sale.");
       else if (!cardChargeComplete) setMessage("Charge the card before completing the sale.");
       return;
     }
-    const localDigits = localPhoneDigits(customerPhone);
-    const saleCustomer = findSaleCustomer();
-    // If a real phone was entered but the customer is new or missing a name /
-    // address, prompt for those before finishing so the receipt + CRM are filled.
-    if (localDigits.length >= 6 && (!saleCustomer || !saleCustomer.name || !saleCustomer.address)) {
-      setCustomerPrompt({ phone: customerPhone.trim(), customer: saleCustomer });
+    // Every sale needs a customer on file with a name for the receipt + CRM.
+    if (!saleCustomer?.name?.trim()) {
+      setCustomerPrompt({ phone: customerPhone.trim(), customer: saleCustomer, required: true });
       return;
     }
     completeSale(saleCustomer);
@@ -4860,22 +4949,17 @@ function PosPage({ products, activeEmployee, activeLocation, activeDeviceId, act
       mobile: values.mobile.trim(),
       address: values.address.trim(),
     };
-    onSaveCustomer?.({
+    const saved = {
       id: customerPrompt.customer?.id || "",
       phone: customerPrompt.phone,
       mobile: info.mobile,
       name: info.name,
       address: info.address,
-    });
+    };
+    onSaveCustomer?.(saved);
+    setResolvedCustomer(saved);
     setCustomerPrompt(null);
-    completeSale(info);
-  }
-
-  // Cashier chose not to add details — finish with whatever the CRM already has.
-  function handleCustomerPromptSkip() {
-    const customer = customerPrompt?.customer || null;
-    setCustomerPrompt(null);
-    completeSale(customer);
+    completeSale(saved);
   }
 
   function startNewSale() {
@@ -4886,22 +4970,17 @@ function PosPage({ products, activeEmployee, activeLocation, activeDeviceId, act
   }
 
   return (
-    <>
-      <section className="workspace pos-hero">
-        <div className="workspace-header">
-          <div>
-            <p className="eyebrow">Point of sale</p>
-            <h2>Scan items and check out</h2>
-          </div>
+    <div className="pos-page">
+      <section className="workspace pos-hero pos-hero-compact">
+        <div className="pos-hero-top">
           <div className="summary-strip">
             <span className="metric">Store <strong>{activeLocation || "Unassigned"}</strong></span>
             <span className="metric">Cashier <strong>{activeEmployee}</strong></span>
           </div>
-        </div>
-
-        <div className="segmented-control scan-mode" role="tablist" aria-label="Entry mode">
-          <button type="button" className={scanMode ? "selected" : ""} onClick={() => { setScanMode(true); scanRef.current?.focus(); }}>Scan</button>
-          <button type="button" className={!scanMode ? "selected" : ""} onClick={() => { setScanMode(false); scanRef.current?.focus(); }}>Manual</button>
+          <div className="segmented-control scan-mode" role="tablist" aria-label="Entry mode">
+            <button type="button" className={scanMode ? "selected" : ""} onClick={() => { setScanMode(true); scanRef.current?.focus(); }}>Scan</button>
+            <button type="button" className={!scanMode ? "selected" : ""} onClick={() => { setScanMode(false); scanRef.current?.focus(); }}>Manual</button>
+          </div>
         </div>
         <form className="pos-scan" onSubmit={handleScan}>
           <input
@@ -4923,7 +5002,9 @@ function PosPage({ products, activeEmployee, activeLocation, activeDeviceId, act
         ) : null}
       </section>
 
+      <div className="pos-body">
       <div className="pos-layout">
+        <div className="pos-left">
         <section className="history pos-cart">
           <div className="history-header">
             <div>
@@ -5032,6 +5113,54 @@ function PosPage({ products, activeEmployee, activeLocation, activeDeviceId, act
           )}
         </section>
 
+        <section className="history pos-quick-panel">
+          <div className="history-header">
+            <div>
+              <p className="eyebrow">Quick add</p>
+              <h2>Find a product</h2>
+            </div>
+            <input
+              className="pos-search"
+              value={productSearch}
+              onChange={(event) => setProductSearch(event.target.value)}
+              placeholder="Search name, SKU, or barcode"
+              autoComplete="off"
+              spellCheck={false}
+            />
+          </div>
+          <div className="pos-quick-actions">
+            <button className="secondary-button" type="button" onClick={() => setCustomAmountOpen(true)}>
+              Custom item
+            </button>
+          </div>
+          <div className="pos-product-grid">
+            {quickAddProducts.length ? (
+              quickAddProducts.map((product) => (
+                <button
+                  className="pos-product"
+                  type="button"
+                  key={product.id}
+                  onClick={() => {
+                    if (addProductToCart(product)) setMessage(`Added ${product.name}.`);
+                    scanRef.current?.focus();
+                  }}
+                >
+                  <strong>{product.name}</strong>
+                  <span>{formatMoney(Number(product.price) || 0)}</span>
+                  <small className="muted">
+                    {product.requiresImei
+                      ? `In stock ${product.imeis?.length || 0} - IMEI`
+                      : `Stock ${Number(product.quantity) || 0}`}
+                  </small>
+                </button>
+              ))
+            ) : (
+              <p className="empty-state">{productSearch.trim().length >= 2 ? "No matching products." : "Type to search."}</p>
+            )}
+          </div>
+        </section>
+        </div>
+
         <section className="workspace pos-checkout">
           <div className="workspace-header">
             <div>
@@ -5039,9 +5168,10 @@ function PosPage({ products, activeEmployee, activeLocation, activeDeviceId, act
               <h2>{formatMoney(total)}</h2>
             </div>
           </div>
+          <div className="pos-checkout-scroll">
           <div className="form-grid">
             <label className="field">
-              <span>Customer phone (optional)</span>
+              <span>Customer phone</span>
               <CustomerPhoneInput
                 value={customerPhone}
                 onChange={setCustomerPhone}
@@ -5049,9 +5179,17 @@ function PosPage({ products, activeEmployee, activeLocation, activeDeviceId, act
                 onSaveCustomer={onSaveCustomer}
                 onResolveCustomer={setResolvedCustomer}
                 onSelectCustomer={(customer) => { setCustomerPhone(customer.phone); setResolvedCustomer(customer); }}
-                placeholder="For receipt / follow-up"
+                placeholder="Required — search or add customer"
+                required
               />
             </label>
+            {saleCustomer?.name ? (
+              <p className="pos-customer-name">{saleCustomer.name}</p>
+            ) : customerIssue ? (
+              <p className="pos-warning pos-customer-hint">{customerIssue}</p>
+            ) : customerDigits.length >= 6 ? (
+              <p className="pos-warning pos-customer-hint">Customer name required — complete at checkout.</p>
+            ) : null}
             <label className="field">
               <span>Payment method</span>
               <select value={paymentMethod} onChange={(event) => setPaymentMethod(event.target.value)}>
@@ -5063,24 +5201,24 @@ function PosPage({ products, activeEmployee, activeLocation, activeDeviceId, act
             </label>
             <label className="field full">
               <span>Notes (optional)</span>
-              <textarea value={notes} onChange={(event) => setNotes(event.target.value)} rows={2} />
+              <textarea value={notes} onChange={(event) => setNotes(event.target.value)} rows={1} />
             </label>
           </div>
 
           <div className="pos-totals">
-            <div className="pos-totals-row"><span>Subtotal</span><span>{formatMoney(subtotal)}</span></div>
+            <div className="pos-totals-row pos-totals-sub"><span>Subtotal</span><span>{formatMoney(subtotal)}</span></div>
             <label className="checkbox-field pos-out-of-state">
               <input type="checkbox" checked={outOfState} onChange={(event) => setOutOfState(event.target.checked)} />
               <span>Out of state (no sales tax)</span>
             </label>
-            <div className="pos-totals-row">
+            <div className="pos-totals-row pos-totals-tax">
               <span>Tax{taxApplies ? ` (${taxRate}%)` : ""}</span>
               <span>{formatMoney(taxAmount)}</span>
             </div>
             {!outOfState && taxRate === 0 ? (
               <p className="muted">No tax rate set for this store. Add the store address in Inventory.</p>
             ) : null}
-            <div className="pos-totals-row pos-totals-grand"><span>Total</span><strong>{formatMoney(total)}</strong></div>
+            <div className="pos-totals-row pos-totals-grand"><span>Grand total</span><strong>{formatMoney(total)}</strong></div>
           </div>
 
           {requiresCardCharge ? (
@@ -5116,76 +5254,19 @@ function PosPage({ products, activeEmployee, activeLocation, activeDeviceId, act
               ) : null}
             </div>
           ) : null}
-          {imeiIssue ? (
-            <p className="muted pos-warning">{imeiIssue}</p>
-          ) : null}
-          {requiresCardCharge && !cardChargeComplete && !imeiIssue ? (
-            <p className="muted pos-warning">Charge the card before completing the sale.</p>
-          ) : null}
-          <p className="muted pos-checkout-hint">Use the Complete sale bar at the bottom of the screen.</p>
+          </div>
+          <div className="pos-checkout-actions">
+            {imeiIssue ? <p className="pos-warning">{imeiIssue}</p> : null}
+            {!imeiIssue && customerIssue ? <p className="pos-warning">{customerIssue}</p> : null}
+            {!imeiIssue && !customerIssue && requiresCardCharge && !cardChargeComplete ? (
+              <p className="pos-warning">Charge the card before completing the sale.</p>
+            ) : null}
+            <button className="primary-button pos-complete-button" type="button" disabled={!canCheckout} onClick={handleCheckout}>
+              {cart.length ? `Complete sale · ${formatMoney(total)}` : "Scan items to start"}
+            </button>
+          </div>
         </section>
       </div>
-
-      <section className="history">
-        <div className="history-header">
-          <div>
-            <p className="eyebrow">Quick add</p>
-            <h2>Find a product</h2>
-          </div>
-          <input
-            className="pos-search"
-            value={productSearch}
-            onChange={(event) => setProductSearch(event.target.value)}
-            placeholder="Search item name, SKU, or barcode"
-            autoComplete="off"
-            spellCheck={false}
-          />
-        </div>
-        <div className="pos-quick-actions">
-          <button className="secondary-button" type="button" onClick={() => setCustomAmountOpen(true)}>
-            Custom item
-          </button>
-        </div>
-        <div className="pos-product-grid">
-          {quickAddProducts.length ? (
-            quickAddProducts.map((product) => (
-              <button
-                className="pos-product"
-                type="button"
-                key={product.id}
-                onClick={() => {
-                  if (addProductToCart(product)) setMessage(`Added ${product.name}.`);
-                  scanRef.current?.focus();
-                }}
-              >
-                <strong>{product.name}</strong>
-                <span>{formatMoney(Number(product.price) || 0)}</span>
-                <small className="muted">
-                  {product.requiresImei
-                    ? `In stock ${product.imeis?.length || 0} - IMEI`
-                    : `Stock ${Number(product.quantity) || 0}`}
-                </small>
-              </button>
-            ))
-          ) : (
-            <p className="empty-state">{productSearch.trim().length >= 2 ? "No matching products for this store." : "Start typing to find a product."}</p>
-          )}
-        </div>
-      </section>
-
-      <div className="pos-action-spacer" />
-      <div className="pos-action-bar">
-        <div className="pos-action-bar-info">
-          <span>{itemCount} item{itemCount === 1 ? "" : "s"} · {activeLocation || "Store"}</span>
-          <strong>{formatMoney(total)}</strong>
-        </div>
-        <div className="pos-action-bar-cta">
-          {imeiIssue ? <span className="pos-action-warn">{imeiIssue}</span> : null}
-          {!imeiIssue && requiresCardCharge && !cardChargeComplete ? <span className="pos-action-warn">Charge the card first</span> : null}
-          <button className="primary-button pos-complete-button" type="button" disabled={!canCheckout} onClick={handleCheckout}>
-            {cart.length ? `Complete sale · ${formatMoney(total)}` : "Scan items to start"}
-          </button>
-        </div>
       </div>
 
       {customAmountOpen ? (
@@ -5204,8 +5285,8 @@ function PosPage({ products, activeEmployee, activeLocation, activeDeviceId, act
         <CustomerInfoDialog
           phone={customerPrompt.phone}
           customer={customerPrompt.customer}
+          required={customerPrompt.required}
           onSave={handleCustomerPromptSave}
-          onSkip={handleCustomerPromptSkip}
           onClose={() => setCustomerPrompt(null)}
         />
       ) : null}
@@ -5213,7 +5294,7 @@ function PosPage({ products, activeEmployee, activeLocation, activeDeviceId, act
       {completedSale ? (
         <SaleReceiptDialog sale={completedSale} onClose={startNewSale} />
       ) : null}
-    </>
+    </div>
   );
 }
 
@@ -5395,17 +5476,23 @@ function CustomAmountDialog({ onAdd, onClose }) {
 
 // Prompt shown at checkout when the entered phone is a new customer or is missing
 // a name / address — captures those for the receipt and the CRM.
-function CustomerInfoDialog({ phone, customer, onSave, onSkip, onClose }) {
+function CustomerInfoDialog({ phone, customer, onSave, onSkip, onClose, required = false }) {
   const isNew = !customer;
   const [name, setName] = useState(customer?.name || "");
   const [mobile, setMobile] = useState(customer?.mobile || "");
   const [address, setAddress] = useState(customer?.address || "");
+  const [nameError, setNameError] = useState("");
 
   function submit(event) {
     event.preventDefault();
     // Stop the submit from bubbling (through React's portal tree) to any parent
     // report/order form, which would otherwise also fire its own submit.
     event.stopPropagation();
+    if (required && !name.trim()) {
+      setNameError("Customer name is required.");
+      return;
+    }
+    setNameError("");
     onSave({ name, mobile, address });
   }
 
@@ -5415,20 +5502,27 @@ function CustomerInfoDialog({ phone, customer, onSave, onSkip, onClose }) {
   return createPortal(
     <div className="dialog-backdrop" role="presentation" onMouseDown={onClose}>
       <div className="dialog-card" role="dialog" aria-modal="true" onMouseDown={(event) => event.stopPropagation()}>
-        <h2>{isNew ? "Add new customer" : "Complete customer details"}</h2>
+        <h2>{isNew ? "Add customer" : "Complete customer details"}</h2>
         <p className="muted">
-          {isNew
-            ? `${phone} isn't in the CRM yet. Add their details for the receipt and follow-up.`
-            : `${phone} is missing some details. Add them for the receipt and follow-up.`}
+          {required
+            ? "A customer is required before completing this sale."
+            : isNew
+              ? `${phone} isn't in the CRM yet. Add their details for the receipt and follow-up.`
+              : `${phone} is missing some details. Add them for the receipt and follow-up.`}
         </p>
         <form className="form-grid" onSubmit={submit}>
           <label className="field"><span>Phone</span><input value={phone} disabled /></label>
-          <label className="field"><span>Name</span><input value={name} onChange={(event) => setName(event.target.value)} autoFocus /></label>
+          <label className="field">
+            <span>Name{required ? " *" : ""}</span>
+            <input value={name} onChange={(event) => { setName(event.target.value); setNameError(""); }} autoFocus required={required} />
+            {nameError ? <p className="pos-warning">{nameError}</p> : null}
+          </label>
           <label className="field"><span>Mobile (optional)</span><input value={mobile} inputMode="tel" onChange={(event) => setMobile(event.target.value)} /></label>
           <AddressAutocomplete value={address} onChange={setAddress} />
           <div className="pos-form-actions form-actions-row">
             <button className="primary-button" type="submit">Save &amp; complete sale</button>
-            <button className="secondary-button" type="button" onClick={onSkip}>Skip</button>
+            {!required && onSkip ? <button className="secondary-button" type="button" onClick={onSkip}>Skip</button> : null}
+            {required ? <button className="secondary-button" type="button" onClick={onClose}>Cancel</button> : null}
           </div>
         </form>
       </div>
@@ -5437,29 +5531,49 @@ function CustomerInfoDialog({ phone, customer, onSave, onSkip, onClose }) {
   );
 }
 
-// Shared 80mm thermal receipt styling.
+// Shared 80mm thermal receipt styling — smaller type with generous vertical spacing.
 const THERMAL_BASE_CSS = `
   @page { size: 80mm auto; margin: 0; }
   html, body { margin: 0; }
-  body { width: 80mm; box-sizing: border-box; padding: 8px 9px 14px; color: #000;
-    font-family: ui-sans-serif, system-ui, "Segoe UI", sans-serif; font-size: 12.5px; line-height: 1.38; }
-  /* Thermal printers are monochrome — render the wordmark logo as crisp black. */
-  .receipt-logo { display: block; max-width: 72mm; max-height: 64px; margin: 0 auto 6px; object-fit: contain;
+  body { width: 80mm; box-sizing: border-box; padding: 4mm 2.5mm 6mm; color: #000;
+    font-family: ui-sans-serif, system-ui, "Segoe UI", Arial, sans-serif;
+    font-size: 14px; line-height: 1.65; font-weight: 400;
+    -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+  .receipt-logo { display: block; width: 68mm; max-width: 68mm; max-height: 52px; margin: 0 auto 4mm; object-fit: contain;
     filter: grayscale(1) brightness(0); }
-  table { width: 100%; border-collapse: collapse; }
-  td { padding: 4px 0; vertical-align: top; }
-  .meta { font-size: 11.5px; text-align: center; }
-  .divider { border-top: 1px dashed #000; margin: 7px 0; }
-  .contact { text-align: center; font-size: 11px; }
-  .store-name { text-align: center; font-weight: 800; margin-top: 6px; }
-  .store-addr { text-align: center; font-size: 11px; }
-  .cust { text-align: center; font-size: 11.5px; margin-top: 2px; }
-  .hours { text-align: center; font-size: 11px; margin-bottom: 4px; }
-  .thanks { text-align: center; margin-top: 10px; font-weight: 700; }
-  .feedback { text-align: center; font-size: 10.5px; margin-top: 4px; }
-  .powered { text-align: center; font-size: 9.5px; margin-top: 8px; color: #333; }
-  small { color: #000; }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  td { padding: 3.5mm 0; vertical-align: top; }
+  td:first-child { width: 100%; font-weight: 400; line-height: 1.55; }
+  td:last-child { text-align: right; white-space: nowrap; font-weight: 500; padding-left: 2mm; }
+  .meta { font-size: 12px; text-align: center; font-weight: 400; margin: 2mm 0; line-height: 1.55; }
+  .divider { border-top: 1px dashed #000; margin: 5mm 0; }
+  .contact { text-align: center; font-size: 12px; font-weight: 400; line-height: 1.6; margin-bottom: 2mm; }
+  .store-name { text-align: center; font-weight: 600; font-size: 16px; margin-top: 2mm; line-height: 1.45; }
+  .store-addr { text-align: center; font-size: 12px; font-weight: 400; line-height: 1.6; margin-top: 1.5mm; }
+  .cust { text-align: left; margin-top: 4mm; line-height: 1.6; }
+  .cust-name { font-size: 15px; font-weight: 600; margin-bottom: 2.5mm; }
+  .cust-phone { font-size: 13px; font-weight: 400; margin-bottom: 2mm; }
+  .cust-addr { font-size: 12px; font-weight: 400; margin-top: 0; line-height: 1.55; }
+  .hours { text-align: center; font-size: 12px; font-weight: 400; margin-bottom: 3mm; line-height: 1.55; }
+  .thanks { text-align: center; margin-top: 4mm; font-weight: 600; font-size: 14px; line-height: 1.5; }
+  .feedback { text-align: center; font-size: 11px; font-weight: 400; margin-top: 3mm; line-height: 1.55; }
+  .powered { text-align: center; font-size: 10px; margin-top: 4mm; color: #000; font-weight: 400; line-height: 1.5; }
+  small { font-size: 11px; color: #000; font-weight: 400; line-height: 1.5; }
 `;
+
+// Totals, payment line, and barcode — shared by sale + phone-order receipts.
+const THERMAL_CHECKOUT_CSS = `
+  .line { display: flex; justify-content: space-between; align-items: baseline; gap: 2mm; margin: 2.5mm 0; line-height: 1.55; }
+  .line-subtotal { font-size: 13px; font-weight: 400; }
+  .line-tax { font-size: 13px; font-weight: 500; }
+  .line-tax span:last-child { font-weight: 600; }
+  .total { display: flex; justify-content: space-between; align-items: baseline; margin-top: 4mm; padding-top: 4mm; border-top: 1px solid #000; line-height: 1.5; }
+  .total-grand { font-size: 16px; font-weight: 600; }
+  .total-grand span:last-child { font-size: 17px; font-weight: 600; }
+  .paid { font-size: 13px; font-weight: 500; text-align: center; margin-top: 4mm; line-height: 1.55; }
+  .barcode { text-align: center; margin-top: 5mm; }
+  .barcode svg { max-width: 92%; height: 40px; }
+  .barcode-text { font-size: 11px; font-weight: 500; letter-spacing: 1.5px; margin-top: 2mm; }`;
 
 // Shared receipt header: logo, company-wide contact, and the store's name + address.
 function receiptHeaderHtml(storeName, storeAddress) {
@@ -5486,8 +5600,18 @@ function receiptFooterHtml(storeHours) {
 // Builds the customer block for a receipt from snapshotted details.
 function receiptCustomerHtml(name, phone, mobile, address) {
   if (!name && !phone && !mobile && !address) return "";
-  const phoneLine = [phone, mobile].filter(Boolean).join(" / ");
-  return `<div class="cust">${name ? `${escapeHtml(name)}<br/>` : ""}${phoneLine ? `${escapeHtml(phoneLine)}<br/>` : ""}${address ? escapeHtml(address) : ""}</div>`;
+  const phoneFormatted = formatReceiptPhone(phone);
+  const mobileDigits = localPhoneDigits(mobile);
+  const phoneDigits = localPhoneDigits(phone);
+  const mobileFormatted = mobile && mobileDigits && mobileDigits !== phoneDigits
+    ? formatReceiptPhone(mobile)
+    : "";
+  return `<div class="cust">
+    ${name ? `<div class="cust-name">${escapeHtml(name)}</div>` : ""}
+    ${phoneFormatted ? `<div class="cust-phone">${escapeHtml(phoneFormatted)}</div>` : ""}
+    ${mobileFormatted ? `<div class="cust-phone">${escapeHtml(mobileFormatted)}</div>` : ""}
+    ${address ? `<div class="cust-addr">${escapeHtml(address)}</div>` : ""}
+  </div>`;
 }
 
 // Opens a hidden 80mm print window that prints immediately and closes itself.
@@ -5533,23 +5657,17 @@ function printSaleReceipt(sale) {
 
   const receiptCode = sale.receiptCode || "";
   const barcodeBlock = receiptCode
-    ? `<div class="barcode">${code128Svg(receiptCode, { moduleWidth: 2, height: 56 })}<div class="barcode-text">${escapeHtml(receiptCode)}</div></div>`
+    ? `<div class="barcode">${code128Svg(receiptCode, { moduleWidth: 1.8, height: 40 })}<div class="barcode-text">${escapeHtml(receiptCode)}</div></div>`
     : "";
 
   const taxAmount = Number(details.taxAmount) || 0;
   const taxBlock = taxAmount > 0 || Number(details.subtotal) > 0
     ? `
-    <div class="line"><span>Subtotal</span><span>${formatMoney(Number(details.subtotal) || 0)}</span></div>
-    <div class="line"><span>Tax${details.taxRate ? ` (${details.taxRate}%)` : ""}</span><span>${formatMoney(taxAmount)}</span></div>`
+    <div class="line line-subtotal"><span>Subtotal</span><span>${formatMoney(Number(details.subtotal) || 0)}</span></div>
+    <div class="line line-tax"><span>Tax${details.taxRate ? ` (${details.taxRate}%)` : ""}</span><span>${formatMoney(taxAmount)}</span></div>`
     : "";
 
-  const css = `
-    .line { display: flex; justify-content: space-between; font-size: 12px; }
-    .total { font-size: 15px; font-weight: 800; display: flex; justify-content: space-between; margin-top: 4px; }
-    .paid { font-size: 11.5px; text-align: center; margin-top: 6px; }
-    .barcode { text-align: center; margin-top: 12px; }
-    .barcode svg { max-width: 100%; height: 56px; }
-    .barcode-text { font-size: 11px; letter-spacing: 2px; margin-top: 2px; }`;
+  const css = THERMAL_CHECKOUT_CSS;
   const customerBlock = receiptCustomerHtml(
     details.customerName,
     sale.customerPhone,
@@ -5565,7 +5683,7 @@ function printSaleReceipt(sale) {
     <table>${rows}</table>
     <div class="divider"></div>
     ${taxBlock}
-    <div class="total"><span>Total</span><span>${formatMoney(total)}</span></div>
+    <div class="total total-grand"><span>Grand total</span><span>${formatMoney(total)}</span></div>
     <div class="paid">Paid by ${escapeHtml(sale.paymentMethod || "-")}</div>
     ${barcodeBlock}
     <div class="divider"></div>
@@ -5592,25 +5710,19 @@ function printPhoneOrderReceipt(order) {
 
   const receiptCode = order.receiptCode || "";
   const barcodeBlock = receiptCode
-    ? `<div class="barcode">${code128Svg(receiptCode, { moduleWidth: 2, height: 56 })}<div class="barcode-text">${escapeHtml(receiptCode)}</div></div>`
+    ? `<div class="barcode">${code128Svg(receiptCode, { moduleWidth: 1.8, height: 40 })}<div class="barcode-text">${escapeHtml(receiptCode)}</div></div>`
     : "";
 
   const taxAmount = Number(order.taxAmount) || 0;
   const taxBlock = taxAmount > 0 || Number(order.subtotal) > 0
     ? `
-    <div class="line"><span>Subtotal</span><span>${formatMoney(Number(order.subtotal) || 0)}</span></div>
-    <div class="line"><span>Tax${order.taxRate ? ` (${order.taxRate}%)` : ""}</span><span>${formatMoney(taxAmount)}</span></div>`
+    <div class="line line-subtotal"><span>Subtotal</span><span>${formatMoney(Number(order.subtotal) || 0)}</span></div>
+    <div class="line line-tax"><span>Tax${order.taxRate ? ` (${order.taxRate}%)` : ""}</span><span>${formatMoney(taxAmount)}</span></div>`
     : "";
 
-  const css = `
-    .line { display: flex; justify-content: space-between; font-size: 12px; }
-    .total { font-size: 15px; font-weight: 800; display: flex; justify-content: space-between; margin-top: 4px; }
-    .paid { font-size: 11.5px; text-align: center; margin-top: 6px; }
-    .deliver { font-size: 12px; margin-top: 6px; }
-    .deliver strong { display: block; }
-    .barcode { text-align: center; margin-top: 12px; }
-    .barcode svg { max-width: 100%; height: 56px; }
-    .barcode-text { font-size: 11px; letter-spacing: 2px; margin-top: 2px; }`;
+  const css = `${THERMAL_CHECKOUT_CSS}
+    .deliver { font-size: 17px; font-weight: 600; margin-top: 2mm; line-height: 1.35; }
+    .deliver strong { display: block; font-size: 16px; font-weight: 800; margin-bottom: 1mm; }`;
   const customerBlock = receiptCustomerHtml(order.customerName, order.customerPhone, "", "");
   const deliverTo = order.deliveryAddress || order.address || "-";
   const onFile = (order.address || "").trim();
@@ -5630,7 +5742,7 @@ function printPhoneOrderReceipt(order) {
     <table>${rows}</table>
     <div class="divider"></div>
     ${taxBlock}
-    <div class="total"><span>Total</span><span>${formatMoney(total)}</span></div>
+    <div class="total total-grand"><span>Grand total</span><span>${formatMoney(total)}</span></div>
     <div class="paid">${escapeHtml(order.paymentStatus || "")}${order.paymentMethod ? ` · ${escapeHtml(order.paymentMethod)}` : ""}</div>
     ${barcodeBlock}
     <div class="divider"></div>
@@ -5648,12 +5760,12 @@ function printRepairPhoneLabel(report) {
   const customer = [details.customerName, report.customerPhone].filter(Boolean).join(" · ");
 
   const css = `
-    .eyebrow { text-align: center; font-size: 11px; text-transform: uppercase; letter-spacing: 1px; }
-    .ticket { text-align: center; font-size: 26px; font-weight: 800; margin: 4px 0; letter-spacing: 1px; }
-    .who { text-align: center; font-size: 12.5px; font-weight: 700; }
-    .row { font-size: 12.5px; margin: 2px 0; }
-    .row strong { display: inline-block; min-width: 52px; }
-    .issue { font-size: 14px; font-weight: 800; margin-top: 4px; }`;
+    .eyebrow { text-align: center; font-size: 13px; font-weight: 700; text-transform: uppercase; letter-spacing: 1px; }
+    .ticket { text-align: center; font-size: 30px; font-weight: 800; margin: 2mm 0; letter-spacing: 1px; }
+    .who { text-align: center; font-size: 16px; font-weight: 700; }
+    .row { font-size: 15px; font-weight: 600; margin: 1mm 0; }
+    .row strong { display: inline-block; min-width: 14mm; font-weight: 800; }
+    .issue { font-size: 17px; font-weight: 800; margin-top: 2mm; }`;
   const body = `
     <div class="eyebrow">Repair — stick on phone</div>
     <div class="ticket">${escapeHtml(details.ticketNumber || "")}</div>
@@ -5690,9 +5802,9 @@ function printRepairTicket(report) {
     .join("");
 
   const css = `
-    .eyebrow { text-align: center; font-size: 11px; text-transform: uppercase; letter-spacing: 1px; }
-    .ticket { text-align: center; font-size: 24px; font-weight: 800; margin: 6px 0; letter-spacing: 1px; }
-    .notes { font-size: 11.5px; margin-top: 10px; }`;
+    .eyebrow { text-align: center; font-size: 14px; font-weight: 700; text-transform: uppercase; letter-spacing: 1px; }
+    .ticket { text-align: center; font-size: 28px; font-weight: 800; margin: 2mm 0; letter-spacing: 1px; }
+    .notes { font-size: 14px; font-weight: 600; margin-top: 3mm; line-height: 1.35; }`;
   const body = `
     ${receiptHeaderHtml(location, details.storeAddress)}
     <div class="divider"></div>
@@ -5743,10 +5855,10 @@ function printRentalReceipt(report) {
     .join("");
 
   const css = `
-    .eyebrow { text-align: center; font-size: 11px; text-transform: uppercase; letter-spacing: 1px; }
-    .total { display: flex; justify-content: space-between; font-weight: 800; font-size: 14px; margin-top: 6px; }
-    .paid { text-align: center; font-size: 11.5px; margin-top: 2px; }
-    .notes { font-size: 11.5px; margin-top: 10px; }`;
+    .eyebrow { text-align: center; font-size: 14px; font-weight: 700; text-transform: uppercase; letter-spacing: 1px; }
+    .total { display: flex; justify-content: space-between; font-weight: 800; font-size: 22px; margin-top: 2mm; }
+    .paid { text-align: center; font-size: 15px; font-weight: 700; margin-top: 2mm; }
+    .notes { font-size: 14px; font-weight: 600; margin-top: 3mm; line-height: 1.35; }`;
   const body = `
     ${receiptHeaderHtml(location, details.storeAddress)}
     <div class="divider"></div>

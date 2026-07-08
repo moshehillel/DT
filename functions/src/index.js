@@ -14,6 +14,8 @@ const { buildRepairMessage, buildRepairReceivedMessage, findRepairByLookup } = r
 const {
   buildTelebroadPendingReport,
   buildTelebroadSmsRequest,
+  callResultRank,
+  classifyCall,
   shouldImportCall,
 } = require("./telebroad");
 const { extractShopifyImei } = require("./shopify");
@@ -787,6 +789,27 @@ exports.shopifyOrderWebhook = onRequest(HTTP_OPTIONS, async (req, res) => {
   sendJson(res, 200, { ok: true });
 });
 
+// Temporary capture of raw Telebroad webhooks so we can confirm which field
+// distinguishes a real missed call (rang an agent) from an IVR hang-up. Best
+// effort — a logging failure must never block the actual import.
+async function logTelebroadWebhook(payload) {
+  try {
+    await db.collection("telebroadWebhookLogs").add({
+      receivedAt: admin.firestore.FieldValue.serverTimestamp(),
+      classification: classifyCall(payload),
+      status: payload?.status || "",
+      direction: payload?.direction || "",
+      destinationType: payload?.destinationType || "",
+      sendType: payload?.sendType || "",
+      callDuration: payload?.callDuration ?? "",
+      talkDuration: payload?.talkDuration ?? "",
+      raw: payload || {},
+    });
+  } catch (error) {
+    logger.warn("telebroadWebhookLogs write failed", error);
+  }
+}
+
 exports.telebroadCallWebhook = onRequest(HTTP_OPTIONS, async (req, res) => {
   if (req.method !== "POST") {
     sendJson(res, 405, { error: "POST required" });
@@ -795,6 +818,12 @@ exports.telebroadCallWebhook = onRequest(HTTP_OPTIONS, async (req, res) => {
 
   try {
     const payload = getPayload(req);
+
+    // Capture every raw webhook (including ones we ignore) so we can inspect the
+    // real fields that separate a missed call from an IVR hang-up, then finalize
+    // missed-call detection (IMPORT_MISSED in telebroad.js). Remove this capture
+    // once detection is locked down.
+    await logTelebroadWebhook(payload);
 
     if (!shouldImportCall(payload)) {
       sendJson(res, 200, {
@@ -810,10 +839,37 @@ exports.telebroadCallWebhook = onRequest(HTTP_OPTIONS, async (req, res) => {
     const existing = await pendingRef.get();
 
     if (existing.exists) {
+      // Every segment of one call shares a callId, so they land on the same doc.
+      // Only overwrite when this segment is a better outcome (answered > voicemail
+      // > missed); otherwise keep what we have. This is what stops a call that
+      // rang unanswered (missed) and was then answered from staying "Missed" — and
+      // conversely stops a late ring segment from downgrading an answered call.
+      const existingData = existing.data() || {};
+      const existingResult = existingData.callResult || "answered";
+      if (callResultRank(pendingReport.callResult) <= callResultRank(existingResult)) {
+        sendJson(res, 200, {
+          ok: true,
+          imported: false,
+          reason: "already_imported",
+          existingResult,
+          pendingReportId: pendingReport.id,
+        });
+        return;
+      }
+
+      await pendingRef.set({
+        ...pendingReport,
+        // Keep the original import time so ordering/age doesn't reset on upgrade.
+        createdAt: existingData.createdAt || pendingReport.createdAt,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+
       sendJson(res, 200, {
         ok: true,
-        imported: false,
-        reason: "already_imported",
+        imported: true,
+        upgraded: true,
+        from: existingResult,
+        to: pendingReport.callResult,
         pendingReportId: pendingReport.id,
       });
       return;

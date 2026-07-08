@@ -18,6 +18,12 @@ export const STAFF_KEY = "diamant-telecom-staff-v2";
 export const CUSTOMERS_KEY = "diamant-telecom-customers-v1";
 export const FUNCTIONS_BASE_URL = import.meta.env.VITE_FUNCTIONS_BASE_URL || "";
 
+/** TEMPORARY — billing reminder banner at the top of every page. Set false to hide. */
+export const PAYMENT_REMINDER_ENABLED = true;
+export const PAYMENT_REMINDER_TEXT =
+  "You are 80% paid — make the additional payment to avoid system interruptions.";
+export const PAYMENT_REMINDER_CONTACT_EMAIL = "info@advancedautomations.net";
+
 // Company-wide contact details shown on every receipt (same for all stores).
 export const COMPANY = {
   phone: "1 (347) 388-7467",

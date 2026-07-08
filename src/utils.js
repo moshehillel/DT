@@ -118,6 +118,16 @@ export function localPhoneDigits(value) {
   return digits.startsWith("1") ? digits.slice(1) : digits;
 }
 
+// Readable phone line for thermal receipts, e.g. 8456370687 -> "845 637 0687".
+export function formatReceiptPhone(value) {
+  const digits = localPhoneDigits(value);
+  if (digits.length === 10) {
+    return `${digits.slice(0, 3)} ${digits.slice(3, 6)} ${digits.slice(6)}`;
+  }
+  const raw = String(value || "").trim();
+  return raw || digits;
+}
+
 // Title-case a person's name for storage/display: "moshe gluck" -> "Moshe
 // Gluck". Capitalizes after spaces, hyphens, and apostrophes (so "o'brien" ->
 // "O'Brien", "anne-marie" -> "Anne-Marie") and collapses runs of whitespace.
