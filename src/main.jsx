@@ -1828,6 +1828,11 @@ function ReportForm({ activeType, activeEmployee, activeLocation, reports, activ
           return;
         }
       }
+      // What came in with the phone / whether we lent a loaner, so pickup can
+      // reconcile the accessories and get the temporary phone back.
+      details.hadSim = formData.get("hadSim") === "on";
+      details.hadSdCard = formData.get("hadSdCard") === "on";
+      details.borrowedTempPhone = formData.get("borrowedTempPhone") === "on";
       details.ticketNumber = generateRepairTicketNumber(reports);
       details.ticketDigits = digitsOnly(details.ticketNumber);
       // The intake amount is the quote; the real price is set when the repair is
@@ -1950,6 +1955,23 @@ function ReportForm({ activeType, activeEmployee, activeLocation, reports, activ
             />
           ))}
         </div>
+
+        {isRepair ? (
+          <div className="form-grid repair-accessories">
+            <label className="field checkbox-field">
+              <input type="checkbox" name="hadSim" />
+              <span>Phone came with a SIM</span>
+            </label>
+            <label className="field checkbox-field">
+              <input type="checkbox" name="hadSdCard" />
+              <span>Phone came with an SD card</span>
+            </label>
+            <label className="field checkbox-field">
+              <input type="checkbox" name="borrowedTempPhone" />
+              <span>Borrowed a temporary phone</span>
+            </label>
+          </div>
+        ) : null}
 
         <label className="field full">
           <span>Notes</span>
@@ -5811,6 +5833,9 @@ function printRepairTicket(report) {
     ["Issue", details.damage],
     ["Estimated price", estimatedPrice ? formatMoney(Number(estimatedPrice) || 0) : ""],
     ["Final price", details.finalPrice ? formatMoney(Number(details.finalPrice) || 0) : ""],
+    ["SIM in phone", details.hadSim ? "Yes" : ""],
+    ["SD card in phone", details.hadSdCard ? "Yes" : ""],
+    ["Loaner phone given", details.borrowedTempPhone ? "Yes" : ""],
     ["Paid", details.paymentStatus],
     ["Expected ready", details.dueDate],
     ["Notify by", details.notificationPreference],
@@ -7195,6 +7220,9 @@ function ReportDetails({ report, compact }) {
       ["Ticket", details.ticketNumber],
       ["Model", details.model],
       ["Damage", details.damage],
+      ["SIM in phone", details.hadSim ? "Yes" : ""],
+      ["SD card in phone", details.hadSdCard ? "Yes" : ""],
+      ["Loaner phone given", details.borrowedTempPhone ? "Yes" : ""],
       ["Paid", details.paymentStatus],
       ["Ready", details.dueDate],
     ],
