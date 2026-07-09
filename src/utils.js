@@ -345,7 +345,10 @@ export function unionByName(local, cloud) {
   const consider = (item) => {
     if (!item?.name) return;
     const existing = byName.get(item.name);
-    if (!existing || (Number(item.updatedAt) || 0) >= (Number(existing.updatedAt) || 0)) {
+    // Strictly-newer wins. A `>=` tie-break let two devices (or a stable shape/key
+    // difference, or entries with no updatedAt = 0) each keep re-selecting their own
+    // copy on every merge, so the doc got re-healed and rewritten in a loop.
+    if (!existing || (Number(item.updatedAt) || 0) > (Number(existing.updatedAt) || 0)) {
       byName.set(item.name, item);
     }
   };

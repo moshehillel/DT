@@ -15,7 +15,6 @@ const {
   buildTelebroadPendingReport,
   buildTelebroadSmsRequest,
   callResultRank,
-  classifyCall,
   shouldImportCall,
 } = require("./telebroad");
 const { extractShopifyImei } = require("./shopify");
@@ -789,26 +788,6 @@ exports.shopifyOrderWebhook = onRequest(HTTP_OPTIONS, async (req, res) => {
   sendJson(res, 200, { ok: true });
 });
 
-// Temporary capture of raw Telebroad webhooks so we can confirm which field
-// distinguishes a real missed call (rang an agent) from an IVR hang-up. Best
-// effort — a logging failure must never block the actual import.
-async function logTelebroadWebhook(payload) {
-  try {
-    await db.collection("telebroadWebhookLogs").add({
-      receivedAt: admin.firestore.FieldValue.serverTimestamp(),
-      classification: classifyCall(payload),
-      status: payload?.status || "",
-      direction: payload?.direction || "",
-      destinationType: payload?.destinationType || "",
-      sendType: payload?.sendType || "",
-      callDuration: payload?.callDuration ?? "",
-      talkDuration: payload?.talkDuration ?? "",
-      raw: payload || {},
-    });
-  } catch (error) {
-    logger.warn("telebroadWebhookLogs write failed", error);
-  }
-}
 
 exports.telebroadCallWebhook = onRequest(HTTP_OPTIONS, async (req, res) => {
   if (req.method !== "POST") {
@@ -818,12 +797,6 @@ exports.telebroadCallWebhook = onRequest(HTTP_OPTIONS, async (req, res) => {
 
   try {
     const payload = getPayload(req);
-
-    // Capture every raw webhook (including ones we ignore) so we can inspect the
-    // real fields that separate a missed call from an IVR hang-up, then finalize
-    // missed-call detection (IMPORT_MISSED in telebroad.js). Remove this capture
-    // once detection is locked down.
-    await logTelebroadWebhook(payload);
 
     if (!shouldImportCall(payload)) {
       sendJson(res, 200, {

@@ -186,8 +186,14 @@ function Workspace({ currentUser, isAdmin }) {
   // Keep the signed-in employee in the staff list so admins can see and
   // attribute to them. Adds a bare entry (no store yet) the first time they sign
   // in; the union merge keeps it from ever being dropped by another device.
+  // Heal a given signed-in name at most once per session. Without this, a stale
+  // tombstone on another device (or clock skew) that keeps re-winning the merge
+  // would drop the name back out of `employees`, re-arming this effect and letting
+  // it rewrite appState/staff on every snapshot echo — a self-sustaining loop.
+  const healedNamesRef = useRef(new Set());
   useEffect(() => {
-    if (employeeName && !employees.includes(employeeName)) {
+    if (employeeName && !employees.includes(employeeName) && !healedNamesRef.current.has(employeeName)) {
+      healedNamesRef.current.add(employeeName);
       setStaff((current) => {
         const list = current || [];
         const existing = list.find((member) => member?.name === employeeName);
@@ -3461,6 +3467,7 @@ function PendingReportCard({ pendingReport, activeEmployee, onSaveCustomerName, 
           handledBy: imported.employeeName || pendingReport.details?.handledBy || "",
           telebroadCallId: imported.callId || pendingReport.details?.telebroadCallId || "",
           telebroadUniqueId: imported.uniqueId || pendingReport.details?.telebroadUniqueId || "",
+          recordingUrl: imported.recordingUrl || pendingReport.details?.recordingUrl || "",
           callDuration: imported.callDuration ?? pendingReport.details?.callDuration ?? "",
           talkDuration: imported.talkDuration ?? pendingReport.details?.talkDuration ?? "",
         },
@@ -3544,16 +3551,27 @@ function PendingReportCard({ pendingReport, activeEmployee, onSaveCustomerName, 
     );
   }
 
+  const recordingHref = imported.recordingUrl || callRecordingUrl(imported.callId, imported.uniqueId);
+  const summaryRight = isCallReport
+    ? (pendingReport.createdAt ? formatShortDate(pendingReport.createdAt) : "")
+    : formatPayment(fields.paymentAmount);
+
   return (
-    <article className={`pending-card ${isClaimedByMe ? "claimed" : ""}`}>
-      <div className="pending-card-head">
-        <div>
-          <p className="eyebrow">{sourceLabel}</p>
-          <h3>{cardTitle}</h3>
-        </div>
-        <span className={`badge ${isCallReport ? "call" : "sale"}`}>{isCallReport ? callTypeLabel : (pendingReport.type || "sale")}</span>
+    <article className={`pending-card ${isClaimedByMe ? "claimed" : ""} ${expanded ? "open" : "compact"}`}>
+      <div className="returnable-row">
+        <button type="button" className="returnable-summary" onClick={() => setExpanded((value) => !value)} aria-expanded={expanded}>
+          <span className="expand-caret">{expanded ? "▾" : "▸"}</span>
+          <span className={`badge ${isCallReport ? "call" : "sale"}`}>{isCallReport ? callTypeLabel : (pendingReport.type || "sale")}</span>
+          <span className="returnable-who">{cardTitle}</span>
+          {pendingReport.claimedBy && !readyToComplete ? (
+            <span className="returnable-phone">{isClaimedByMe ? "you" : pendingReport.claimedBy}</span>
+          ) : null}
+          <span className="returnable-when">{summaryRight}</span>
+        </button>
       </div>
 
+      {!expanded ? null : (
+      <>
       <div className="pending-import">
         {isCallReport ? (
           <>
@@ -3564,8 +3582,8 @@ function PendingReportCard({ pendingReport, activeEmployee, onSaveCustomerName, 
             <span><strong>Handled by:</strong> {importedAgentName || "-"}</span>
             <span><strong>Talk time:</strong> {imported.talkDuration !== "" && imported.talkDuration !== undefined ? `${imported.talkDuration}s` : "-"}</span>
             <span><strong>Imported:</strong> {pendingReport.createdAt ? formatShortDate(pendingReport.createdAt) : "-"}</span>
-            {callRecordingUrl(imported.callId, imported.uniqueId) ? (
-              <a className="secondary-button compact-button" href={callRecordingUrl(imported.callId, imported.uniqueId)} target="_blank" rel="noopener noreferrer">
+            {recordingHref ? (
+              <a className="secondary-button compact-button" href={recordingHref} target="_blank" rel="noopener noreferrer">
                 ▶ Call recording
               </a>
             ) : null}
@@ -3694,6 +3712,8 @@ function PendingReportCard({ pendingReport, activeEmployee, onSaveCustomerName, 
       {claimedBySomeoneElse ? (
         <p className="muted">Only {pendingReport.claimedBy} can complete this pending report.</p>
       ) : null}
+      </>
+      )}
     </article>
   );
 }
@@ -7234,7 +7254,7 @@ function ReportDetails({ report, compact }) {
   }[report.type];
 
   const recordingUrl = report.type === "call"
-    ? callRecordingUrl(details.telebroadCallId, details.telebroadUniqueId)
+    ? (details.recordingUrl || callRecordingUrl(details.telebroadCallId, details.telebroadUniqueId))
     : "";
 
   const filled = lines.filter(([, value]) => value);

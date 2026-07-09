@@ -168,6 +168,11 @@ export function useCloudDocumentState(documentId, localKey, fallback, options = 
         ? nextValueOrUpdater(current)
         : nextValueOrUpdater;
 
+      // Writing an identical value is what let a heal/merge fight rewrite
+      // appState/staff thousands of times: return the same reference so we neither
+      // re-render nor push a no-op write.
+      if (isSameArray(nextValue, current)) return current;
+
       if (cloudReadyRef.current) {
         lastPushedRef.current = nextValue;
         replaceAppStateDocument(documentId, nextValue).catch((error) =>
