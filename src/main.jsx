@@ -4709,14 +4709,15 @@ function PosPage({ products, activeEmployee, activeLocation, activeDeviceId, act
     };
   }
 
-  function makeCustomLine(amount) {
+  function makeCustomLine(amount, name) {
     const price = Number.parseFloat(String(amount || "").replace(/[^\d.]/g, ""));
     if (!Number.isFinite(price) || price <= 0) return null;
+    const label = String(name || "").trim() || "Custom item";
     return {
       lineId: crypto.randomUUID(),
       productId: "",
       sku: "CUSTOM",
-      name: "Custom item",
+      name: label,
       price,
       qty: 1,
       requiresImei: false,
@@ -4727,8 +4728,8 @@ function PosPage({ products, activeEmployee, activeLocation, activeDeviceId, act
     };
   }
 
-  function addCustomItemToCart(amount) {
-    const line = makeCustomLine(amount);
+  function addCustomItemToCart(amount, name) {
+    const line = makeCustomLine(amount, name);
     if (!line) {
       playScanError();
       setMessage("Enter a valid custom amount greater than zero.");
@@ -4736,7 +4737,7 @@ function PosPage({ products, activeEmployee, activeLocation, activeDeviceId, act
     }
     setCart((current) => [...current, line]);
     playScanBeep();
-    setMessage(`Added Custom item for ${formatMoney(line.price)}.`);
+    setMessage(`Added ${line.name} for ${formatMoney(line.price)}.`);
     return true;
   }
 
@@ -5313,8 +5314,8 @@ function PosPage({ products, activeEmployee, activeLocation, activeDeviceId, act
 
       {customAmountOpen ? (
         <CustomAmountDialog
-          onAdd={(amount) => {
-            if (addCustomItemToCart(amount)) {
+          onAdd={(amount, name) => {
+            if (addCustomItemToCart(amount, name)) {
               setCustomAmountOpen(false);
               scanRef.current?.focus();
             }
@@ -5482,26 +5483,35 @@ function AddressAutocomplete({ value, onChange, autoFocus }) {
 // Enter a one-off charge that prints on the receipt as Custom item.
 function CustomAmountDialog({ onAdd, onClose }) {
   const [amount, setAmount] = useState("");
+  const [name, setName] = useState("");
 
   function submit(event) {
     event.preventDefault();
     event.stopPropagation();
-    onAdd(amount);
+    onAdd(amount, name);
   }
 
   return createPortal(
     <div className="dialog-backdrop" role="presentation" onMouseDown={onClose}>
       <div className="dialog-card" role="dialog" aria-modal="true" onMouseDown={(event) => event.stopPropagation()}>
         <h2>Custom item</h2>
-        <p className="muted">Enter the amount to charge. The receipt will list it as Custom item.</p>
+        <p className="muted">Enter an item name and amount. The receipt lists the name you enter (or “Custom item” if left blank).</p>
         <form className="form-grid" onSubmit={submit}>
+          <label className="field">
+            <span>Item name</span>
+            <input
+              value={name}
+              onChange={(event) => setName(event.target.value)}
+              autoFocus
+              placeholder="Custom item"
+            />
+          </label>
           <label className="field">
             <span>Amount</span>
             <input
               value={amount}
               onChange={(event) => setAmount(event.target.value)}
               inputMode="decimal"
-              autoFocus
               placeholder="0.00"
             />
           </label>
