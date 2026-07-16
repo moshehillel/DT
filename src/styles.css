@@ -2863,6 +2863,18 @@ tr:last-child td {
   margin-top: 6px;
 }
 
+/* Trimmed card panel (no manual-entry toggle / header) so checkout fits the
+   fixed-height POS without scrolling when a card payment is selected. */
+.payment-panel-compact {
+  gap: 8px;
+  padding: 10px 12px;
+  margin-top: 4px;
+}
+
+.payment-panel-compact .card-reader-row {
+  padding: 0;
+}
+
 /* Quick-add products */
 .pos-product-grid {
   grid-template-columns: repeat(auto-fill, minmax(170px, 1fr));

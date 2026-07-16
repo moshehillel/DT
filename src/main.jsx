@@ -4765,7 +4765,6 @@ function PosPage({ products, storeLocations = [], activeEmployee, activeLocation
   const [completedSale, setCompletedSale] = useState(null);
   const [customerPrompt, setCustomerPrompt] = useState(null);
   const [customAmountOpen, setCustomAmountOpen] = useState(false);
-  const [cardEntryMode, setCardEntryMode] = useState("terminal");
   const [card, setCard] = useState({ status: "idle", message: "", refNum: "" });
   const scanRef = useRef(null);
 
@@ -5005,7 +5004,6 @@ function PosPage({ products, storeLocations = [], activeEmployee, activeLocation
       const result = await chargeOnLocalTerminal({
         amount: total.toFixed(2),
         externalRequestId: `sale-${Date.now()}`,
-        manualEntry: cardEntryMode === "manual",
         onStatus: (text) => setCard((current) => ({ ...current, message: text })),
       });
       setCard({
@@ -5408,18 +5406,10 @@ function PosPage({ products, storeLocations = [], activeEmployee, activeLocation
           </div>
 
           {requiresCardCharge ? (
-            <div className="payment-panel payment-panel-stack">
-              <div>
-                <p className="eyebrow">Card payment (Verifone P200)</p>
-                <h3>Charge {formatMoney(total)} on the terminal</h3>
-              </div>
+            <div className="payment-panel payment-panel-stack payment-panel-compact">
               <div className="card-reader-row">
                 <span className="reader-dot connected" aria-hidden="true" />
-                <span className="muted">Verifone P200 · local terminal (Sola BBPOS)</span>
-              </div>
-              <div className="segmented-control" role="tablist" aria-label="Card entry mode">
-                <button type="button" className={cardEntryMode === "terminal" ? "selected" : ""} onClick={() => setCardEntryMode("terminal")} disabled={card.status === "charging" || card.status === "paid"}>Tap / dip / swipe</button>
-                <button type="button" className={cardEntryMode === "manual" ? "selected" : ""} onClick={() => setCardEntryMode("manual")} disabled={card.status === "charging" || card.status === "paid"}>Manual entry</button>
+                <span className="muted">Verifone P200 · charge {formatMoney(total)}</span>
               </div>
               <button
                 className="secondary-button"
@@ -5428,12 +5418,10 @@ function PosPage({ products, storeLocations = [], activeEmployee, activeLocation
                 disabled={!total || card.status === "charging" || card.status === "paid"}
               >
                 {card.status === "paid"
-                  ? "Card charged"
+                  ? "Card charged ✓"
                   : card.status === "charging"
-                    ? "Waiting for card..."
-                    : cardEntryMode === "manual"
-                      ? "Charge card (manual entry)"
-                      : "Charge card (tap / dip / swipe)"}
+                    ? "Waiting for card…"
+                    : "Charge card (tap / dip / swipe)"}
               </button>
               {card.message ? (
                 <p className={card.status === "error" ? "summary-error" : "muted"}>{card.message}</p>
