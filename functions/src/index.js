@@ -44,6 +44,7 @@ const RCUK_ADD_RENTAL_PATH = process.env.RCUK_ADD_RENTAL_PATH || "/add-rental";
 const RCUK_GET_RENTAL_PATH = process.env.RCUK_GET_RENTAL_PATH || "/get-rental";
 const RCUK_CHECK_SIM_PATH = process.env.RCUK_CHECK_SIM_PATH || "/check-sim";
 const RCUK_CANCEL_RENTAL_PATH = process.env.RCUK_CANCEL_RENTAL_PATH || "/cancel-rental";
+const RCUK_UPDATE_RENTAL_PATH = process.env.RCUK_UPDATE_RENTAL_PATH || "/update-rental";
 const SOLA_API_KEY = process.env.SOLA_API_KEY || "";
 const SOLA_API_BASE_URL = process.env.SOLA_API_BASE_URL || "https://x1.cardknox.com";
 const SOLA_CREATE_CHARGE_PATH = process.env.SOLA_CREATE_CHARGE_PATH || "/gatewayjson";
@@ -1081,6 +1082,55 @@ exports.rcukCancelRental = onRequest(HTTP_OPTIONS, async (req, res) => {
   } catch (error) {
     logger.error("rcukCancelRental failed", error);
     sendJson(res, 500, { ok: false, message: error.message || "RCUK cancel rental failed." });
+  }
+});
+
+// Edit an existing rental on RCUK's LIVE system. update-rental takes the same
+// rental config as add-rental, keyed by rental_id, so we reuse the shared payload
+// builder and just require the rental_id up front. The browser confirms with the
+// user before calling this, since it changes a live rental.
+exports.rcukUpdateRental = onRequest(HTTP_OPTIONS, async (req, res) => {
+  if (handleCors(req, res)) return;
+  if (req.method !== "POST") {
+    sendJson(res, 405, { error: "POST required" });
+    return;
+  }
+
+  try {
+    const payload = getPayload(req);
+    const rentalId = payload.rental_id || payload.rentalId || payload.id;
+
+    if (!rentalId) {
+      sendJson(res, 400, { ok: false, message: "rental_id is required." });
+      return;
+    }
+
+    const rcukPayload = { rental_id: rentalId, ...buildRcukRentalPayload(payload) };
+
+    if (!rcukPayload.sim_number) {
+      sendJson(res, 400, { ok: false, message: "sim_number is required." });
+      return;
+    }
+
+    const result = await callRcuk(RCUK_UPDATE_RENTAL_PATH, rcukPayload);
+
+    if (!result.ok) {
+      sendJson(res, 400, {
+        ok: false,
+        message: result.data.message || "RCUK update rental failed.",
+        raw: result.data,
+      });
+      return;
+    }
+
+    sendJson(res, 200, {
+      ok: true,
+      message: result.data.message || "Rental updated.",
+      raw: result.data,
+    });
+  } catch (error) {
+    logger.error("rcukUpdateRental failed", error);
+    sendJson(res, 500, { ok: false, message: error.message || "RCUK update rental failed." });
   }
 });
 

@@ -1287,6 +1287,7 @@ function Workspace({ currentUser, isAdmin }) {
         ) : activeView === "openRepairs" ? (
           <OpenRepairsPage
             reports={filteredReports}
+            employees={employees}
             onStatusChange={updateRepairStatus}
             onSetReady={markRepairReady}
             onMarkPaid={markRepairPaid}
@@ -1338,6 +1339,7 @@ function Workspace({ currentUser, isAdmin }) {
               activeLocation={activeLocation}
               reports={reports}
               activeStoreInfo={activeStoreInfo}
+              employees={employees}
               onSaveCustomerName={saveCustomerName}
               onSaveCustomer={saveCustomer}
               onSave={saveReport}
@@ -1365,6 +1367,7 @@ function Workspace({ currentUser, isAdmin }) {
           <PosPage
             key={`pos-${formNonce}`}
             products={products}
+            storeLocations={storeLocations}
             activeEmployee={activeEmployee}
             activeLocation={activeLocation}
             activeDeviceId={activeDeviceId}
@@ -1372,6 +1375,7 @@ function Workspace({ currentUser, isAdmin }) {
             activeStoreInfo={activeStoreInfo}
             onSaveCustomerName={saveCustomerName}
             onSaveCustomer={saveCustomer}
+            onSaveProduct={saveProduct}
             onCompleteSale={savePosSale}
           />
         ) : activeView === "inventory" ? (
@@ -1574,6 +1578,16 @@ function formatStoreAddress(entry) {
   return [entry.street, [cityState, entry.zip].filter(Boolean).join(" ").trim()].filter(Boolean).join(", ");
 }
 
+// Drop the company prefix from a store name so lists show just the branch:
+// "Diamant Telecom - Monroe" -> "Monroe". Falls back to the full name if the
+// prefix isn't there.
+function shortStoreName(name) {
+  const full = String(name || "").trim();
+  if (!full) return "";
+  const stripped = full.replace(/^\s*diamant\s*telecom\s*[-–—:·|]*\s*/i, "").trim();
+  return stripped || full;
+}
+
 function PoweredByFooter() {
   return (
     <a
@@ -1747,7 +1761,7 @@ function buildInitialFieldValues(config) {
   return values;
 }
 
-function ReportForm({ activeType, activeEmployee, activeLocation, reports, activeStoreInfo, onSaveCustomerName, onSaveCustomer, onSave }) {
+function ReportForm({ activeType, activeEmployee, activeLocation, reports, activeStoreInfo, employees = [], onSaveCustomerName, onSaveCustomer, onSave }) {
   const [now, setNow] = useState(new Date());
   const [customerPhone, setCustomerPhone] = useState("");
   // The customer the phone field resolved to (queried on demand), used to snapshot
@@ -1838,6 +1852,9 @@ function ReportForm({ activeType, activeEmployee, activeLocation, reports, activ
       // The intake amount is the quote; the real price is set when the repair is
       // marked Ready. Record it explicitly as the estimated price.
       details.estimatedPrice = String(formData.get("paymentAmount") || "").trim();
+      // Who's fixing it, and (for a returned device) which ticket this follows up.
+      details.technician = String(formData.get("technician") || "").trim();
+      details.originalTicket = String(formData.get("originalTicket") || "").trim();
     }
 
     // Require a payment method whenever money is being recorded, so nothing is
@@ -1955,6 +1972,29 @@ function ReportForm({ activeType, activeEmployee, activeLocation, reports, activ
             />
           ))}
         </div>
+
+        {isRepair ? (
+          <div className="form-grid">
+            <label className="field">
+              <span>Repair technician</span>
+              <select name="technician" defaultValue="">
+                <option value="">Unassigned</option>
+                {employees.map((employee) => (
+                  <option key={employee}>{employee}</option>
+                ))}
+              </select>
+            </label>
+            <label className="field">
+              <span>Follow-up of ticket #</span>
+              <input
+                name="originalTicket"
+                inputMode="numeric"
+                placeholder="Original ticket, if returned"
+                autoComplete="off"
+              />
+            </label>
+          </div>
+        ) : null}
 
         {isRepair ? (
           <div className="form-grid repair-accessories">
@@ -3038,15 +3078,36 @@ function ReportHistory({
   );
 }
 
-function OpenRepairsPage({ reports, onStatusChange, onSetReady, onMarkPaid, onEditRepair }) {
+function OpenRepairsPage({ reports, employees = [], onStatusChange, onSetReady, onMarkPaid, onEditRepair }) {
   const [paying, setPaying] = useState({ id: "", status: "", message: "" });
   // When set, the final-price dialog is open for this repair before it goes Ready.
   const [finalPrompt, setFinalPrompt] = useState(null);
   // When set, the edit dialog is open for this repair.
   const [editing, setEditing] = useState(null);
-  const openRepairs = reports.filter((report) =>
+  // Free-text search across ticket #, customer name/phone, date, and store.
+  const [search, setSearch] = useState("");
+  const allOpenRepairs = reports.filter((report) =>
     report.type === "repair" && !["Completed", "Cancelled"].includes(report.details?.status),
   );
+
+  const query = search.trim().toLowerCase();
+  const openRepairs = query
+    ? allOpenRepairs.filter((repair) => {
+        const haystack = [
+          repair.details?.ticketNumber,
+          repair.details?.customerName,
+          repair.customerPhone,
+          repair.location,
+          shortStoreName(repair.location),
+          repair.details?.technician,
+          formatShortDate(repair.createdAt),
+        ]
+          .filter(Boolean)
+          .join(" ")
+          .toLowerCase();
+        return haystack.includes(query);
+      })
+    : allOpenRepairs;
 
   // Marking a repair "Ready" requires the final price. Open the dialog first (any
   // other status change just persists). The estimate pre-fills the dialog.
@@ -3113,6 +3174,14 @@ function OpenRepairsPage({ reports, onStatusChange, onSetReady, onMarkPaid, onEd
           <p className="eyebrow">Repair queue</p>
           <h2>Open repairs</h2>
         </div>
+        <input
+          className="pos-search"
+          type="search"
+          value={search}
+          onChange={(event) => setSearch(event.target.value)}
+          placeholder="Search ticket, name, date, store…"
+          aria-label="Search repairs"
+        />
         <span className="metric">Open <strong>{openRepairs.length}</strong></span>
       </div>
 
@@ -3127,6 +3196,7 @@ function OpenRepairsPage({ reports, onStatusChange, onSetReady, onMarkPaid, onEd
               <th>Phone</th>
               <th>Damage</th>
               <th>Payment</th>
+              <th>Technician</th>
               <th>Served by</th>
               <th>Status</th>
               <th></th>
@@ -3140,10 +3210,20 @@ function OpenRepairsPage({ reports, onStatusChange, onSetReady, onMarkPaid, onEd
                 const needsTerminal = isCardPayment(repair.paymentMethod);
                 return (
                   <tr key={repair.id}>
-                    <td><strong>{repair.details?.ticketNumber || "-"}</strong></td>
+                    <td>
+                      <strong>{repair.details?.ticketNumber || "-"}</strong>
+                      {repair.details?.originalTicket ? (
+                        <div className="muted">↩ follow-up of #{repair.details.originalTicket}</div>
+                      ) : null}
+                    </td>
                     <td>{formatShortDate(repair.createdAt)}</td>
-                    <td>{repair.location || repair.details?.location || "-"}</td>
-                    <td>{repair.customerPhone || "-"}</td>
+                    <td>{shortStoreName(repair.location || repair.details?.location) || "-"}</td>
+                    <td>
+                      <div>{repair.details?.customerName || repair.customerPhone || "-"}</div>
+                      {repair.details?.customerName && repair.customerPhone ? (
+                        <div className="muted">{repair.customerPhone}</div>
+                      ) : null}
+                    </td>
                     <td>{repair.details?.model || "-"}</td>
                     <td>{repair.details?.damage || "-"}</td>
                     <td>
@@ -3179,6 +3259,21 @@ function OpenRepairsPage({ reports, onStatusChange, onSetReady, onMarkPaid, onEd
                         <p className={paying.status === "error" ? "summary-error" : "muted"}>{paying.message}</p>
                       ) : null}
                     </td>
+                    <td>
+                      <select
+                        className="status-select"
+                        value={repair.details?.technician || ""}
+                        onChange={(event) => onEditRepair(repair.id, { details: { technician: event.target.value } })}
+                      >
+                        <option value="">Unassigned</option>
+                        {employees.map((employee) => (
+                          <option key={employee}>{employee}</option>
+                        ))}
+                        {repair.details?.technician && !employees.includes(repair.details.technician) ? (
+                          <option value={repair.details.technician}>{repair.details.technician}</option>
+                        ) : null}
+                      </select>
+                    </td>
                     <td>{repair.servedBy || "-"}</td>
                     <td>
                       <select
@@ -3201,7 +3296,9 @@ function OpenRepairsPage({ reports, onStatusChange, onSetReady, onMarkPaid, onEd
               })
             ) : (
               <tr>
-                <td colSpan="10" className="empty-state">No open repairs.</td>
+                <td colSpan="11" className="empty-state">
+                  {query ? "No repairs match your search." : "No open repairs."}
+                </td>
               </tr>
             )}
           </tbody>
@@ -3220,6 +3317,7 @@ function OpenRepairsPage({ reports, onStatusChange, onSetReady, onMarkPaid, onEd
       {editing ? (
         <EditRepairDialog
           repair={editing}
+          employees={employees}
           onSave={(patch) => {
             onEditRepair(editing.id, patch);
             setEditing(null);
@@ -3231,7 +3329,7 @@ function OpenRepairsPage({ reports, onStatusChange, onSetReady, onMarkPaid, onEd
   );
 }
 
-function EditRepairDialog({ repair, onSave, onClose }) {
+function EditRepairDialog({ repair, employees = [], onSave, onClose }) {
   const details = repair.details || {};
   const [form, setForm] = useState({
     model: details.model || "",
@@ -3243,6 +3341,8 @@ function EditRepairDialog({ repair, onSave, onClose }) {
     notificationPreference: details.notificationPreference || "Text message",
     paymentMethod: repair.paymentMethod || "",
     customerPhone: repair.customerPhone || "",
+    technician: details.technician || "",
+    originalTicket: details.originalTicket || "",
     notes: repair.notes || "",
   });
 
@@ -3266,6 +3366,8 @@ function EditRepairDialog({ repair, onSave, onClose }) {
         finalPrice: String(form.finalPrice ?? "").trim(),
         dueDate: form.dueDate,
         notificationPreference: form.notificationPreference,
+        technician: form.technician.trim(),
+        originalTicket: String(form.originalTicket ?? "").trim(),
       },
     });
   }
@@ -3282,6 +3384,17 @@ function EditRepairDialog({ repair, onSave, onClose }) {
           <label className="field"><span>Estimated price</span><input value={form.estimatedPrice} inputMode="decimal" placeholder="0.00" onChange={(event) => set("estimatedPrice", event.target.value)} /></label>
           <label className="field"><span>Final price</span><input value={form.finalPrice} inputMode="decimal" placeholder="0.00" onChange={(event) => set("finalPrice", event.target.value)} /></label>
           <label className="field"><span>Expected ready date</span><input type="date" value={form.dueDate} onChange={(event) => set("dueDate", event.target.value)} /></label>
+          <label className="field">
+            <span>Repair technician</span>
+            <select value={form.technician} onChange={(event) => set("technician", event.target.value)}>
+              <option value="">Unassigned</option>
+              {employees.map((employee) => <option key={employee}>{employee}</option>)}
+              {form.technician && !employees.includes(form.technician) ? (
+                <option value={form.technician}>{form.technician}</option>
+              ) : null}
+            </select>
+          </label>
+          <label className="field"><span>Follow-up of ticket #</span><input value={form.originalTicket} inputMode="numeric" placeholder="Original ticket, if returned" onChange={(event) => set("originalTicket", event.target.value)} /></label>
           <label className="field">
             <span>Payment method</span>
             <select value={form.paymentMethod} onChange={(event) => set("paymentMethod", event.target.value)}>
@@ -4634,10 +4747,13 @@ function DeliveryBoard({ orders, activeEmployee, sessionRole, activeLocation, on
   );
 }
 
-function PosPage({ products, activeEmployee, activeLocation, activeDeviceId, activeTaxRate, activeStoreInfo, onSaveCustomerName, onSaveCustomer, onCompleteSale }) {
+function PosPage({ products, storeLocations = [], activeEmployee, activeLocation, activeDeviceId, activeTaxRate, activeStoreInfo, onSaveCustomerName, onSaveCustomer, onSaveProduct, onCompleteSale }) {
   const [cart, setCart] = useState([]);
   const [scan, setScan] = useState("");
   const [scanMode, setScanMode] = useState(true);
+  // When set, the restock dialog is open for this product (add stock without
+  // leaving checkout).
+  const [restock, setRestock] = useState(null);
   // Customer resolved by the phone field (queried on demand) for the receipt/CRM.
   const [resolvedCustomer, setResolvedCustomer] = useState(null);
   const [productSearch, setProductSearch] = useState("");
@@ -4830,6 +4946,20 @@ function PosPage({ products, activeEmployee, activeLocation, activeDeviceId, act
 
   function removeLine(lineId) {
     setCart((current) => current.filter((line) => line.lineId !== lineId));
+  }
+
+  // Add stock to a product straight from checkout (e.g. a scanned item that just
+  // came in). Mirrors Inventory's restock so counts stay consistent.
+  function addStock(product, { addQuantity, newImeis, location, barcode }) {
+    if (!onSaveProduct || !product) return;
+    const nextLocation = location === undefined ? product.location : location;
+    const barcodePatch = barcode && !product.barcode ? { barcode: String(barcode).trim() } : {};
+    if (product.requiresImei) {
+      onSaveProduct({ ...product, location: nextLocation, ...barcodePatch, imeis: [...(product.imeis || []), ...newImeis] });
+    } else {
+      onSaveProduct({ ...product, location: nextLocation, ...barcodePatch, quantity: (Number(product.quantity) || 0) + addQuantity });
+    }
+    setMessage(`Restocked ${product.name}.`);
   }
 
   const subtotal = cart.reduce((sum, line) => sum + effectiveLinePrice(line) * line.qty, 0);
@@ -5140,8 +5270,21 @@ function PosPage({ products, activeEmployee, activeLocation, activeDeviceId, act
                         )}
                       </td>
                       <td>{formatMoney(unitPrice * line.qty)}</td>
-                      <td>
-                        <button className="secondary-button" type="button" onClick={() => removeLine(line.lineId)}>
+                      <td className="pos-row-actions">
+                        {!line.isCustom && onSaveProduct ? (
+                          <button
+                            className="secondary-button compact-button"
+                            type="button"
+                            onClick={() => {
+                              const product = products.find((item) => item.id === line.productId);
+                              if (product) setRestock(product);
+                              else setMessage("This item isn't in inventory, so it can't be restocked.");
+                            }}
+                          >
+                            Restock
+                          </button>
+                        ) : null}
+                        <button className="secondary-button compact-button" type="button" onClick={() => removeLine(line.lineId)}>
                           Remove
                         </button>
                       </td>
@@ -5336,6 +5479,19 @@ function PosPage({ products, activeEmployee, activeLocation, activeDeviceId, act
 
       {completedSale ? (
         <SaleReceiptDialog sale={completedSale} onClose={startNewSale} />
+      ) : null}
+
+      {restock ? (
+        <RestockDialog
+          product={restock}
+          storeLocations={storeLocations}
+          onClose={() => setRestock(null)}
+          onAddStock={(payload) => {
+            addStock(restock, payload);
+            setRestock(null);
+            scanRef.current?.focus();
+          }}
+        />
       ) : null}
     </div>
   );
@@ -7109,6 +7265,7 @@ function RentalReportActions({ report, onUpdate }) {
   const details = report.details || {};
   const [busy, setBusy] = useState("");
   const [message, setMessage] = useState("");
+  const [editing, setEditing] = useState(false);
   const rentalId = details.rentalId;
   const cancelled = details.rentalStatus === "Cancelled";
   const hasNumbers = Boolean(details.cli);
@@ -7175,6 +7332,9 @@ function RentalReportActions({ report, onUpdate }) {
 
   return (
     <div className="rental-actions">
+      <button className="secondary-button compact-button" type="button" onClick={() => setEditing(true)}>
+        Edit rental
+      </button>
       {cancelled ? (
         <span className="status-pill returned">Cancelled</span>
       ) : (
@@ -7190,7 +7350,169 @@ function RentalReportActions({ report, onUpdate }) {
         </>
       )}
       {message ? <span className="muted">{message}</span> : null}
+      {editing ? (
+        <RentalEditDialog
+          report={report}
+          onSave={(patch) => {
+            onUpdate(report.id, patch);
+            setEditing(false);
+            setMessage("Rental updated.");
+          }}
+          onClose={() => setEditing(false)}
+        />
+      ) : null}
     </div>
+  );
+}
+
+function RentalEditDialog({ report, onSave, onClose }) {
+  const details = report.details || {};
+  // A rental with an RCUK rental_id is live on RCUK; editing it pushes the change
+  // to RCUK's system (after a confirm). Without one, it's a local-only record.
+  const rentalId = details.rentalId;
+  const isRcuk = Boolean(rentalId);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [form, setForm] = useState({
+    customerPhone: report.customerPhone || "",
+    paymentAmount: report.paymentAmount || "",
+    paymentMethod: report.paymentMethod || "",
+    serviceType: details.serviceType || "Voice",
+    startDate: details.startDate || "",
+    endDate: details.endDate || "",
+    ukDays: details.ukDays ?? "",
+    euDays: details.euDays ?? "",
+    wtsDays: details.wtsDays ?? "",
+    addSms: details.addSms === "Yes",
+    usaNumber: details.usaNumber === "Yes",
+    simNumber: details.simNumber || "",
+    model: details.model || "",
+    imei: details.imei || "",
+    notes: report.notes || "",
+  });
+  const set = (name, value) => setForm((current) => ({ ...current, [name]: value }));
+
+  function localPatch() {
+    return {
+      customerPhone: form.customerPhone.trim(),
+      paymentAmount: String(form.paymentAmount ?? "").trim(),
+      paymentMethod: form.paymentMethod,
+      notes: form.notes.trim(),
+      details: {
+        serviceType: form.serviceType,
+        startDate: form.startDate,
+        endDate: form.endDate,
+        ukDays: Number(form.ukDays) || 0,
+        euDays: Number(form.euDays) || 0,
+        wtsDays: Number(form.wtsDays) || 0,
+        addSms: form.addSms ? "Yes" : "No",
+        usaNumber: form.usaNumber ? "Yes" : "No",
+        simNumber: form.simNumber.trim(),
+        model: form.model.trim(),
+        imei: form.imei.trim(),
+      },
+    };
+  }
+
+  async function submit(event) {
+    event.preventDefault();
+    event.stopPropagation();
+
+    if (isRcuk) {
+      if (!window.confirm("Are you sure you want to edit this rental in the RCUK LIVE system?")) return;
+      if (!FUNCTIONS_BASE_URL) { setError("Functions URL not configured."); return; }
+      setBusy(true);
+      setError("");
+      try {
+        const response = await fetch(`${FUNCTIONS_BASE_URL}/rcukUpdateRental`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            rental_id: rentalId,
+            sim_number: form.simNumber.trim(),
+            service_type: form.serviceType,
+            start_date: form.startDate,
+            end_date: form.endDate,
+            uk_days: Number(form.ukDays) || 0,
+            eu_days: Number(form.euDays) || 0,
+            wts_days: Number(form.wtsDays) || 0,
+            add_sms: form.addSms ? "yes" : "no",
+            usa_number: form.usaNumber ? "yes" : "no",
+            customer_phone: form.customerPhone.trim(),
+            notes: form.notes.trim(),
+          }),
+        });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok || !data.ok) {
+          setError(data.message || "RCUK could not update the rental.");
+          setBusy(false);
+          return;
+        }
+      } catch (err) {
+        setError(err.message || "Could not reach RCUK.");
+        setBusy(false);
+        return;
+      }
+      setBusy(false);
+    }
+
+    // Persist our local copy once RCUK has accepted (or for local-only rentals).
+    onSave(localPatch());
+  }
+
+  return createPortal(
+    <div className="dialog-backdrop" role="presentation" onMouseDown={onClose}>
+      <div className="dialog-card dialog-card-wide" role="dialog" aria-modal="true" onMouseDown={(event) => event.stopPropagation()}>
+        <h2>Edit rental{rentalId ? ` #${rentalId}` : ""}</h2>
+        <p className={isRcuk ? "summary-error" : "muted"}>
+          {isRcuk
+            ? "⚠ This rental is live on RCUK. Saving updates the real rental on RCUK's system — you'll be asked to confirm."
+            : "This rental has no RCUK ID, so changes are saved locally only."}
+        </p>
+        <form className="form-grid" onSubmit={submit}>
+          <label className="field"><span>Customer phone</span><input value={form.customerPhone} inputMode="tel" onChange={(event) => set("customerPhone", event.target.value)} autoFocus /></label>
+          <label className="field"><span>Payment amount</span><input value={form.paymentAmount} inputMode="decimal" placeholder="0.00" onChange={(event) => set("paymentAmount", event.target.value)} /></label>
+          <label className="field">
+            <span>Payment method</span>
+            <select value={form.paymentMethod} onChange={(event) => set("paymentMethod", event.target.value)}>
+              <option value="" disabled>Select one</option>
+              {paymentMethods.map((method) => <option key={method}>{method}</option>)}
+            </select>
+          </label>
+          <label className="field">
+            <span>Service{isRcuk ? " (RCUK)" : ""}</span>
+            <select value={form.serviceType} onChange={(event) => set("serviceType", event.target.value)}>
+              {["Voice", "Data", "Voice & Data"].map((option) => <option key={option}>{option}</option>)}
+            </select>
+          </label>
+          <label className="field"><span>Start date{isRcuk ? " (RCUK)" : ""}</span><input type="date" value={form.startDate} onChange={(event) => set("startDate", event.target.value)} /></label>
+          <label className="field"><span>End date{isRcuk ? " (RCUK)" : ""}</span><input type="date" value={form.endDate} onChange={(event) => set("endDate", event.target.value)} /></label>
+          <label className="field"><span>UK days{isRcuk ? " (RCUK)" : ""}</span><input value={form.ukDays} inputMode="numeric" onChange={(event) => set("ukDays", event.target.value)} /></label>
+          <label className="field"><span>EU days{isRcuk ? " (RCUK)" : ""}</span><input value={form.euDays} inputMode="numeric" onChange={(event) => set("euDays", event.target.value)} /></label>
+          <label className="field"><span>WTS days{isRcuk ? " (RCUK)" : ""}</span><input value={form.wtsDays} inputMode="numeric" onChange={(event) => set("wtsDays", event.target.value)} /></label>
+          <label className="field"><span>SIM number{isRcuk ? " (RCUK)" : ""}</span><input value={form.simNumber} inputMode="numeric" onChange={(event) => set("simNumber", event.target.value)} /></label>
+          <label className="field"><span>Phone model</span><input value={form.model} onChange={(event) => set("model", event.target.value)} /></label>
+          <label className="field"><span>IMEI</span><input value={form.imei} inputMode="numeric" onChange={(event) => set("imei", event.target.value)} /></label>
+          <label className="field checkbox-field">
+            <input type="checkbox" checked={form.addSms} onChange={(event) => set("addSms", event.target.checked)} />
+            <span>Add SMS{isRcuk ? " (RCUK)" : ""}</span>
+          </label>
+          <label className="field checkbox-field">
+            <input type="checkbox" checked={form.usaNumber} onChange={(event) => set("usaNumber", event.target.checked)} />
+            <span>USA number{isRcuk ? " (RCUK)" : ""}</span>
+          </label>
+          <label className="field full"><span>Notes</span><textarea rows={2} value={form.notes} onChange={(event) => set("notes", event.target.value)} /></label>
+          {error ? <p className="summary-error full">{error}</p> : null}
+          <div className="pos-form-actions form-actions-row">
+            <button className="primary-button" type="submit" disabled={busy}>
+              {busy ? "Updating RCUK…" : isRcuk ? "Update on RCUK & save" : "Save changes"}
+            </button>
+            <button className="secondary-button" type="button" onClick={onClose} disabled={busy}>Cancel</button>
+          </div>
+        </form>
+      </div>
+    </div>,
+    document.body,
   );
 }
 
