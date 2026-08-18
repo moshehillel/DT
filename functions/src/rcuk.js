@@ -22,6 +22,18 @@ function numberOrZero(value) {
   return Number.isFinite(num) ? num : 0;
 }
 
+// RCUK answers HTTP 200 even when the operation failed, putting the real outcome
+// in the body: {"status":"Failed","message":"Invalid SIM Entered"}. Judging the
+// call by HTTP status alone read those as success — a rejected SIM looked checked,
+// and a failed activation looked "submitted" with no rental ID. Only an explicit
+// failure word counts, so whatever wording RCUK uses for success still passes.
+const RCUK_FAILURE_STATUSES = ["failed", "fail", "error", "declined", "rejected", "invalid"];
+
+function isRcukFailureBody(data) {
+  const status = String(data?.status ?? data?.Status ?? "").trim().toLowerCase();
+  return RCUK_FAILURE_STATUSES.includes(status);
+}
+
 function mapRentalPackage(value) {
   const normalized = String(value || "").trim().toLowerCase();
   if (["v&d", "voice and data", "voice & data", "voice+data", "both"].includes(normalized)) return "v&d";
@@ -62,6 +74,7 @@ function buildRcukRentalPayload(payload) {
 module.exports = {
   buildRcukRentalPayload,
   digitsOnly,
+  isRcukFailureBody,
   mapRentalPackage,
   normalizeRcukSimNumber,
   numberOrZero,

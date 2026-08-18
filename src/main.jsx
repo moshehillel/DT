@@ -7,6 +7,7 @@ import {
   CUSTOMERS_KEY,
   defaultManualReportType,
   defaultOrderHandlers,
+  DISMISSED_NOTICES_KEY,
   FUNCTIONS_BASE_URL,
   isCardPayment,
   lookupRepairPrice,
@@ -20,6 +21,9 @@ import {
   PHONE_ORDERS_KEY,
   productCategories,
   PRODUCTS_KEY,
+  RENTAL_PHONE_IN_STORE,
+  RENTAL_PHONE_WITH_CUSTOMER,
+  RENTAL_PHONES_KEY,
   repairStatuses,
   reportTypes,
   RESET_REQUESTS_KEY,
@@ -48,6 +52,7 @@ import { chargeOnLocalTerminal } from "./bbposTerminal";
 import {
   buildAppNotifications,
   calculateInclusiveDays,
+  calculateRentalLateFee,
   calculateRentalPrice,
   calculateReturnDueDate,
   code128Svg,
@@ -72,6 +77,8 @@ import {
   parsePriceAdjust,
   playScanBeep,
   playScanError,
+  readJson,
+  startOfDay,
   titleCaseName,
   toJsDate,
   unionByName,
@@ -149,6 +156,7 @@ function Workspace({ currentUser, isAdmin }) {
     { enabled: isAdmin },
   );
   const [products, setProducts] = useCloudCollectionState("products", PRODUCTS_KEY, []);
+  const [rentalPhones, setRentalPhones] = useCloudCollectionState("rentalPhones", RENTAL_PHONES_KEY, []);
   const [stores, setStores] = useCloudDocumentState("stores", STORES_KEY, []);
   // Customers are queried on demand (see findCustomerByPhone / CustomersPage) —
   // never bulk-loaded — so a 10k+ CRM doesn't cost a read on every app load.
@@ -180,6 +188,8 @@ function Workspace({ currentUser, isAdmin }) {
   // null = still checking, true = reaching the cloud, false = blocked/offline.
   const [cloudOnline, setCloudOnline] = useState(null);
   const [filters, setFilters] = useState(createEmptyFilters);
+  // Ids of "Needs attention" notices this device has dismissed.
+  const [dismissedNotices, setDismissedNotices] = useState(() => readJson(DISMISSED_NOTICES_KEY, []));
   const [formNonce, setFormNonce] = useState(0);
   const [returnTarget, setReturnTarget] = useState(null);
 
@@ -337,9 +347,23 @@ function Workspace({ currentUser, isAdmin }) {
     const visibleReportIds = new Set(reports.map((report) => report.id));
     return notifications.filter((notice) => visibleReportIds.has(notice.reportId));
   }, [notifications, reports]);
-  const appNotifications = useMemo(() => {
-    return buildAppNotifications(reports);
-  }, [reports]);
+  const rentalNotices = useMemo(() => buildAppNotifications(reports), [reports]);
+  const appNotifications = useMemo(
+    () => rentalNotices.filter((notice) => !dismissedNotices.includes(notice.id)),
+    [rentalNotices, dismissedNotices],
+  );
+
+  // Hide one notice on this device. Dismissals of notices that no longer fire (the
+  // rental came back) are dropped on the way out, so the stored list can't grow
+  // without bound.
+  function dismissNotification(id) {
+    setDismissedNotices((current) => {
+      const live = new Set(rentalNotices.map((notice) => notice.id));
+      const next = [...new Set([...current.filter((entry) => live.has(entry)), id])];
+      localStorage.setItem(DISMISSED_NOTICES_KEY, JSON.stringify(next));
+      return next;
+    });
+  }
 
   function addStoreLocation(store) {
     const name = String((typeof store === "string" ? store : store?.name) || "").trim();
@@ -932,6 +956,13 @@ function Workspace({ currentUser, isAdmin }) {
     if (typeof top.customerPhone === "string") {
       top.customerPhoneDigits = digitsOnly(top.customerPhone);
     }
+    // Marking a rental returned (or cancelled) puts its handset back on the shelf,
+    // so the fleet list never shows a phone as out once it's physically back.
+    if (detailsPatch.returnedAt || detailsPatch.rentalStatus === "Cancelled") {
+      const report = reports.find((entry) => entry.id === reportId);
+      const phoneId = report?.details?.rentalPhoneId;
+      if (phoneId) releaseRentalPhone(phoneId);
+    }
     setReports((current) =>
       current.map((report) =>
         report.id === reportId
@@ -939,6 +970,55 @@ function Workspace({ currentUser, isAdmin }) {
           : report,
       ),
     );
+  }
+
+  // --- Rental phone fleet ----------------------------------------------------
+  function saveRentalPhone(phone) {
+    const imei = digitsOnly(phone?.imei);
+    const name = String(phone?.name || "").trim();
+    if (!imei) return null;
+    const existing = rentalPhones.find((entry) => digitsOnly(entry.imei) === imei);
+    const record = {
+      id: phone.id || existing?.id || crypto.randomUUID(),
+      name: name || existing?.name || "Phone",
+      imei,
+      status: phone.status || existing?.status || RENTAL_PHONE_IN_STORE,
+      rentalReportId: phone.rentalReportId ?? existing?.rentalReportId ?? "",
+      customerPhone: phone.customerPhone ?? existing?.customerPhone ?? "",
+      updatedAt: Date.now(),
+    };
+    setRentalPhones((current) => [
+      ...current.filter((entry) => entry.id !== record.id),
+      record,
+    ]);
+    return record;
+  }
+
+  // Hand a phone to a customer: flag it out and link it to the rental it went with.
+  function issueRentalPhone(phoneId, { reportId, customerPhone }) {
+    setRentalPhones((current) =>
+      current.map((entry) => (entry.id === phoneId
+        ? {
+          ...entry,
+          status: RENTAL_PHONE_WITH_CUSTOMER,
+          rentalReportId: reportId || "",
+          customerPhone: customerPhone || "",
+          updatedAt: Date.now(),
+        }
+        : entry)),
+    );
+  }
+
+  function releaseRentalPhone(phoneId) {
+    setRentalPhones((current) =>
+      current.map((entry) => (entry.id === phoneId
+        ? { ...entry, status: RENTAL_PHONE_IN_STORE, rentalReportId: "", customerPhone: "", updatedAt: Date.now() }
+        : entry)),
+    );
+  }
+
+  function removeRentalPhone(phoneId) {
+    setRentalPhones((current) => current.filter((entry) => entry.id !== phoneId));
   }
 
   function queueDeliveryNotification(report) {
@@ -1126,10 +1206,16 @@ function Workspace({ currentUser, isAdmin }) {
     const returnLines = (selection.returnLines || []).filter((line) => Number(line.returnQty) > 0);
     if (!returnLines.length) return;
 
-    const refundTotal = returnLines.reduce(
+    const refundSubtotal = returnLines.reduce(
       (sum, line) => sum + (Number(line.price) || 0) * (Number(line.returnQty) || 0),
       0,
     );
+    // The dialog computes the tax to refund from the original sale's rate; fall
+    // back to the bare subtotal if an older caller didn't send the breakdown.
+    const refundTax = Number(selection.refundTax) || 0;
+    const refundTotal = Number.isFinite(Number(selection.refundTotal))
+      ? Number(selection.refundTotal)
+      : refundSubtotal + refundTax;
     const itemsText = returnLines
       .map((line) => `${line.returnQty}x ${line.name}${line.imei ? ` (IMEI ${line.imei})` : ""}`)
       .join(", ");
@@ -1151,6 +1237,9 @@ function Workspace({ currentUser, isAdmin }) {
         request: "Return / refund",
         originalReportId: original.id,
         refundMethod: selection.refundMethod || original.paymentMethod || "",
+        refundSubtotal: refundSubtotal.toFixed(2),
+        refundTax: refundTax.toFixed(2),
+        taxRate: Number(selection.taxRate) || 0,
         refundTotal: refundTotal.toFixed(2),
         solaRefundRef: selection.solaRefundRef || "",
         itemsText,
@@ -1272,7 +1361,7 @@ function Workspace({ currentUser, isAdmin }) {
           </button>
         </div>
 
-        <NotificationCenter notifications={appNotifications} />
+        <NotificationCenter notifications={appNotifications} onDismiss={dismissNotification} />
 
         {activeView === "pendingReports" ? (
           <PendingReportsPage
@@ -1309,6 +1398,9 @@ function Workspace({ currentUser, isAdmin }) {
               activeStoreInfo={activeStoreInfo}
               onSaveCustomerName={saveCustomerName}
               onSaveCustomer={saveCustomer}
+              rentalPhones={rentalPhones}
+              onSaveRentalPhone={saveRentalPhone}
+              onIssueRentalPhone={issueRentalPhone}
               onSave={saveReport}
             />
           ) : activeType === "phoneOrder" ? (
@@ -1348,6 +1440,7 @@ function Workspace({ currentUser, isAdmin }) {
         ) : activeView === "reportsLog" ? (
           <ReportHistory
             employees={visibleEmployees}
+            activeEmployee={activeEmployee}
             storeLocations={storeLocations}
             reports={filteredReports}
             filters={filters}
@@ -1385,6 +1478,10 @@ function Workspace({ currentUser, isAdmin }) {
             sessionRole={sessionRole}
             onSaveProduct={saveProduct}
             onRemoveProduct={removeProduct}
+            rentalPhones={rentalPhones}
+            onSaveRentalPhone={saveRentalPhone}
+            onReleaseRentalPhone={releaseRentalPhone}
+            onRemoveRentalPhone={removeRentalPhone}
           />
         ) : (
           <AdminPage
@@ -2074,20 +2171,42 @@ function DynamicField({ field, onValueChange }) {
   );
 }
 
-function NotificationCenter({ notifications }) {
+function NotificationCenter({ notifications, onDismiss }) {
   if (!notifications.length) return null;
 
   return (
     <section className="notification-center">
-      <div>
-        <p className="eyebrow">Notifications</p>
-        <h2>Needs attention</h2>
+      <div className="notification-center-head">
+        <div>
+          <p className="eyebrow">Notifications</p>
+          <h2>Needs attention</h2>
+        </div>
+        {notifications.length > 1 ? (
+          <button
+            className="secondary-button compact-button"
+            type="button"
+            onClick={() => notifications.forEach((notification) => onDismiss(notification.id))}
+          >
+            Dismiss all
+          </button>
+        ) : null}
       </div>
       <div className="notification-list">
         {notifications.map((notification) => (
           <article className={`app-notification ${notification.severity}`} key={notification.id}>
-            <strong>{notification.title}</strong>
-            <p>{notification.message}</p>
+            <div className="app-notification-body">
+              <strong>{notification.title}</strong>
+              <p>{notification.message}</p>
+            </div>
+            <button
+              className="notification-dismiss"
+              type="button"
+              aria-label={`Dismiss ${notification.title}`}
+              title="Dismiss"
+              onClick={() => onDismiss(notification.id)}
+            >
+              ×
+            </button>
           </article>
         ))}
       </div>
@@ -2095,7 +2214,17 @@ function NotificationCenter({ notifications }) {
   );
 }
 
-function RentalReportForm({ activeEmployee, activeLocation, activeStoreInfo, onSaveCustomerName, onSaveCustomer, onSave }) {
+function RentalReportForm({
+  activeEmployee,
+  activeLocation,
+  activeStoreInfo,
+  onSaveCustomerName,
+  onSaveCustomer,
+  rentalPhones = [],
+  onSaveRentalPhone,
+  onIssueRentalPhone,
+  onSave,
+}) {
   const [now, setNow] = useState(new Date());
   const [form, setForm] = useState({
     rentalRegion: "RCUK",
@@ -2110,9 +2239,13 @@ function RentalReportForm({ activeEmployee, activeLocation, activeStoreInfo, onS
     deviceKind: "SIM only",
     model: "",
     imei: "",
+    // Which fleet handset was handed over (empty for SIM-only rentals).
+    rentalPhoneId: "",
     simNumber: "",
     returnDays: "",
     paymentMethod: "",
+    // Blank = charge the calculated price. Any number here overrides it.
+    priceOverride: "",
     returnReminderPreference: "Text message",
     lateFeeWeekly: "",
     customerPhone: "",
@@ -2142,6 +2275,7 @@ function RentalReportForm({ activeEmployee, activeLocation, activeStoreInfo, onS
     raw: null,
   });
   const solaTokenRef = useRef("");
+  const [addPhoneOpen, setAddPhoneOpen] = useState(false);
   // Card-present terminal state (Verifone P200 / Sola BBPOS), same as the POS.
   const [card, setCard] = useState({ status: "idle", message: "", refNum: "", cardType: "", maskedCardNumber: "" });
   const [cardEntryMode, setCardEntryMode] = useState("terminal");
@@ -2155,7 +2289,13 @@ function RentalReportForm({ activeEmployee, activeLocation, activeStoreInfo, onS
   const zoneDays = numberValue(form.ukDays) + numberValue(form.euDays) + numberValue(form.wtsDays);
   const rentalPricing = calculateRentalPrice(form, totalDays);
   const dailyRate = rentalPricing.dailyRate;
-  const totalPrice = rentalPricing.totalPrice;
+  // The formula gives the standard price; an employee can charge something else
+  // (discount, deposit, agreed rate). Both are kept so the report shows what was
+  // charged AND what it would have been.
+  const calculatedPrice = rentalPricing.totalPrice;
+  const overrideAmount = Number.parseFloat(form.priceOverride);
+  const hasPriceOverride = form.priceOverride.trim() !== "" && Number.isFinite(overrideAmount) && overrideAmount >= 0;
+  const totalPrice = hasPriceOverride ? overrideAmount : calculatedPrice;
   const isRcukRental = form.rentalRegion === "RCUK";
   const isSimpleRental = !isRcukRental;
   const normalizedSimNumber = normalizeRcukSimNumber(form.simNumber);
@@ -2176,11 +2316,32 @@ function RentalReportForm({ activeEmployee, activeLocation, activeStoreInfo, onS
     ? isRentalFormComplete(form) && minimumDaysValid && totalPrice > 0 && cardChargeComplete
     : rentalSubmitted && submitState.getNumbersAttempted && cardChargeComplete;
 
+  // Only a real handset needs a fleet phone; a SIM-only rental doesn't.
+  const needsHandset = form.deviceKind !== "SIM only";
+  // Phones on the shelf, plus whichever one is already picked on this form so it
+  // doesn't vanish from its own dropdown.
+  const availableFleetPhones = useMemo(
+    () => rentalPhones.filter((phone) => phone.status !== RENTAL_PHONE_WITH_CUSTOMER || phone.id === form.rentalPhoneId),
+    [rentalPhones, form.rentalPhoneId],
+  );
+
+  // Picking a fleet phone fills the model and IMEI from the registry, so the
+  // report and the fleet can't describe the same handset differently.
+  function selectFleetPhone(phoneId) {
+    const phone = rentalPhones.find((entry) => entry.id === phoneId);
+    setForm((current) => ({
+      ...current,
+      rentalPhoneId: phoneId,
+      imei: phone?.imei || "",
+      model: phone?.name || current.model,
+    }));
+  }
+
   function updateField(name, value) {
     setForm((current) => ({ ...current, [name]: value }));
     // A change that moves the price or the payment method invalidates any card
     // charge already taken — force it to be run again for the new amount.
-    if (["paymentMethod", "customerPhone", "startDate", "endDate", "serviceType", "addSms", "rentalRegion", "ukDays", "euDays", "wtsDays"].includes(name)) {
+    if (["paymentMethod", "priceOverride", "customerPhone", "startDate", "endDate", "serviceType", "addSms", "rentalRegion", "ukDays", "euDays", "wtsDays"].includes(name)) {
       setCard({ status: "idle", message: "", refNum: "", cardType: "", maskedCardNumber: "" });
     }
     setSubmitState((current) => (
@@ -2516,6 +2677,7 @@ function RentalReportForm({ activeEmployee, activeLocation, activeStoreInfo, onS
         rentalType: form.deviceKind,
         model: form.model,
         imei: form.imei,
+        rentalPhoneId: form.rentalPhoneId,
         simNumber: isRcukRental ? normalizedSimNumber : form.simNumber.trim(),
         startDate: form.startDate,
         endDate: form.endDate,
@@ -2532,7 +2694,11 @@ function RentalReportForm({ activeEmployee, activeLocation, activeStoreInfo, onS
         cli: submitState.cli,
         usDdi: submitState.usDdi,
         dailyRate,
+        // What was actually charged, plus what the formula said, so a discount
+        // stays visible on the report instead of vanishing into the total.
         totalPrice,
+        calculatedPrice,
+        priceOverridden: hasPriceOverride ? "Yes" : "",
         pricingLabel: rentalPricing.label,
         location: activeLocation || "",
         storeAddress: activeStoreInfo?.address || "",
@@ -2545,6 +2711,11 @@ function RentalReportForm({ activeEmployee, activeLocation, activeStoreInfo, onS
     };
 
     onSave(report);
+    // The handset is now out with the customer — flag it so the fleet list and
+    // the next rental both know it isn't on the shelf.
+    if (form.rentalPhoneId && onIssueRentalPhone) {
+      onIssueRentalPhone(form.rentalPhoneId, { reportId: report.id, customerPhone: form.customerPhone });
+    }
     printRentalReceipt(report);
   }
 
@@ -2633,9 +2804,46 @@ function RentalReportForm({ activeEmployee, activeLocation, activeStoreInfo, onS
               <span>Phone model</span>
               <input value={form.model} onChange={(event) => updateField("model", event.target.value)} placeholder="Optional for SIM only" />
             </label>
+            {needsHandset ? (
+              /* A physical phone goes out, so pick it from the tracked fleet rather
+                 than retyping an IMEI — that's what keeps "who has which phone"
+                 accurate. Adding a new handset is available right in the list. */
+              <label className="field">
+                <span>Phone issued (from fleet)</span>
+                <select
+                  value={form.rentalPhoneId}
+                  onChange={(event) => {
+                    const value = event.target.value;
+                    if (value === "__add__") { setAddPhoneOpen(true); return; }
+                    selectFleetPhone(value);
+                  }}
+                >
+                  <option value="">Select a phone…</option>
+                  {availableFleetPhones.map((phone) => (
+                    <option key={phone.id} value={phone.id}>
+                      {phone.name} · {phone.imei}
+                    </option>
+                  ))}
+                  <option value="__add__">+ Add a phone / IMEI…</option>
+                </select>
+                <small className="muted">
+                  {availableFleetPhones.length
+                    ? `${availableFleetPhones.length} phone${availableFleetPhones.length === 1 ? "" : "s"} in store`
+                    : "No phones in store — add one to issue it."}
+                </small>
+              </label>
+            ) : null}
             <label className="field">
               <span>IMEI / device ID</span>
-              <input value={form.imei} onChange={(event) => updateField("imei", event.target.value)} inputMode="numeric" autoComplete="off" spellCheck={false} placeholder="Scan or type 15-digit IMEI" />
+              <input
+                value={form.imei}
+                onChange={(event) => updateField("imei", event.target.value)}
+                inputMode="numeric"
+                autoComplete="off"
+                spellCheck={false}
+                placeholder="Scan or type 15-digit IMEI"
+                readOnly={Boolean(form.rentalPhoneId)}
+              />
             </label>
             <label className="field">
               <div className="field-label-row">
@@ -2762,6 +2970,23 @@ function RentalReportForm({ activeEmployee, activeLocation, activeStoreInfo, onS
           <div className="summary-line"><span>Daily rate</span><strong>{formatMoney(dailyRate)}</strong></div>
           <div className="summary-line"><span>Pricing</span><strong>{rentalPricing.label}</strong></div>
           <div className="summary-line"><span>Total days</span><strong>{totalDays || 0}</strong></div>
+          {hasPriceOverride ? (
+            <div className="summary-line"><span>Calculated</span><strong>{formatMoney(calculatedPrice)}</strong></div>
+          ) : null}
+          <label className="field rental-price-override">
+            <span>Charge a different amount (optional)</span>
+            <input
+              inputMode="decimal"
+              value={form.priceOverride}
+              onChange={(event) => updateField("priceOverride", event.target.value)}
+              placeholder={calculatedPrice ? calculatedPrice.toFixed(2) : "0.00"}
+            />
+            <small className="muted">
+              {hasPriceOverride
+                ? `Charging ${formatMoney(totalPrice)} instead of the calculated ${formatMoney(calculatedPrice)}.`
+                : "Leave blank to charge the calculated price."}
+            </small>
+          </label>
           {isRcukRental ? (
             <div className={zoneDaysValid ? "summary-ok" : "summary-error"}>
               UK + EU + WTS: {zoneDays || 0} / {totalDays || 0}
@@ -2796,12 +3021,84 @@ function RentalReportForm({ activeEmployee, activeLocation, activeStoreInfo, onS
           ) : null}
         </aside>
       </div>
+
+      {addPhoneOpen ? (
+        <AddRentalPhoneDialog
+          existingPhones={rentalPhones}
+          onClose={() => setAddPhoneOpen(false)}
+          onAdd={(phone) => {
+            const saved = onSaveRentalPhone?.(phone);
+            if (saved) selectFleetPhone(saved.id);
+            setAddPhoneOpen(false);
+          }}
+        />
+      ) : null}
     </section>
+  );
+}
+
+// Register a handset into the rental fleet without leaving the rental form —
+// scan the IMEI, name it, and it's immediately selectable as the phone issued.
+function AddRentalPhoneDialog({ existingPhones = [], onAdd, onClose }) {
+  const [name, setName] = useState("");
+  const [imei, setImei] = useState("");
+  const [error, setError] = useState("");
+
+  function submit(event) {
+    event.preventDefault();
+    const cleanImei = digitsOnly(imei);
+    if (!cleanImei) { setError("Scan or type the phone's IMEI."); return; }
+    if (!name.trim()) { setError("Give the phone a name so staff can recognise it."); return; }
+    if (existingPhones.some((phone) => digitsOnly(phone.imei) === cleanImei)) {
+      setError("That IMEI is already in the fleet.");
+      return;
+    }
+    onAdd({ name: name.trim(), imei: cleanImei });
+  }
+
+  return createPortal(
+    <div className="dialog-backdrop" role="presentation" onMouseDown={onClose}>
+      <div className="dialog-card" role="dialog" aria-modal="true" onMouseDown={(event) => event.stopPropagation()}>
+        <div>
+          <p className="eyebrow">Rental fleet</p>
+          <h3>Add a phone</h3>
+        </div>
+        <form className="form-grid dialog-form" onSubmit={submit}>
+          <label className="field full">
+            <span>IMEI</span>
+            <input
+              value={imei}
+              onChange={(event) => { setImei(event.target.value); setError(""); }}
+              inputMode="numeric"
+              autoComplete="off"
+              spellCheck={false}
+              placeholder="Scan the IMEI"
+              autoFocus
+            />
+          </label>
+          <label className="field full">
+            <span>Phone name</span>
+            <input
+              value={name}
+              onChange={(event) => { setName(event.target.value); setError(""); }}
+              placeholder="e.g. Nokia 105 — blue"
+            />
+          </label>
+          {error ? <p className="summary-error full">{error}</p> : null}
+          <div className="pos-form-actions form-actions-row">
+            <button className="primary-button" type="submit">Add to fleet</button>
+            <button className="secondary-button" type="button" onClick={onClose}>Cancel</button>
+          </div>
+        </form>
+      </div>
+    </div>,
+    document.body,
   );
 }
 
 function ReportHistory({
   employees,
+  activeEmployee,
   storeLocations,
   reports,
   filters,
@@ -3031,6 +3328,7 @@ function ReportHistory({
                   onUpdateReport={onUpdateReport}
                   onDeleteReport={onDeleteReport}
                   onReturn={onReturn}
+                  activeEmployee={activeEmployee}
                   hasActions={hasActions}
                 />
               ))
@@ -4799,6 +5097,10 @@ function PosPage({ products, storeLocations = [], activeEmployee, activeLocation
     );
   }, [productSearch, availableProducts]);
 
+  // True once the search is long enough to actually be filtering, so the panel
+  // can tell "nothing typed yet" apart from "typed, but nothing matches".
+  const searching = productSearch.trim().length >= 2;
+
   function imeiLineStatus(line) {
     if (!line.requiresImei) return "ok";
     if (!line.imei) return "missing";
@@ -5300,46 +5602,77 @@ function PosPage({ products, storeLocations = [], activeEmployee, activeLocation
         <section className="history pos-quick-panel">
           <div className="history-header">
             <div>
-              <p className="eyebrow">Quick add</p>
-              <h2>Find a product</h2>
+              <p className="eyebrow">Inventory</p>
+              <h2>
+                Find a product
+                {searching ? <span className="pos-result-count">{quickAddProducts.length} found</span> : null}
+              </h2>
             </div>
-            <input
-              className="pos-search"
-              value={productSearch}
-              onChange={(event) => setProductSearch(event.target.value)}
-              placeholder="Search name, SKU, or barcode"
-              autoComplete="off"
-              spellCheck={false}
-            />
-          </div>
-          <div className="pos-quick-actions">
-            <button className="secondary-button" type="button" onClick={() => setCustomAmountOpen(true)}>
-              Custom item
-            </button>
+            <div className="pos-quick-actions">
+              <input
+                className="pos-search"
+                value={productSearch}
+                onChange={(event) => setProductSearch(event.target.value)}
+                placeholder="Search name, SKU, or barcode"
+                autoComplete="off"
+                spellCheck={false}
+              />
+              {productSearch ? (
+                <button
+                  className="secondary-button compact-button"
+                  type="button"
+                  onClick={() => { setProductSearch(""); scanRef.current?.focus(); }}
+                >
+                  Clear
+                </button>
+              ) : null}
+              <button className="secondary-button compact-button" type="button" onClick={() => setCustomAmountOpen(true)}>
+                Custom item
+              </button>
+            </div>
           </div>
           <div className="pos-product-grid">
             {quickAddProducts.length ? (
-              quickAddProducts.map((product) => (
-                <button
-                  className="pos-product"
-                  type="button"
-                  key={product.id}
-                  onClick={() => {
-                    if (addProductToCart(product)) setMessage(`Added ${product.name}.`);
-                    scanRef.current?.focus();
-                  }}
-                >
-                  <strong>{product.name}</strong>
-                  <span>{formatMoney(Number(product.price) || 0)}</span>
-                  <small className="muted">
-                    {product.requiresImei
-                      ? `In stock ${product.imeis?.length || 0} - IMEI`
-                      : `Stock ${Number(product.quantity) || 0}`}
-                  </small>
-                </button>
-              ))
+              quickAddProducts.map((product) => {
+                const stock = product.requiresImei ? product.imeis?.length || 0 : Number(product.quantity) || 0;
+                // Colour-code the count so a cashier sees at a glance what is
+                // running out, instead of reading a bare number.
+                const level = stock <= 0 ? "out" : stock <= 3 ? "low" : "ok";
+                const stockLabel = stock <= 0
+                  ? "Out of stock"
+                  : `${stock} in stock${product.requiresImei ? " · IMEI" : ""}`;
+                return (
+                  <div className={`pos-product-card level-${level}`} key={product.id}>
+                    <button
+                      className="pos-product"
+                      type="button"
+                      onClick={() => {
+                        if (addProductToCart(product)) setMessage(`Added ${product.name}.`);
+                        scanRef.current?.focus();
+                      }}
+                    >
+                      <strong>{product.name}</strong>
+                      <span>{formatMoney(Number(product.price) || 0)}</span>
+                      <small className={`pos-product-stock level-${level}`}>{stockLabel}</small>
+                    </button>
+                    {onSaveProduct ? (
+                      /* Restock without putting the item in the sale first. */
+                      <button
+                        className="pos-product-restock"
+                        type="button"
+                        title={`Add stock to ${product.name}`}
+                        onClick={() => setRestock(product)}
+                      >
+                        + Stock
+                      </button>
+                    ) : null}
+                  </div>
+                );
+              })
             ) : (
-              <p className="empty-state">{productSearch.trim().length >= 2 ? "No matching products." : "Type to search."}</p>
+              <p className="empty-state">
+                {searching ? `No product matches "${productSearch.trim()}".` : "Type at least 2 letters to search the catalog."}
+              </p>
             )}
           </div>
         </section>
@@ -6263,6 +6596,10 @@ function RestockDialog({ product, storeLocations, onClose, onAddStock }) {
       window.alert("Add a barcode for this item before adding stock.");
       return;
     }
+    if (!location) {
+      window.alert("Choose which store this stock is going to.");
+      return;
+    }
     const target = Number(quantity) || 0;
     if (!target) {
       window.alert("Enter how many units to add.");
@@ -6301,12 +6638,19 @@ function RestockDialog({ product, storeLocations, onClose, onAddStock }) {
           ) : null}
           <label className="field">
             <span>Add stock to store</span>
-            <select value={location} onChange={(event) => setLocation(event.target.value)}>
-              <option value="">All stores</option>
+            {/* Stock always belongs to one store — there is no "all stores" option. */}
+            <select value={location} onChange={(event) => setLocation(event.target.value)} required>
+              <option value="" disabled>Select a store…</option>
               {stores.map((store) => (
                 <option key={store}>{store}</option>
               ))}
             </select>
+            {!product.location ? (
+              <small className="muted">
+                This item is currently stocked for all stores. Picking a store moves its existing {currentStock}{" "}
+                unit{currentStock === 1 ? "" : "s"} to that store as well.
+              </small>
+            ) : null}
           </label>
           <label className="field">
             <span>Quantity to add</span>
@@ -6336,12 +6680,23 @@ function RestockDialog({ product, storeLocations, onClose, onAddStock }) {
   );
 }
 
+// Store names are compared loosely (trimmed, case-folded) so a product row saved
+// as "monsey " still counts toward the "Monsey" store instead of looking like
+// stock at some unknown location.
+function normalizeStoreKey(value) {
+  return String(value || "").trim().toLowerCase();
+}
+
 function InventoryPage({
   products,
   storeLocations,
   sessionRole,
   onSaveProduct,
   onRemoveProduct,
+  rentalPhones = [],
+  onSaveRentalPhone,
+  onReleaseRentalPhone,
+  onRemoveRentalPhone,
 }) {
   const isAdmin = sessionRole === "admin";
   const canDelete = isAdmin;
@@ -6354,7 +6709,10 @@ function InventoryPage({
     cost: "",
     category: productCategories[0],
     requiresImei: false,
-    location: storeLocations[0] || "",
+    // No default store: picking one is deliberate, so stock can't quietly land at
+    // whichever store happens to sort first. The last pick is carried over after a
+    // save, so a run of adds at one store only asks once.
+    location: "",
     quantity: "0",
     imeis: [],
   };
@@ -6382,6 +6740,10 @@ function InventoryPage({
     event.preventDefault();
     if (!form.sku.trim() || !form.name.trim()) {
       window.alert("SKU and name are required.");
+      return;
+    }
+    if (!form.location) {
+      window.alert("Pick the store this stock belongs to.");
       return;
     }
     if (form.requiresImei) {
@@ -6414,24 +6776,36 @@ function InventoryPage({
 
   // Group per-store product rows up by item so we can show, in one popup, how
   // many of each item are in stock at every store along with its variants.
+  //
+  // Each group ends up with one `buckets` list that is the single source for the
+  // popup: every current store (so a store with none of the item still shows a 0)
+  // plus a bucket for anything the rows point at that isn't a current store — the
+  // unassigned "All stores" rows, and stock stranded under a renamed or deleted
+  // location. `total` is the sum of that same list, so the columns and the Total
+  // are arithmetically incapable of disagreeing.
   const groups = useMemo(() => {
+    const stores = [...new Set(storeLocations)];
+    const storeSet = new Set(stores);
+    // Store names match loosely, so a row saved as "monsey " lands in the
+    // "Monsey" column instead of silently becoming its own orphan bucket.
+    const canonicalByKey = new Map(stores.map((name) => [normalizeStoreKey(name), name]));
+
     const map = new Map();
     for (const product of products) {
       const key = String(product.sku || product.name || product.id).trim().toLowerCase();
       const stock = product.requiresImei ? product.imeis?.length || 0 : Number(product.quantity) || 0;
-      const loc = product.location || "";
+      const rawLocation = String(product.location || "").trim();
+      const loc = rawLocation ? canonicalByKey.get(normalizeStoreKey(rawLocation)) ?? rawLocation : "";
       const group = map.get(key) || {
         key,
         name: product.name,
         sku: product.sku,
         category: product.category,
         requiresImei: Boolean(product.requiresImei),
-        total: 0,
         byStore: {},
         variants: [],
       };
       group.byStore[loc] = (group.byStore[loc] || 0) + stock;
-      group.total += stock;
       group.variants.push(product);
       if (!group.name && product.name) group.name = product.name;
       if (!group.sku && product.sku) group.sku = product.sku;
@@ -6439,8 +6813,27 @@ function InventoryPage({
       if (product.requiresImei) group.requiresImei = true;
       map.set(key, group);
     }
+
+    for (const group of map.values()) {
+      group.buckets = [
+        ...stores.map((name) => ({ name, label: name, stock: group.byStore[name] || 0, orphan: false })),
+        // Everything the rows point at that has no column above: "" (unassigned)
+        // first, then any stranded location, so nothing can go uncounted.
+        ...Object.keys(group.byStore)
+          .filter((name) => !storeSet.has(name))
+          .sort()
+          .map((name) => ({
+            name,
+            label: name || "All stores",
+            stock: group.byStore[name],
+            orphan: Boolean(name),
+          })),
+      ];
+      group.total = group.buckets.reduce((sum, bucket) => sum + bucket.stock, 0);
+    }
+
     return Array.from(map.values()).sort((a, b) => String(a.name || "").localeCompare(String(b.name || "")));
-  }, [products]);
+  }, [products, storeLocations]);
 
   const filteredGroups = useMemo(() => {
     const query = search.trim().toLowerCase();
@@ -6455,7 +6848,6 @@ function InventoryPage({
   }, [groups, search]);
 
   const selectedGroup = selectedKey ? groups.find((group) => group.key === selectedKey) : null;
-  const selectedHasAllStores = selectedGroup ? Boolean(selectedGroup.byStore[""]) : false;
 
   return (
     <>
@@ -6523,8 +6915,9 @@ function InventoryPage({
           </label>
           <label className="field">
             <span>Store</span>
-            <select value={form.location} onChange={(event) => updateField("location", event.target.value)}>
-              <option value="">All stores</option>
+            {/* Stock always belongs to one store — there is no "all stores" option. */}
+            <select value={form.location} onChange={(event) => updateField("location", event.target.value)} required>
+              <option value="" disabled>Select a store…</option>
               {storeLocations.map((location) => (
                 <option key={location}>{location}</option>
               ))}
@@ -6628,11 +7021,17 @@ function InventoryPage({
         )}
       </section>
 
+      <RentalPhoneFleet
+        phones={rentalPhones}
+        isAdmin={isAdmin}
+        onSavePhone={onSaveRentalPhone}
+        onReleasePhone={onReleaseRentalPhone}
+        onRemovePhone={onRemoveRentalPhone}
+      />
+
       {selectedGroup ? (
         <ItemDetailsDialog
           group={selectedGroup}
-          storeLocations={storeLocations}
-          hasAllStores={selectedHasAllStores}
           sessionRole={sessionRole}
           onClose={() => setSelectedKey("")}
           onRestock={(product) => {
@@ -6656,13 +7055,167 @@ function InventoryPage({
   );
 }
 
+// The rental handset fleet: scan phones in one at a time to register them, then
+// see at a glance which are on the shelf and which are out with a customer.
+// Deliberately separate from `products` — these are lent, never sold.
+function RentalPhoneFleet({ phones = [], isAdmin, onSavePhone, onReleasePhone, onRemovePhone }) {
+  const [imei, setImei] = useState("");
+  const [name, setName] = useState("");
+  const [search, setSearch] = useState("");
+  const [message, setMessage] = useState("");
+  const imeiRef = useRef(null);
+
+  const outCount = phones.filter((phone) => phone.status === RENTAL_PHONE_WITH_CUSTOMER).length;
+
+  const visible = useMemo(() => {
+    const query = search.trim().toLowerCase();
+    const sorted = [...phones].sort((left, right) => String(left.name || "").localeCompare(String(right.name || "")));
+    if (!query) return sorted;
+    return sorted.filter((phone) =>
+      [phone.name, phone.imei, phone.customerPhone].filter(Boolean).join(" ").toLowerCase().includes(query));
+  }, [phones, search]);
+
+  function addPhone(event) {
+    event.preventDefault();
+    const cleanImei = digitsOnly(imei);
+    if (!cleanImei) { setMessage("Scan or type an IMEI."); return; }
+    if (!name.trim()) { setMessage("Give the phone a name."); return; }
+    if (phones.some((phone) => digitsOnly(phone.imei) === cleanImei)) {
+      setMessage(`IMEI ${cleanImei} is already in the fleet.`);
+      return;
+    }
+    onSavePhone?.({ name: name.trim(), imei: cleanImei });
+    setMessage(`Added ${name.trim()} · ${cleanImei}.`);
+    setImei("");
+    // Keep the name so a run of identical handsets can be scanned back to back.
+    imeiRef.current?.focus();
+  }
+
+  return (
+    <section className="history">
+      <div className="history-header">
+        <div>
+          <p className="eyebrow">Rental fleet</p>
+          <h2>Phones &amp; IMEIs</h2>
+        </div>
+        <div className="summary-strip">
+          <span className="metric">Total <strong>{phones.length}</strong></span>
+          <span className="metric">In store <strong>{phones.length - outCount}</strong></span>
+          <span className="metric">With customers <strong>{outCount}</strong></span>
+        </div>
+      </div>
+      <p className="muted">
+        Scan every phone you lend out so the shop always knows where each handset is. Phones added here are the ones
+        offered when a rental issues a device.
+      </p>
+
+      <form className="form-grid inventory-form" onSubmit={addPhone}>
+        <label className="field">
+          <span>IMEI</span>
+          <input
+            ref={imeiRef}
+            value={imei}
+            onChange={(event) => { setImei(event.target.value); setMessage(""); }}
+            inputMode="numeric"
+            autoComplete="off"
+            spellCheck={false}
+            placeholder="Scan the IMEI"
+          />
+        </label>
+        <label className="field">
+          <span>Phone name</span>
+          <input
+            value={name}
+            onChange={(event) => { setName(event.target.value); setMessage(""); }}
+            placeholder="e.g. Nokia 105 — blue"
+          />
+        </label>
+        <div className="pos-form-actions form-actions-row">
+          <button className="primary-button" type="submit">Add phone</button>
+          {message ? <span className="muted">{message}</span> : null}
+        </div>
+      </form>
+
+      <input
+        className="pos-search"
+        value={search}
+        onChange={(event) => setSearch(event.target.value)}
+        placeholder="Search by name, IMEI, or customer"
+      />
+
+      <div className="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Phone</th>
+              <th>IMEI</th>
+              <th>Status</th>
+              <th>With</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            {visible.length ? visible.map((phone) => {
+              const out = phone.status === RENTAL_PHONE_WITH_CUSTOMER;
+              return (
+                <tr key={phone.id}>
+                  <td><strong>{phone.name}</strong></td>
+                  <td>{phone.imei}</td>
+                  <td>
+                    <span className={`status-pill ${out ? "" : "returned"}`}>
+                      {out ? RENTAL_PHONE_WITH_CUSTOMER : RENTAL_PHONE_IN_STORE}
+                    </span>
+                  </td>
+                  <td>{out ? phone.customerPhone || "Customer" : "-"}</td>
+                  <td className="pos-row-actions">
+                    {out ? (
+                      <button
+                        className="secondary-button compact-button"
+                        type="button"
+                        onClick={() => onReleasePhone?.(phone.id)}
+                      >
+                        Mark back in store
+                      </button>
+                    ) : null}
+                    {isAdmin ? (
+                      <button
+                        className="secondary-button compact-button"
+                        type="button"
+                        onClick={() => {
+                          if (window.confirm(`Remove ${phone.name} (${phone.imei}) from the fleet?`)) onRemovePhone?.(phone.id);
+                        }}
+                      >
+                        Remove
+                      </button>
+                    ) : null}
+                  </td>
+                </tr>
+              );
+            }) : (
+              <tr>
+                <td colSpan="5" className="empty-state">
+                  {phones.length ? "No phones match that search." : "No phones in the fleet yet — scan one above."}
+                </td>
+              </tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  );
+}
+
 // Popup showing one item's stock per store plus each per-store variant, with
 // restock / edit / delete actions. Replaces the always-on inventory tables.
-function ItemDetailsDialog({ group, storeLocations, hasAllStores, sessionRole, onClose, onRestock, onEdit, onDelete }) {
+function ItemDetailsDialog({ group, sessionRole, onClose, onRestock, onEdit, onDelete }) {
   const isAdmin = sessionRole === "admin";
   const subtitle = [group.sku ? `SKU ${group.sku}` : "", group.category || "", group.requiresImei ? "IMEI tracked" : ""]
     .filter(Boolean)
     .join(" · ");
+  // Stock sitting under a location that is no longer a store — a rename or a
+  // delete left it behind. It counts toward the total, so call it out with the
+  // name it's stranded under rather than letting it hide.
+  const orphanBuckets = group.buckets.filter((bucket) => bucket.orphan && bucket.stock > 0);
 
   return (
     <div className="dialog-backdrop" role="presentation" onClick={onClose}>
@@ -6683,24 +7236,33 @@ function ItemDetailsDialog({ group, storeLocations, hasAllStores, sessionRole, o
           <table>
             <thead>
               <tr>
-                {storeLocations.map((location) => (
-                  <th key={location}>{location}</th>
+                {group.buckets.map((bucket) => (
+                  <th key={bucket.name} className={bucket.orphan ? "stock-orphan" : ""}>
+                    {bucket.label}{bucket.orphan ? " ⚠" : ""}
+                  </th>
                 ))}
-                {hasAllStores ? <th>All stores</th> : null}
                 <th>Total</th>
               </tr>
             </thead>
             <tbody>
               <tr>
-                {storeLocations.map((location) => (
-                  <td key={location}>{group.byStore[location] || 0}</td>
+                {group.buckets.map((bucket) => (
+                  <td key={bucket.name} className={bucket.orphan ? "stock-orphan" : ""}>{bucket.stock}</td>
                 ))}
-                {hasAllStores ? <td>{group.byStore[""] || 0}</td> : null}
                 <td><strong>{group.total}</strong></td>
               </tr>
             </tbody>
           </table>
         </div>
+
+        {orphanBuckets.length ? (
+          <p className="stock-orphan-note">
+            ⚠ {orphanBuckets.map((bucket) => `"${bucket.label}"`).join(", ")}
+            {orphanBuckets.length === 1 ? " is not a current store" : " are not current stores"} — this stock is
+            counted in the total but belongs to a renamed or deleted location. Use Edit or Restock on the matching
+            row below to move it to a real store.
+          </p>
+        ) : null}
 
         <div className="request-list">
           {group.variants.map((product) => {
@@ -6825,9 +7387,16 @@ function AdminPage({
     });
   }, [employees, reports]);
 
-  const sortedReports = [...reports].sort(
-    (left, right) => (toJsDate(right.createdAt)?.getTime() || 0) - (toJsDate(left.createdAt)?.getTime() || 0),
-  );
+  // The audit trail shows only today's activity by default so it stays short.
+  const todayStart = startOfDay(new Date()).getTime();
+  const sortedReports = [...reports]
+    .filter((report) => {
+      const when = toJsDate(report.createdAt)?.getTime();
+      return when != null && when >= todayStart;
+    })
+    .sort(
+      (left, right) => (toJsDate(right.createdAt)?.getTime() || 0) - (toJsDate(left.createdAt)?.getTime() || 0),
+    );
 
   function updateHandlerField(name, value) {
     setHandlerForm((current) => ({ ...current, [name]: value }));
@@ -7114,23 +7683,15 @@ function AdminPage({
                 <th>Customer</th>
                 <th>Details</th>
                 <th>Paid</th>
+                <th>Method</th>
               </tr>
             </thead>
             <tbody>
               {sortedReports.length ? (
-                sortedReports.map((report) => (
-                  <tr key={report.id}>
-                    <td>{formatShortDate(report.createdAt)}</td>
-                    <td>{report.servedBy || "-"}</td>
-                    <td><span className={`badge ${report.type}`}>{reportTypes[report.type].label}</span></td>
-                    <td>{report.customerPhone || "-"}</td>
-                    <td><ReportDetails report={report} /></td>
-                    <td>{formatPayment(report.paymentAmount)}</td>
-                  </tr>
-                ))
+                sortedReports.map((report) => <AuditRow key={report.id} report={report} />)
               ) : (
                 <tr>
-                  <td colSpan="6" className="empty-state">No employee activity yet.</td>
+                  <td colSpan="7" className="empty-state">No employee activity today.</td>
                 </tr>
               )}
             </tbody>
@@ -7169,7 +7730,41 @@ function AdminPage({
   );
 }
 
-function ReportRow({ report, onStatusChange, onUpdateReport, onDeleteReport, onReturn, hasActions }) {
+// A row in the admin "Everything employees did" audit trail. Collapsed by
+// default to a one-line teaser; click to expand the full details.
+function AuditRow({ report }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <>
+      <tr className="report-row" onClick={() => setOpen((value) => !value)}>
+        <td>{formatShortDate(report.createdAt)}</td>
+        <td>{report.servedBy || "-"}</td>
+        <td><span className={`badge ${report.type}`}>{reportTypes[report.type].label}</span></td>
+        <td>{report.customerPhone || "-"}</td>
+        <td>
+          <button
+            type="button"
+            className="row-toggle"
+            aria-expanded={open}
+            onClick={(event) => { event.stopPropagation(); setOpen((value) => !value); }}
+          >
+            {open ? "▾" : "▸"}
+          </button>
+          {open ? null : <ReportDetails report={report} compact />}
+        </td>
+        <td>{formatPayment(report.paymentAmount)}</td>
+        <td>{report.paymentMethod || "-"}</td>
+      </tr>
+      {open ? (
+        <tr className="report-detail-row">
+          <td colSpan="7"><ReportDetails report={report} /></td>
+        </tr>
+      ) : null}
+    </>
+  );
+}
+
+function ReportRow({ report, onStatusChange, onUpdateReport, onDeleteReport, onReturn, activeEmployee, hasActions }) {
   const [open, setOpen] = useState(false);
   const saleLineItems = report.details?.lineItems || [];
   const returnableType = report.type === "sale" || report.type === "phoneOrder";
@@ -7238,7 +7833,7 @@ function ReportRow({ report, onStatusChange, onUpdateReport, onDeleteReport, onR
           <td colSpan={columnCount}>
             <ReportDetails report={report} />
             {report.type === "rental" && onUpdateReport ? (
-              <RentalReportActions report={report} onUpdate={onUpdateReport} />
+              <RentalReportActions report={report} onUpdate={onUpdateReport} activeEmployee={activeEmployee} />
             ) : null}
           </td>
         </tr>
@@ -7249,14 +7844,39 @@ function ReportRow({ report, onStatusChange, onUpdateReport, onDeleteReport, onR
 
 // Post-sale RCUK actions on a saved rental: fetch the assigned numbers if they
 // weren't ready at creation, and cancel the rental (frees the SIM immediately).
-function RentalReportActions({ report, onUpdate }) {
+function RentalReportActions({ report, onUpdate, activeEmployee }) {
   const details = report.details || {};
   const [busy, setBusy] = useState("");
   const [message, setMessage] = useState("");
   const [editing, setEditing] = useState(false);
   const rentalId = details.rentalId;
   const cancelled = details.rentalStatus === "Cancelled";
+  const returned = Boolean(details.returnedAt);
   const hasNumbers = Boolean(details.cli);
+
+  // Record the phone coming back. This is what stops the past-due notice and
+  // freezes the late fee — after this the amount owed no longer grows, so the
+  // figure stored here is the one to collect.
+  function markReturned() {
+    const { daysLate, amount } = calculateRentalLateFee(report);
+    const feeLine = amount > 0
+      ? `\n\nLate fee owed: ${formatMoney(amount)} (${daysLate} day${daysLate === 1 ? "" : "s"} late). This is not charged automatically — collect it before closing out.`
+      : "";
+    if (!window.confirm(`Mark this rental returned?${feeLine}`)) return;
+
+    onUpdate(report.id, {
+      details: {
+        rentalStatus: "Returned",
+        returnedAt: new Date().toISOString(),
+        returnedBy: activeEmployee || "",
+        lateFeeDaysAtReturn: daysLate,
+        lateFeeAtReturn: amount ? amount.toFixed(2) : "0.00",
+      },
+    });
+    setMessage(amount > 0
+      ? `Marked returned. Late fee owed: ${formatMoney(amount)} — collect it separately.`
+      : "Marked returned. No late fee owed.");
+  }
 
   async function getNumbers() {
     if (!FUNCTIONS_BASE_URL) { setMessage("Functions URL not configured."); return; }
@@ -7325,6 +7945,11 @@ function RentalReportActions({ report, onUpdate }) {
       </button>
       {cancelled ? (
         <span className="status-pill returned">Cancelled</span>
+      ) : returned ? (
+        <span className="status-pill returned">
+          Returned {formatShortDate(details.returnedAt)}
+          {details.returnedBy ? ` by ${details.returnedBy}` : ""}
+        </span>
       ) : (
         <>
           {!hasNumbers ? (
@@ -7332,6 +7957,9 @@ function RentalReportActions({ report, onUpdate }) {
               {busy === "numbers" ? "Getting numbers…" : "Get numbers"}
             </button>
           ) : null}
+          <button className="primary-button compact-button" type="button" onClick={markReturned}>
+            Mark returned
+          </button>
           <button className="secondary-button compact-button" type="button" disabled={busy === "cancel"} onClick={cancelRental}>
             {busy === "cancel" ? "Cancelling…" : "Cancel rental"}
           </button>
@@ -7398,6 +8026,12 @@ function RentalEditDialog({ report, onSave, onClose }) {
         simNumber: form.simNumber.trim(),
         model: form.model.trim(),
         imei: form.imei.trim(),
+        // The edited amount IS the rental total — without this the Paid column and
+        // the "Total" in the report details drift apart after an edit.
+        totalPrice: String(form.paymentAmount ?? "").trim(),
+        // Keep the original formula price so an edited total still shows what the
+        // rental would have cost. Older rentals seed it from their current total.
+        calculatedPrice: details.calculatedPrice || details.totalPrice || "",
       },
     };
   }
@@ -7564,6 +8198,14 @@ function ReportDetails({ report, compact }) {
       ["End", details.endDate],
       ["Return time", details.returnTime],
       ["Return due", details.returnDueDate],
+      ["Returned", details.returnedAt
+        ? `${formatShortDate(details.returnedAt)}${details.returnedBy ? ` by ${details.returnedBy}` : ""}`
+        : ""],
+      // Frozen at the moment it was marked returned, so it stops growing and the
+      // amount to collect is unambiguous.
+      ["Late fee owed", Number(details.lateFeeAtReturn) > 0
+        ? `${formatMoney(Number(details.lateFeeAtReturn))} (${details.lateFeeDaysAtReturn} day${Number(details.lateFeeDaysAtReturn) === 1 ? "" : "s"} late)`
+        : ""],
       ["Reminder", details.returnReminderPreference],
       ["Late fee", Number(details.lateFeeWeekly) > 0
         ? `${formatMoney(Number(details.lateFeeWeekly))}/wk (${formatMoney(Number(details.lateFeeWeekly) / 7)}/day overdue)`
@@ -7575,7 +8217,13 @@ function ReportDetails({ report, compact }) {
       ["CLI", details.cli],
       ["US DDI", details.usDdi],
       ["Sola", details.solaTransactionId],
-      ["Total", details.totalPrice ? formatMoney(Number(details.totalPrice)) : ""],
+      ["Total", details.totalPrice
+        ? `${formatMoney(Number(details.totalPrice))}${
+            Number(details.calculatedPrice) > 0 && Number(details.calculatedPrice) !== Number(details.totalPrice)
+              ? ` (calculated ${formatMoney(Number(details.calculatedPrice))})`
+              : ""
+          }`
+        : ""],
     ],
     phoneOrder: [
       ["Status", details.status],
@@ -7597,6 +8245,8 @@ function ReportDetails({ report, compact }) {
       ["Refund method", details.refundMethod],
       ["Card refund", details.solaRefundRef],
       ["Original sale", details.originalReportId],
+      ["Subtotal", Number(details.refundTax) > 0 && details.refundSubtotal ? formatMoney(Number(details.refundSubtotal)) : ""],
+      ["Sales tax", Number(details.refundTax) > 0 ? `${formatMoney(Number(details.refundTax))}${details.taxRate ? ` (${details.taxRate}%)` : ""}` : ""],
       ["Refunded", details.refundTotal ? formatMoney(Number(details.refundTotal)) : ""],
     ],
   }[report.type];
@@ -7606,8 +8256,8 @@ function ReportDetails({ report, compact }) {
     : "";
 
   const filled = lines.filter(([, value]) => value);
-  // Collapsed rows show just the first couple of fields as a one-line teaser.
-  const shown = compact ? filled.slice(0, 2) : filled;
+  // Collapsed rows stay as small as possible: a single-field, one-line teaser.
+  const shown = compact ? filled.slice(0, 1) : filled;
 
   return (
     <div className={compact ? "details details-compact" : "details"}>
@@ -7670,7 +8320,14 @@ function ReturnDialog({ report, onClose, onSubmit }) {
     setLines((current) => current.map((line) => ({ ...line, returnQty: line.remaining })));
   }
 
-  const refundTotal = lines.reduce((sum, line) => sum + line.price * line.returnQty, 0);
+  const refundSubtotal = lines.reduce((sum, line) => sum + line.price * line.returnQty, 0);
+  // Refund the sales tax the customer originally paid: apply the sale's tax rate
+  // to the returned subtotal. Skip it when the sale charged no tax (out of state
+  // or no store rate), so tax-free sales still refund exactly what was paid.
+  const saleTaxRate = Number(details.taxRate) || 0;
+  const taxApplies = Number(details.taxAmount) > 0 && saleTaxRate > 0;
+  const refundTax = taxApplies ? refundSubtotal * (saleTaxRate / 100) : 0;
+  const refundTotal = refundSubtotal + refundTax;
   const anySelected = lines.some((line) => line.returnQty > 0);
   const imeiNeedsScan = lines.some(
     (line) => line.requiresImei && line.returnQty > 0 && line.scanImei !== line.soldImei,
@@ -7711,7 +8368,16 @@ function ReturnDialog({ report, onClose, onSubmit }) {
         lineIndex: line.index,
       }));
 
-    await Promise.resolve(onSubmit(report, { returnLines, refundMethod, solaRefundRef: solaRef, notes }));
+    await Promise.resolve(onSubmit(report, {
+      returnLines,
+      refundMethod,
+      solaRefundRef: solaRef,
+      notes,
+      refundSubtotal,
+      refundTax,
+      refundTotal,
+      taxRate: taxApplies ? saleTaxRate : 0,
+    }));
     onClose();
   }
 
@@ -7802,6 +8468,12 @@ function ReturnDialog({ report, onClose, onSubmit }) {
           <p className={refundState.status === "error" ? "summary-error" : "muted"}>{refundState.message}</p>
         ) : null}
 
+        {taxApplies ? (
+          <div className="return-lines">
+            <div className="pos-totals-row"><span>Subtotal</span><span>{formatMoney(refundSubtotal)}</span></div>
+            <div className="pos-totals-row"><span>Sales tax ({saleTaxRate}%)</span><span>{formatMoney(refundTax)}</span></div>
+          </div>
+        ) : null}
         <div className="return-summary">
           <span>Refund total</span>
           <strong>{formatMoney(refundTotal)}</strong>

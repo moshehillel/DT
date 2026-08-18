@@ -16,6 +16,16 @@ export const STORE_TAX_KEY = "diamant-telecom-store-tax-v1";
 export const STORES_KEY = "diamant-telecom-stores-v2";
 export const STAFF_KEY = "diamant-telecom-staff-v2";
 export const CUSTOMERS_KEY = "diamant-telecom-customers-v1";
+// The rental phone fleet: every handset we lend out, tracked by IMEI whether it
+// is on the shelf or out with a customer. Separate from `products` on purpose —
+// these are not for sale and must never appear in POS stock.
+export const RENTAL_PHONES_KEY = "diamant-telecom-rental-phones-v1";
+export const RENTAL_PHONE_IN_STORE = "In store";
+export const RENTAL_PHONE_WITH_CUSTOMER = "With customer";
+// Notices the user dismissed from the "Needs attention" panel. Kept per-device in
+// localStorage — dismissing is a "I've seen this" gesture, not shared state, and
+// this way it costs no cloud writes.
+export const DISMISSED_NOTICES_KEY = "diamant-telecom-dismissed-notices-v1";
 export const FUNCTIONS_BASE_URL = import.meta.env.VITE_FUNCTIONS_BASE_URL || "";
 
 /** TEMPORARY — billing reminder banner at the top of every page. Set false to hide. */

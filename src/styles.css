@@ -782,16 +782,49 @@ button:active {
   font-size: 20px;
 }
 
+.notification-center-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
 .notification-list {
   display: grid;
   gap: 10px;
 }
 
 .app-notification {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
   border: 1px solid var(--line);
   border-radius: 8px;
   padding: 12px;
   background: #fbfcfd;
+}
+
+.app-notification-body {
+  flex: 1;
+  min-width: 0;
+}
+
+.notification-dismiss {
+  flex: none;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #fff;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 18px;
+  line-height: 1;
+  padding: 2px 8px 4px;
+}
+
+.notification-dismiss:hover {
+  color: var(--ink);
+  border-color: #b9c2cc;
 }
 
 .app-notification.urgent {
@@ -1891,6 +1924,21 @@ tr:last-child td {
 
 .catalog-table table {
   min-width: 720px;
+}
+
+/* Stock stranded under a location that is no longer a store. */
+.stock-orphan {
+  color: var(--gold);
+}
+
+.stock-orphan-note {
+  margin: 0;
+  border: 1px solid #ffc89b;
+  border-radius: 8px;
+  background: #fff6ed;
+  color: var(--muted);
+  font-size: 13px;
+  padding: 10px 12px;
 }
 
 .pos-form-actions {
@@ -3283,7 +3331,9 @@ tr:last-child td {
 .main.main-pos {
   height: 100vh;
   overflow: hidden;
-  padding: 8px 12px 0;
+  /* Keep a little clearance at the bottom so the lowest control never sits flush
+     against the edge of the screen (or under the OS taskbar in a kiosk window). */
+  padding: 8px 12px 10px;
   gap: 8px;
   grid-template-rows: auto auto minmax(0, 1fr);
 }
@@ -3409,45 +3459,203 @@ tr:last-child td {
   border-radius: 14px;
 }
 
+/* Search sits directly under the scan bar, above the cart — results appear where
+   the cashier is already looking instead of in a strip at the bottom edge of the
+   screen, where the taskbar clipped them. `.pos-left` is a flex column, so this
+   reorders without moving the markup. */
 .pos-quick-panel {
+  order: -1;
   margin: 0;
   padding: 8px 12px 10px;
   border-radius: 14px;
   flex: 0 0 auto;
-  max-height: 132px;
+  /* A cap, not a fixed height: with no search typed the panel stays one line
+     tall and gives all its room back to the cart. */
+  max-height: 350px;
   overflow: hidden;
 }
 
 .pos-quick-panel .history-header {
-  margin-bottom: 6px;
+  margin-bottom: 8px;
+  align-items: center;
+  gap: 12px;
 }
 
 .pos-quick-panel .history-header h2 {
-  font-size: 16px;
+  font-size: 18px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.pos-result-count {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--brand-dark);
+  background: var(--brand-soft);
+  border-radius: 999px;
+  padding: 2px 9px;
 }
 
 .pos-quick-panel .pos-quick-actions {
-  margin-bottom: 6px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 0;
+  flex: 1 1 auto;
+  justify-content: flex-end;
+}
+
+.pos-quick-panel .pos-quick-actions .pos-search {
+  flex: 1 1 auto;
+  max-width: 340px;
+  min-height: 42px;
+  font-size: 15px;
 }
 
 .pos-quick-panel .pos-product-grid {
-  grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
-  gap: 8px;
-  max-height: 56px;
+  grid-template-columns: repeat(auto-fill, minmax(158px, 1fr));
+  gap: 10px;
+  /* Roughly three rows of the larger tiles before it scrolls. */
+  max-height: 252px;
   overflow-y: auto;
+  padding-right: 2px;
+}
+
+/* Tile = big "add to sale" target with a small restock action tucked in the
+   corner, so one search result serves both jobs. */
+.pos-product-card {
+  position: relative;
+  display: flex;
 }
 
 .pos-quick-panel .pos-product {
-  min-height: 52px;
-  padding: 6px 8px;
+  flex: 1 1 auto;
+  min-height: 78px;
+  padding: 10px 10px 8px;
+  gap: 2px;
 }
 
 .pos-quick-panel .pos-product strong {
-  font-size: 12px;
+  font-size: 13px;
+  line-height: 1.25;
 }
 
 .pos-quick-panel .pos-product span {
+  font-size: 17px;
+  font-weight: 800;
+}
+
+/* The shared `.pos-product small` pill sets its colour with !important, so these
+   have to match that weight to win. */
+.pos-product-stock {
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.pos-product-stock.level-low {
+  background: #fff1e2 !important;
+  color: #8a5a12 !important;
+}
+
+.pos-product-stock.level-out {
+  background: #fdeaea !important;
+  color: var(--danger) !important;
+}
+
+.pos-product-card.level-low .pos-product {
+  border-color: #ffc89b;
+}
+
+.pos-product-card.level-out .pos-product {
+  border-color: #eab4b4;
+  background: #fdf6f6;
+}
+
+.pos-product-restock {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+  color: var(--brand-dark);
+  font-size: 11px;
+  font-weight: 800;
+  line-height: 1;
+  padding: 5px 7px;
+}
+
+.pos-product-restock:hover {
+  background: var(--brand-soft);
+  border-color: var(--brand);
+}
+
+/* ---- Checkout column: trimmed so selecting a card payment reveals the terminal
+   panel without pushing the column into a scroll. Everything a cashier needs
+   stays on one screen. ---- */
+.pos-page .pos-checkout .workspace-header h2 {
+  font-size: 28px;
+}
+
+.pos-page .pos-checkout .form-grid {
+  gap: 8px;
+}
+
+.pos-page .pos-checkout .field {
+  gap: 4px;
+}
+
+.pos-page .pos-checkout .field span {
+  font-size: 12px;
+}
+
+.pos-page .pos-checkout input,
+.pos-page .pos-checkout select,
+.pos-page .pos-checkout textarea {
+  min-height: 40px;
+  padding: 8px 10px;
+}
+
+.pos-page .pos-checkout textarea {
+  min-height: 36px;
+}
+
+.pos-page .pos-checkout .pos-totals {
+  gap: 2px;
+  margin-top: 8px;
+}
+
+.pos-page .pos-checkout .pos-totals-sub {
   font-size: 14px;
+}
+
+.pos-page .pos-checkout .pos-totals-tax {
+  font-size: 15px;
+}
+
+.pos-page .pos-checkout .pos-totals-grand {
+  font-size: 22px !important;
+  padding-top: 7px;
+  margin-top: 2px;
+}
+
+.pos-page .pos-checkout .pos-totals-grand strong {
+  font-size: 24px;
+}
+
+.pos-page .pos-checkout .pos-out-of-state {
+  margin: 2px 0;
+}
+
+.pos-page .pos-checkout .payment-panel-compact {
+  gap: 6px;
+  padding: 8px 10px;
+  margin-top: 6px;
+}
+
+.pos-page .pos-checkout .pos-complete-button {
+  min-height: 48px;
 }
 
 @media (max-width: 980px) {
@@ -3457,8 +3665,44 @@ tr:last-child td {
   }
 
   .pos-quick-panel {
-    max-height: 112px;
+    max-height: 250px;
   }
+
+  .pos-quick-panel .pos-product-grid {
+    max-height: 158px;
+  }
+}
+
+/* Short screens (laptops at 768px and under): give the cart the space back and
+   keep the search list from crowding it out. */
+@media (max-height: 800px) {
+  .pos-quick-panel {
+    max-height: 246px;
+  }
+
+  .pos-quick-panel .pos-product-grid {
+    max-height: 156px;
+  }
+
+  .pos-page .pos-checkout .workspace-header h2 {
+    font-size: 24px;
+  }
+
+  .pos-page .pos-checkout .pos-totals-grand {
+    font-size: 20px !important;
+  }
+
+  .pos-page .pos-checkout .pos-totals-grand strong {
+    font-size: 22px;
+  }
+}
+
+/* Price override sits inside the rental total panel, visually tied to the number
+   it replaces. */
+.rental-price-override {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--line);
 }
 
 .pos-customer-name {

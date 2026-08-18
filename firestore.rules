@@ -64,6 +64,13 @@ service cloud.firestore {
       allow delete: if isAdmin();
     }
 
+    // Rental phone fleet. Any employee issuing or taking back a phone updates its
+    // status, so create/update is open to staff; removing a handset is an admin call.
+    match /rentalPhones/{phoneId} {
+      allow read, create, update: if signedIn();
+      allow delete: if isAdmin();
+    }
+
     match /notificationLogs/{logId} {
       allow read, create: if signedIn();
       allow update, delete: if isAdmin();

@@ -2,10 +2,27 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const {
   buildRcukRentalPayload,
+  isRcukFailureBody,
   mapRentalPackage,
   normalizeRcukSimNumber,
   toFlag,
 } = require("../src/rcuk");
+
+// RCUK answers HTTP 200 on failure, so the body is the only signal. Getting this
+// wrong made a rejected SIM look checked and blocked activation entirely.
+test("isRcukFailureBody catches failures reported at HTTP 200", () => {
+  assert.equal(isRcukFailureBody({ status: "Failed", message: "Invalid SIM Entered" }), true);
+  assert.equal(isRcukFailureBody({ Status: "ERROR" }), true);
+  assert.equal(isRcukFailureBody({ status: "rejected" }), true);
+});
+
+test("isRcukFailureBody leaves successful and unknown statuses alone", () => {
+  assert.equal(isRcukFailureBody({ status: "Success" }), false);
+  assert.equal(isRcukFailureBody({ status: "Active", rental_id: "123" }), false);
+  assert.equal(isRcukFailureBody({ rental_id: "123" }), false);
+  assert.equal(isRcukFailureBody({}), false);
+  assert.equal(isRcukFailureBody(null), false);
+});
 
 test("normalizeRcukSimNumber prefixes short SIM codes", () => {
   assert.equal(normalizeRcukSimNumber("000301234567890"), "89441000301234567890");
@@ -44,7 +61,8 @@ test("buildRcukRentalPayload maps daily rental fields", () => {
   assert.equal(payload.end_date, "2026-06-05");
   assert.equal(payload.sms, 1);
   assert.equal(payload.us_ddi, 1);
-  assert.equal(payload.Notes, "+15551234567");
+  // Lowercase `notes` — RCUK rejects the capitalised key as invalid schema.
+  assert.equal(payload.notes, "+15551234567");
   assert.equal(payload.tp_days, 0);
 });
 
@@ -58,5 +76,7 @@ test("buildRcukRentalPayload maps monthly rental fields", () => {
 
   assert.equal(payload.rental_type, "monthly");
   assert.equal(payload.no_of_months, 2);
-  assert.equal(payload.end_date, undefined);
+  // RCUK requires end_date and no_of_months on EVERY request, so a monthly
+  // rental still sends end_date — empty, but present.
+  assert.equal(payload.end_date, "");
 });

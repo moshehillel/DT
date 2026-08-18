@@ -8,6 +8,7 @@ const twilio = require("twilio");
 const {
   buildRcukRentalPayload,
   digitsOnly,
+  isRcukFailureBody,
   normalizeRcukSimNumber,
 } = require("./rcuk");
 const { buildRepairMessage, buildRepairReceivedMessage, findRepairByLookup } = require("./repairs");
@@ -322,7 +323,12 @@ async function callRcuk(path, payload, method = "POST") {
   }
 
   return {
-    ok: response.ok && Number(data.code || response.status) >= 200 && Number(data.code || response.status) < 300,
+    // See isRcukFailureBody: RCUK reports business failures in the body at HTTP 200,
+    // so the HTTP status alone is not enough to call this a success.
+    ok: response.ok
+      && Number(data.code || response.status) >= 200
+      && Number(data.code || response.status) < 300
+      && !isRcukFailureBody(data),
     status: response.status,
     data,
   };
@@ -924,6 +930,18 @@ exports.rcukAddRental = onRequest(HTTP_OPTIONS, async (req, res) => {
       sendJson(res, 400, {
         ok: false,
         message: result.data.message || "RCUK add rental failed.",
+        raw: result.data,
+      });
+      return;
+    }
+
+    // No rental ID means nothing was actually activated. Reporting that as a
+    // success left the form stuck: "Get numbers" stays disabled without an ID, and
+    // the rental can never be saved. Fail loudly with RCUK's own reason instead.
+    if (!rentalId) {
+      sendJson(res, 400, {
+        ok: false,
+        message: result.data.message || "RCUK did not return a rental ID, so the SIM was not activated.",
         raw: result.data,
       });
       return;

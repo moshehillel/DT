@@ -55,7 +55,18 @@ export function playScanError() {
   playTone({ frequency: 320, slideTo: 180, duration: 0.28, volume: 0.2 });
 }
 
+// Today's date as a local YYYY-MM-DD string (matches the <input type="date"> value).
+export function todayDateString() {
+  const now = new Date();
+  return [
+    now.getFullYear(),
+    String(now.getMonth() + 1).padStart(2, "0"),
+    String(now.getDate()).padStart(2, "0"),
+  ].join("-");
+}
+
 export function createEmptyFilters() {
+  const today = todayDateString();
   return {
     query: "",
     type: "all",
@@ -65,8 +76,9 @@ export function createEmptyFilters() {
     location: "all",
     item: "",
     customerName: "",
-    dateFrom: "",
-    dateTo: "",
+    // Default the log to today only; the user can widen the range as needed.
+    dateFrom: today,
+    dateTo: today,
     amountMin: "",
     amountMax: "",
   };
@@ -509,23 +521,49 @@ export function startOfDay(date) {
   return copy;
 }
 
+// A rental stops accruing once the phone is back or the rental was cancelled.
+// Both the past-due notice and the report details ask this, so a closed rental
+// can never keep nagging on one screen while reading as done on another.
+export function isRentalClosed(report) {
+  const details = report?.details || {};
+  return Boolean(details.returnedAt) || ["Returned", "Cancelled"].includes(details.rentalStatus || "");
+}
+
+// How far past the return due date a rental is, and the late fee accrued at the
+// agreed weekly rate, as of `asOf`. Single implementation so the notice, the
+// report details and the return dialog always quote the same number.
+export function calculateRentalLateFee(report, asOf = new Date()) {
+  const details = report?.details || {};
+  const dueDate = details.returnDueDate || calculateReturnDueDate(details.endDate, details.returnTime);
+  const weeklyFee = Number(details.lateFeeWeekly) || 0;
+  if (!dueDate) return { dueDate: "", daysLate: 0, weeklyFee, amount: 0 };
+
+  const due = startOfDay(new Date(`${dueDate}T00:00:00`));
+  const daysLate = Math.max(0, Math.round((startOfDay(asOf) - due) / 86400000));
+  return {
+    dueDate,
+    daysLate,
+    weeklyFee,
+    amount: weeklyFee > 0 ? (weeklyFee / 7) * daysLate : 0,
+  };
+}
+
 export function buildAppNotifications(reports) {
   const today = startOfDay(new Date());
 
   return reports
     .filter((report) => report.type === "rental")
     .map((report) => {
-      const dueDate = report.details?.returnDueDate || calculateReturnDueDate(report.details?.endDate, report.details?.returnTime);
-      if (!dueDate) return null;
-      const due = startOfDay(new Date(`${dueDate}T00:00:00`));
-      if (due >= today) return null;
+      // Returned or cancelled: nothing to chase, so no notice.
+      if (isRentalClosed(report)) return null;
 
-      const daysLate = Math.max(0, Math.round((today - due) / 86400000));
-      const weeklyFee = Number(report.details?.lateFeeWeekly) || 0;
-      const accruedLateFee = weeklyFee > 0 ? (weeklyFee / 7) * daysLate : 0;
+      const { dueDate, daysLate, weeklyFee, amount } = calculateRentalLateFee(report, today);
+      if (!dueDate) return null;
+      if (startOfDay(new Date(`${dueDate}T00:00:00`)) >= today) return null;
+
       const device = report.details?.model || report.details?.rentalType || "rental";
-      const lateFeePart = accruedLateFee > 0
-        ? ` Late fee so far: ${formatMoney(accruedLateFee)} (${daysLate} day${daysLate === 1 ? "" : "s"} × ${formatMoney(weeklyFee / 7)}/day).`
+      const lateFeePart = amount > 0
+        ? ` Late fee so far: ${formatMoney(amount)} (${daysLate} day${daysLate === 1 ? "" : "s"} × ${formatMoney(weeklyFee / 7)}/day).`
         : "";
 
       return {
