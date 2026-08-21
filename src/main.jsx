@@ -323,7 +323,9 @@ function Workspace({ currentUser, isAdmin }) {
       return (
         (filters.type === "all" || report.type === filters.type) &&
         (filters.employee === "all" || report.servedBy === filters.employee) &&
-        (filters.paymentMethod === "all" || report.paymentMethod === filters.paymentMethod) &&
+        (filters.paymentMethod === "all"
+          || report.paymentMethod === filters.paymentMethod
+          || (report.details?.payments || []).some((entry) => entry?.method === filters.paymentMethod)) &&
         (filters.status === "all" || report.details?.status === filters.status) &&
         (filters.location === "all" || reportLocation === filters.location) &&
         (!itemQuery || itemSearchable.includes(itemQuery)) &&
@@ -558,7 +560,7 @@ function Workspace({ currentUser, isAdmin }) {
       ? [
           ...new Set(
             (product.imeis || [])
-              .map((value) => String(value || "").replace(/\D/g, "").slice(0, 15))
+              .map((value) => String(value || "").replace(/\D/g, ""))
               .filter(Boolean),
           ),
         ]
@@ -2847,7 +2849,7 @@ function RentalReportForm({
                 inputMode="numeric"
                 autoComplete="off"
                 spellCheck={false}
-                placeholder="Scan or type 15-digit IMEI"
+                placeholder="Scan or type IMEI"
                 readOnly={Boolean(form.rentalPhoneId)}
               />
             </label>
@@ -4122,7 +4124,7 @@ function PendingReportCard({ pendingReport, activeEmployee, onSaveCustomerName, 
                   inputMode="numeric"
                   autoComplete="off"
                   spellCheck={false}
-                  placeholder="Scan or type 15-digit IMEI"
+                  placeholder="Scan or type IMEI"
                 />
               </label>
               <label className="field">
@@ -5068,6 +5070,11 @@ function PosPage({ products, reports = [], storeLocations = [], activeEmployee, 
   const [sortMode, setSortMode] = useState("used");
   const [customerPhone, setCustomerPhone] = useState("");
   const [paymentMethod, setPaymentMethod] = useState("");
+  // Split tender: the cashier types how much goes on the first method and the
+  // rest falls to the second, so the two always add up to the grand total.
+  const [splitPayment, setSplitPayment] = useState(false);
+  const [splitSecondMethod, setSplitSecondMethod] = useState("");
+  const [splitFirstInput, setSplitFirstInput] = useState("");
   const [outOfState, setOutOfState] = useState(false);
   const [notes, setNotes] = useState("");
   const [message, setMessage] = useState("");
@@ -5270,7 +5277,7 @@ function PosPage({ products, reports = [], storeLocations = [], activeEmployee, 
   }
 
   function updateImei(lineId, imei) {
-    const digits = String(imei || "").replace(/\D/g, "").slice(0, 15);
+    const digits = String(imei || "").replace(/\D/g, "");
     setCart((current) => current.map((line) => (line.lineId === lineId ? { ...line, imei: digits } : line)));
   }
 
@@ -5305,8 +5312,29 @@ function PosPage({ products, reports = [], storeLocations = [], activeEmployee, 
   const taxAmount = taxApplies ? subtotal * (taxRate / 100) : 0;
   const total = subtotal + taxAmount;
   const itemCount = cart.reduce((sum, line) => sum + line.qty, 0);
-  const requiresCardCharge = isCardPayment(paymentMethod);
+  const splitFirstAmount = splitPayment ? Math.max(0, Number(splitFirstInput) || 0) : 0;
+  const splitSecondAmount = splitPayment ? Math.max(0, total - splitFirstAmount) : 0;
+  // Only the card's share goes to the terminal, not the whole sale.
+  const cardAmount = splitPayment
+    ? (isCardPayment(paymentMethod) ? splitFirstAmount : 0)
+      + (isCardPayment(splitSecondMethod) ? splitSecondAmount : 0)
+    : (isCardPayment(paymentMethod) ? total : 0);
+  const requiresCardCharge = cardAmount > 0;
   const cardChargeComplete = !requiresCardCharge || card.status === "paid";
+  const splitIssue = (() => {
+    if (!splitPayment) return "";
+    if (!splitSecondMethod) return "Choose the second payment method.";
+    if (splitSecondMethod === paymentMethod) return "Pick two different payment methods.";
+    if (!(splitFirstAmount > 0)) return "Enter how much goes on the first method.";
+    if (splitFirstAmount >= total) return `The first amount has to be less than ${formatMoney(total)}.`;
+    return "";
+  })();
+  const payments = splitPayment && !splitIssue
+    ? [
+        { method: paymentMethod, amount: splitFirstAmount.toFixed(2) },
+        { method: splitSecondMethod, amount: splitSecondAmount.toFixed(2) },
+      ]
+    : [{ method: paymentMethod, amount: total.toFixed(2) }];
   const imeiIssue = (() => {
     if (cart.some((line) => imeiLineStatus(line) === "missing")) {
       return "Scan an IMEI for every phone before checkout.";
@@ -5325,6 +5353,7 @@ function PosPage({ products, reports = [], storeLocations = [], activeEmployee, 
   const canCheckout =
     cart.length > 0
     && !imeiIssue
+    && !splitIssue
     && cardChargeComplete
     && Boolean(paymentMethod);
 
@@ -5332,14 +5361,14 @@ function PosPage({ products, reports = [], storeLocations = [], activeEmployee, 
     setCard((current) =>
       current.status === "idle" ? current : { status: "idle", message: "", refNum: "" },
     );
-  }, [total, paymentMethod]);
+  }, [total, paymentMethod, splitPayment, splitSecondMethod, splitFirstInput]);
 
   async function chargeCard() {
-    if (!requiresCardCharge || !total) return;
+    if (!requiresCardCharge || !cardAmount) return;
     try {
       setCard({ status: "charging", message: "Sending sale to the terminal...", refNum: "" });
       const result = await chargeOnLocalTerminal({
-        amount: total.toFixed(2),
+        amount: cardAmount.toFixed(2),
         externalRequestId: `sale-${Date.now()}`,
         onStatus: (text) => setCard((current) => ({ ...current, message: text })),
       });
@@ -5368,6 +5397,7 @@ function PosPage({ products, reports = [], storeLocations = [], activeEmployee, 
     if (!canCheckout) {
       if (imeiIssue) setMessage(imeiIssue);
       else if (!paymentMethod) setMessage("Choose a payment method before completing the sale.");
+      else if (splitIssue) setMessage(splitIssue);
       else if (!cardChargeComplete) setMessage("Charge the card before completing the sale.");
       return;
     }
@@ -5401,7 +5431,9 @@ function PosPage({ products, reports = [], storeLocations = [], activeEmployee, 
       location: activeLocation,
       customerPhone: customerPhone.trim(),
       paymentAmount: total.toFixed(2),
-      paymentMethod,
+      paymentMethod: payments.length > 1
+        ? payments.map((entry) => entry.method).join(" + ")
+        : paymentMethod,
       notes: notes.trim(),
       createdAt: new Date().toISOString(),
       details: {
@@ -5421,6 +5453,7 @@ function PosPage({ products, reports = [], storeLocations = [], activeEmployee, 
         taxRate,
         taxAmount: taxAmount.toFixed(2),
         outOfState: outOfState ? "Yes" : "No",
+        payments,
         storeAddress: activeStoreInfo?.address || "",
         storeHours: activeStoreInfo?.hours || "",
         customerName: customerInfo?.name || "",
@@ -5437,6 +5470,9 @@ function PosPage({ products, reports = [], storeLocations = [], activeEmployee, 
     setCustomerPhone("");
     setNotes("");
     setPaymentMethod("");
+    setSplitPayment(false);
+    setSplitSecondMethod("");
+    setSplitFirstInput("");
     setOutOfState(false);
     setCard({ status: "idle", message: "", refNum: "" });
     setMessage("");
@@ -5729,6 +5765,43 @@ function PosPage({ products, reports = [], storeLocations = [], activeEmployee, 
                 ))}
               </select>
             </label>
+            <label className="checkbox-field full pos-split-toggle">
+              <input
+                type="checkbox"
+                checked={splitPayment}
+                onChange={(event) => {
+                  setSplitPayment(event.target.checked);
+                  if (!event.target.checked) { setSplitSecondMethod(""); setSplitFirstInput(""); }
+                }}
+              />
+              <span>Split between two payment methods</span>
+            </label>
+            {splitPayment ? (
+              <div className="pos-split full">
+                <label className="field">
+                  <span>{paymentMethod || "First method"} amount</span>
+                  <input
+                    inputMode="decimal"
+                    placeholder="0.00"
+                    value={splitFirstInput}
+                    onChange={(event) => setSplitFirstInput(event.target.value)}
+                  />
+                </label>
+                <label className="field">
+                  <span>Second method</span>
+                  <select value={splitSecondMethod} onChange={(event) => setSplitSecondMethod(event.target.value)}>
+                    <option value="" disabled>Select one</option>
+                    {paymentMethods.filter((method) => method !== paymentMethod).map((method) => (
+                      <option key={method}>{method}</option>
+                    ))}
+                  </select>
+                </label>
+                <p className="pos-split-remainder">
+                  <span>{splitSecondMethod || "Second method"}</span>
+                  <strong>{formatMoney(splitSecondAmount)}</strong>
+                </p>
+              </div>
+            ) : null}
             <label className="field full">
               <span>Notes (optional)</span>
               <textarea value={notes} onChange={(event) => setNotes(event.target.value)} rows={1} />
@@ -5755,7 +5828,7 @@ function PosPage({ products, reports = [], storeLocations = [], activeEmployee, 
             <div className="payment-panel payment-panel-stack payment-panel-compact">
               <div className="card-reader-row">
                 <span className="reader-dot connected" aria-hidden="true" />
-                <span className="muted">Verifone P200 · charge {formatMoney(total)}</span>
+                <span className="muted">Verifone P200 · charge {formatMoney(cardAmount)}</span>
               </div>
               <button
                 className="secondary-button"
@@ -5777,7 +5850,8 @@ function PosPage({ products, reports = [], storeLocations = [], activeEmployee, 
           </div>
           <div className="pos-checkout-actions">
             {imeiIssue ? <p className="pos-warning">{imeiIssue}</p> : null}
-            {!imeiIssue && requiresCardCharge && !cardChargeComplete ? (
+            {!imeiIssue && splitIssue ? <p className="pos-warning">{splitIssue}</p> : null}
+            {!imeiIssue && !splitIssue && requiresCardCharge && !cardChargeComplete ? (
               <p className="pos-warning">Charge the card before completing the sale.</p>
             ) : null}
             <button className="primary-button pos-complete-button" type="button" disabled={!canCheckout} onClick={handleCheckout}>
@@ -6202,6 +6276,13 @@ function printSaleReceipt(sale) {
     <div class="line line-tax"><span>Tax${details.taxRate ? ` (${details.taxRate}%)` : ""}</span><span>${formatMoney(taxAmount)}</span></div>`
     : "";
 
+  const splitPayments = (details.payments || []).filter((entry) => entry?.method);
+  const paidBlock = splitPayments.length > 1
+    ? splitPayments
+        .map((entry) => `<div class="line"><span>Paid by ${escapeHtml(entry.method)}</span><span>${formatMoney(Number(entry.amount) || 0)}</span></div>`)
+        .join("")
+    : `<div class="paid">Paid by ${escapeHtml(sale.paymentMethod || "-")}</div>`;
+
   const css = THERMAL_CHECKOUT_CSS;
   const customerBlock = receiptCustomerHtml(
     details.customerName,
@@ -6219,7 +6300,7 @@ function printSaleReceipt(sale) {
     <div class="divider"></div>
     ${taxBlock}
     <div class="total total-grand"><span>Grand total</span><span>${formatMoney(total)}</span></div>
-    <div class="paid">Paid by ${escapeHtml(sale.paymentMethod || "-")}</div>
+    ${paidBlock}
     ${barcodeBlock}
     <div class="divider"></div>
     ${receiptFooterHtml(details.storeHours)}`;
@@ -6418,6 +6499,7 @@ function printRentalReceipt(report) {
 
 function SaleReceiptDialog({ sale, onClose }) {
   const details = sale.details || {};
+  const salePayments = (details.payments || []).filter((entry) => entry?.method);
   const lines = details.lineItems || [];
   const total = Number(sale.paymentAmount) || 0;
   const soldAt = toJsDate(sale.createdAt) || new Date();
@@ -6435,6 +6517,13 @@ function SaleReceiptDialog({ sale, onClose }) {
           <div>
             <h3>Sale complete</h3>
             <p className="muted">{formatMoney(total)} paid by {sale.paymentMethod}</p>
+            {salePayments.length > 1 ? (
+              <p className="muted">
+                {salePayments
+                  .map((entry) => `${entry.method} ${formatMoney(Number(entry.amount) || 0)}`)
+                  .join(" · ")}
+              </p>
+            ) : null}
           </div>
         </div>
 
@@ -6485,7 +6574,7 @@ function ImeiLotCapture({ imeis, target, onChangeImeis, blocked = [] }) {
   const reachedTarget = targetNum > 0 && imeis.length >= targetNum;
 
   function addImei() {
-    const value = entry.replace(/\D/g, "").slice(0, 15);
+    const value = entry.replace(/\D/g, "");
     setEntry("");
     if (!value) return;
     if (blocked.includes(value)) {
@@ -6531,13 +6620,13 @@ function ImeiLotCapture({ imeis, target, onChangeImeis, blocked = [] }) {
       </div>
       <div className="imei-lot-scan">
         <label className="field">
-          <span>{scanMode ? "Scan an IMEI — it adds automatically" : "Type a 15-digit IMEI, then press Enter"}</span>
+          <span>{scanMode ? "Scan an IMEI — it adds automatically" : "Type an IMEI, then press Enter"}</span>
           <input
             ref={inputRef}
             value={entry}
             onChange={(event) => setEntry(event.target.value)}
             onKeyDown={handleEntryKeyDown}
-            placeholder={scanMode ? "Scan IMEI" : "Type 15-digit IMEI, then Enter"}
+            placeholder={scanMode ? "Scan IMEI" : "Type IMEI, then Enter"}
             inputMode="numeric"
             autoComplete="off"
             spellCheck={false}
@@ -8422,7 +8511,7 @@ function ReturnDialog({ report, onClose, onSubmit }) {
                       <span>Scan IMEI to restock (sold: {line.soldImei || "n/a"})</span>
                       <input
                         value={line.scanImei}
-                        onChange={(event) => setLine(line.index, { scanImei: event.target.value.replace(/\D/g, "").slice(0, 15) })}
+                        onChange={(event) => setLine(line.index, { scanImei: event.target.value.replace(/\D/g, "") })}
                         placeholder="Scan the returned phone's IMEI"
                         inputMode="numeric"
                         autoComplete="off"

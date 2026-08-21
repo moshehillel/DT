@@ -3513,6 +3513,39 @@ tr:last-child td {
   font-size: 15px;
 }
 
+/* Split tender: the two method fields sit side by side under the payment
+   select, with the auto-calculated remainder called out underneath. */
+.pos-split {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: #fbfcfd;
+}
+
+.pos-split-remainder {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin: 0;
+  padding-top: 8px;
+  border-top: 1px dashed var(--line);
+  font-size: 13px;
+  color: var(--muted, #667);
+}
+
+.pos-split-remainder strong {
+  font-size: 16px;
+  color: var(--brand-dark);
+}
+
+.pos-split-toggle {
+  margin-top: 2px;
+}
+
 /* Sort control sits beside the search box and stays out of its way. */
 .pos-sort {
   flex: 0 0 auto;
