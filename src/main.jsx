@@ -5218,7 +5218,7 @@ function PosPage({ products, reports = [], storeLocations = [], activeEmployee, 
     return "ok";
   }
 
-  function makeLine(product) {
+  function makeLine(product, imei = "") {
     return {
       lineId: crypto.randomUUID(),
       productId: product.id,
@@ -5227,7 +5227,7 @@ function PosPage({ products, reports = [], storeLocations = [], activeEmployee, 
       price: Number(product.price) || 0,
       qty: 1,
       requiresImei: Boolean(product.requiresImei),
-      imei: "",
+      imei: product.requiresImei ? imei : "",
       category: product.category || "",
       adjustCode: "",
     };
@@ -5273,6 +5273,22 @@ function PosPage({ products, reports = [], storeLocations = [], activeEmployee, 
     );
   }
 
+  function findProductByImei(imei) {
+    const clean = digitsOnly(imei);
+    if (!clean) return null;
+    const matches = products.filter(
+      (product) =>
+        product.requiresImei
+        && (product.imeis || []).some((value) => digitsOnly(value) === clean),
+    );
+    if (!matches.length) return null;
+    return (
+      matches.find((product) => product.location === activeLocation) ||
+      matches.find((product) => !product.location) ||
+      matches[0]
+    );
+  }
+
   function findProductBySku(sku) {
     const clean = String(sku || "").trim().toLowerCase();
     if (!clean) return null;
@@ -5289,7 +5305,7 @@ function PosPage({ products, reports = [], storeLocations = [], activeEmployee, 
     );
   }
 
-  function addProductToCart(product) {
+  function addProductToCart(product, imei = "") {
     const stock = product.requiresImei ? (product.imeis?.length || 0) : (Number(product.quantity) || 0);
     const inCart = cart
       .filter((line) => line.productId === product.id)
@@ -5306,7 +5322,7 @@ function PosPage({ products, reports = [], storeLocations = [], activeEmployee, 
     }
     setCart((current) => {
       if (product.requiresImei) {
-        return [...current, makeLine(product)];
+        return [...current, makeLine(product, imei)];
       }
       const existing = current.find((line) => line.productId === product.id && !line.requiresImei);
       if (existing) {
@@ -5323,6 +5339,25 @@ function PosPage({ products, reports = [], storeLocations = [], activeEmployee, 
     event.preventDefault();
     const term = scan.trim();
     if (!term) return;
+
+    // A scanned IMEI resolves to the handset carrying it and fills the line's
+    // IMEI in for the cashier. Only IMEIs already on file match; anything else
+    // falls through to the normal SKU/barcode lookup.
+    const imeiProduct = findProductByImei(term);
+    if (imeiProduct) {
+      const imei = digitsOnly(term);
+      if (cart.some((line) => line.imei === imei)) {
+        playScanError();
+        setMessage(`IMEI ${imei} is already on this sale.`);
+      } else if (addProductToCart(imeiProduct, imei)) {
+        playScanBeep();
+        setMessage(`Added ${imeiProduct.name} · IMEI ${imei}.`);
+      }
+      setScan("");
+      scanRef.current?.focus();
+      return;
+    }
+
     const product = findProductBySku(term);
     if (!product) {
       playScanError();
