@@ -3513,6 +3513,25 @@ tr:last-child td {
   font-size: 15px;
 }
 
+/* Sort control sits beside the search box and stays out of its way. */
+.pos-sort {
+  flex: 0 0 auto;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 0 10px;
+  min-height: 42px;
+  background: #fbfcfd;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--muted, #667);
+}
+
+.pos-sort:focus {
+  border-color: var(--brand);
+  box-shadow: 0 0 0 3px rgba(20, 107, 99, 0.14);
+  background: #fff;
+}
+
 .pos-quick-panel .pos-product-grid {
   grid-template-columns: repeat(auto-fill, minmax(158px, 1fr));
   gap: 10px;

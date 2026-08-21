@@ -1465,6 +1465,7 @@ function Workspace({ currentUser, isAdmin }) {
           <PosPage
             key={`pos-${formNonce}`}
             products={products}
+            reports={reports}
             storeLocations={storeLocations}
             activeEmployee={activeEmployee}
             activeLocation={activeLocation}
@@ -5054,7 +5055,7 @@ function DeliveryBoard({ orders, activeEmployee, sessionRole, activeLocation, on
   );
 }
 
-function PosPage({ products, storeLocations = [], activeEmployee, activeLocation, activeDeviceId, activeTaxRate, activeStoreInfo, onSaveCustomerName, onSaveCustomer, onSaveProduct, onCompleteSale }) {
+function PosPage({ products, reports = [], storeLocations = [], activeEmployee, activeLocation, activeDeviceId, activeTaxRate, activeStoreInfo, onSaveCustomerName, onSaveCustomer, onSaveProduct, onCompleteSale }) {
   const [cart, setCart] = useState([]);
   const [scan, setScan] = useState("");
   const [scanMode, setScanMode] = useState(true);
@@ -5064,6 +5065,7 @@ function PosPage({ products, storeLocations = [], activeEmployee, activeLocation
   // Customer resolved by the phone field (queried on demand) for the receipt/CRM.
   const [resolvedCustomer, setResolvedCustomer] = useState(null);
   const [productSearch, setProductSearch] = useState("");
+  const [sortMode, setSortMode] = useState("used");
   const [customerPhone, setCustomerPhone] = useState("");
   const [paymentMethod, setPaymentMethod] = useState("");
   const [outOfState, setOutOfState] = useState(false);
@@ -5091,19 +5093,45 @@ function PosPage({ products, storeLocations = [], activeEmployee, activeLocation
     [products],
   );
 
+  // Units sold per product across every recorded sale, so the search can float
+  // the items this shop actually rings up to the top. Read off the reports
+  // already in memory — no extra queries.
+  const unitsSoldByProduct = useMemo(() => {
+    const counts = new Map();
+    reports.forEach((report) => {
+      (report.details?.lineItems || []).forEach((line) => {
+        if (!line.productId) return;
+        counts.set(line.productId, (counts.get(line.productId) || 0) + (Number(line.qty) || 1));
+      });
+    });
+    return counts;
+  }, [reports]);
+
   // Quick-add only surfaces matches once a couple of characters are typed,
   // instead of listing the entire catalog up front.
   const quickAddProducts = useMemo(() => {
     const clean = productSearch.trim().toLowerCase();
     if (clean.length < 2) return [];
-    return availableProducts.filter((product) =>
+    const matches = availableProducts.filter((product) =>
       [product.name, product.sku, product.barcode, product.category]
         .filter(Boolean)
         .join(" ")
         .toLowerCase()
         .includes(clean),
     );
-  }, [productSearch, availableProducts]);
+    // availableProducts is already name-sorted, so name order needs no re-sort
+    // and doubles as the tie-breaker for the other two modes.
+    const byName = (a, b) => String(a.name || "").localeCompare(String(b.name || ""));
+    if (sortMode === "price") {
+      return matches.slice().sort((a, b) => (Number(a.price) || 0) - (Number(b.price) || 0) || byName(a, b));
+    }
+    if (sortMode === "used") {
+      return matches
+        .slice()
+        .sort((a, b) => (unitsSoldByProduct.get(b.id) || 0) - (unitsSoldByProduct.get(a.id) || 0) || byName(a, b));
+    }
+    return matches;
+  }, [productSearch, availableProducts, sortMode, unitsSoldByProduct]);
 
   // True once the search is long enough to actually be filtering, so the panel
   // can tell "nothing typed yet" apart from "typed, but nothing matches".
@@ -5596,6 +5624,16 @@ function PosPage({ products, storeLocations = [], activeEmployee, activeLocation
                 autoComplete="off"
                 spellCheck={false}
               />
+              <select
+                className="pos-sort"
+                value={sortMode}
+                aria-label="Sort search results"
+                onChange={(event) => setSortMode(event.target.value)}
+              >
+                <option value="used">Most used</option>
+                <option value="price">Price: low to high</option>
+                <option value="name">Name: A to Z</option>
+              </select>
               {productSearch ? (
                 <button
                   className="secondary-button compact-button"
