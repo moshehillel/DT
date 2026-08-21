@@ -3651,8 +3651,28 @@ function EditRepairDialog({ repair, employees = [], onSave, onClose }) {
     originalTicket: details.originalTicket || "",
     notes: repair.notes || "",
   });
+  // Extra jobs found on the same handset after intake, each priced on its own.
+  const [extraFixes, setExtraFixes] = useState(() =>
+    (details.additionalFixes || []).map((fix) => ({
+      description: fix?.description || "",
+      price: fix?.price || "",
+    })),
+  );
 
   const set = (name, value) => setForm((current) => ({ ...current, [name]: value }));
+
+  function setFix(index, patch) {
+    setExtraFixes((current) => current.map((fix, i) => (i === index ? { ...fix, ...patch } : fix)));
+  }
+
+  const cleanFixes = extraFixes
+    .map((fix) => ({ description: fix.description.trim(), price: String(fix.price ?? "").trim() }))
+    .filter((fix) => fix.description || fix.price);
+  // What every job on the ticket adds up to, so the tech can see the number
+  // before deciding what to put in Final price.
+  const fixesTotal = cleanFixes.reduce((sum, fix) => sum + (Number(fix.price) || 0), 0);
+  const basePrice = Number(form.finalPrice || form.estimatedPrice) || 0;
+  const combinedTotal = basePrice + fixesTotal;
 
   function submit(event) {
     event.preventDefault();
@@ -3674,6 +3694,7 @@ function EditRepairDialog({ repair, employees = [], onSave, onClose }) {
         notificationPreference: form.notificationPreference,
         technician: form.technician.trim(),
         originalTicket: String(form.originalTicket ?? "").trim(),
+        additionalFixes: cleanFixes,
       },
     });
   }
@@ -3714,6 +3735,49 @@ function EditRepairDialog({ repair, employees = [], onSave, onClose }) {
               {["Text message", "Phone call", "Both"].map((option) => <option key={option}>{option}</option>)}
             </select>
           </label>
+          <div className="field full repair-fixes">
+            <span className="repair-fixes-label">Additional fixes on this phone</span>
+            {extraFixes.length ? (
+              extraFixes.map((fix, index) => (
+                <div className="repair-fix-row" key={index}>
+                  <input
+                    value={fix.description}
+                    placeholder="What else is being fixed?"
+                    onChange={(event) => setFix(index, { description: event.target.value })}
+                  />
+                  <input
+                    value={fix.price}
+                    inputMode="decimal"
+                    placeholder="0.00"
+                    onChange={(event) => setFix(index, { price: event.target.value })}
+                  />
+                  <button
+                    className="secondary-button compact-button"
+                    type="button"
+                    onClick={() => setExtraFixes((current) => current.filter((_, i) => i !== index))}
+                  >
+                    Remove
+                  </button>
+                </div>
+              ))
+            ) : (
+              <p className="muted">No extra fixes on this ticket yet.</p>
+            )}
+            <div className="repair-fixes-footer">
+              <button
+                className="secondary-button compact-button"
+                type="button"
+                onClick={() => setExtraFixes((current) => [...current, { description: "", price: "" }])}
+              >
+                + Add another fix
+              </button>
+              {cleanFixes.length ? (
+                <span className="muted">
+                  Extras {formatMoney(fixesTotal)} · all jobs {formatMoney(combinedTotal)}
+                </span>
+              ) : null}
+            </div>
+          </div>
           <label className="field full"><span>Notes</span><textarea rows={2} value={form.notes} onChange={(event) => set("notes", event.target.value)} /></label>
           <div className="pos-form-actions form-actions-row">
             <button className="primary-button" type="submit">Save changes</button>
@@ -5459,13 +5523,13 @@ function PosPage({ products, reports = [], storeLocations = [], activeEmployee, 
         customerName: customerInfo?.name || "",
         customerMobile: customerInfo?.mobile || "",
         customerAddress: customerInfo?.address || "",
+        customerEmail: customerInfo?.email || "",
         cardStatus: requiresCardCharge ? card.status : "",
         solaRefNum: requiresCardCharge ? card.refNum : "",
       },
     };
     onCompleteSale(sale);
     setCompletedSale(sale);
-    printSaleReceipt(sale);
     setCart([]);
     setCustomerPhone("");
     setNotes("");
@@ -6247,6 +6311,42 @@ function openThermalReceipt(title, css, bodyHtml) {
 }
 
 // Prints the sale receipt. Reused by the manual button and the auto-print on checkout.
+function buildReceiptText(sale) {
+  const details = sale.details || {};
+  const soldAt = toJsDate(sale.createdAt) || new Date();
+  const lines = (details.lineItems || []).map((line) => {
+    const amount = formatMoney((Number(line.price) || 0) * (Number(line.qty) || 0));
+    const imei = line.imei ? ` (IMEI ${line.imei})` : "";
+    return `${line.qty}x ${line.name}${imei} - ${amount}`;
+  });
+
+  const payments = (details.payments || []).filter((entry) => entry?.method);
+  const paidLines = payments.length > 1
+    ? payments.map((entry) => `Paid by ${entry.method}: ${formatMoney(Number(entry.amount) || 0)}`)
+    : [`Paid by ${sale.paymentMethod || "-"}`];
+
+  const taxLabel = `Tax${details.taxRate ? ` (${details.taxRate}%)` : ""}`;
+  const out = [
+    `Diamant Telecom${details.location ? ` - ${details.location}` : ""}`,
+    details.storeAddress || null,
+    "",
+    `Receipt ${sale.receiptCode || "-"}`,
+    soldAt.toLocaleString(),
+    sale.servedBy ? `Cashier: ${sale.servedBy}` : null,
+    details.customerName ? `Customer: ${details.customerName}` : null,
+    "",
+    ...lines,
+    "",
+    `Subtotal: ${formatMoney(Number(details.subtotal) || 0)}`,
+    `${taxLabel}: ${formatMoney(Number(details.taxAmount) || 0)}`,
+    `Total: ${formatMoney(Number(sale.paymentAmount) || 0)}`,
+    ...paidLines,
+    "",
+    "Thank you for shopping at Diamant Telecom.",
+  ];
+  return out.filter((line) => line !== null).join("\n");
+}
+
 function printSaleReceipt(sale) {
   const details = sale.details || {};
   const lines = details.lineItems || [];
@@ -6405,6 +6505,13 @@ function printRepairTicket(report) {
     ["Model", details.model],
     ["IMEI", details.imei],
     ["Issue", details.damage],
+    // Extra jobs agreed after intake print under the original issue.
+    ...(details.additionalFixes || [])
+      .filter((fix) => fix?.description || fix?.price)
+      .map((fix) => [
+        "Also fixing",
+        `${fix.description || "Fix"}${fix.price ? ` - ${formatMoney(Number(fix.price) || 0)}` : ""}`,
+      ]),
     ["Estimated price", estimatedPrice ? formatMoney(Number(estimatedPrice) || 0) : ""],
     ["Final price", details.finalPrice ? formatMoney(Number(details.finalPrice) || 0) : ""],
     ["SIM in phone", details.hadSim ? "Yes" : ""],
@@ -6497,15 +6604,63 @@ function printRentalReceipt(report) {
   openThermalReceipt(`Rental ${details.rentalId || report.id}`, css, body);
 }
 
-function SaleReceiptDialog({ sale, onClose }) {
+// Texts a receipt through Telebroad (same SMS line the repair notifications use).
+async function sendReceiptSms(to, body) {
+  const result = await callFunction("sendSaleReceiptSms", { to, body });
+  if (!result?.sent) throw new Error(result?.detail || "The text could not be sent.");
+  return result;
+}
+
+// Shown after a sale and again from any sale report. Nothing prints on its own —
+// the cashier picks print, email or text.
+function SaleReceiptDialog({ sale, onClose, reprint = false }) {
   const details = sale.details || {};
   const salePayments = (details.payments || []).filter((entry) => entry?.method);
   const lines = details.lineItems || [];
   const total = Number(sale.paymentAmount) || 0;
   const soldAt = toJsDate(sale.createdAt) || new Date();
 
+  const [mode, setMode] = useState("");
+  const [emailTo, setEmailTo] = useState(details.customerEmail || "");
+  const [textTo, setTextTo] = useState(sale.customerPhone || "");
+  const [sending, setSending] = useState(false);
+  const [status, setStatus] = useState("");
+
   function printReceipt() {
     printSaleReceipt(sale);
+    setStatus("Sent to the printer.");
+  }
+
+  // Hands the receipt to the default mail app, pre-addressed and pre-filled.
+  function emailReceipt() {
+    const to = emailTo.trim();
+    if (!to.includes("@")) {
+      setStatus("Enter the customer's email address.");
+      return;
+    }
+    const subject = `Diamant Telecom receipt ${sale.receiptCode || ""}`.trim();
+    const href = `mailto:${encodeURIComponent(to)}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(buildReceiptText(sale))}`;
+    window.location.href = href;
+    setStatus(`Opening your email app for ${to}.`);
+  }
+
+  // Plain text only — the receipt number and figures, never a picture.
+  async function textReceipt() {
+    const to = textTo.trim();
+    if (localPhoneDigits(to).length < 10) {
+      setStatus("Enter a 10-digit mobile number.");
+      return;
+    }
+    setSending(true);
+    setStatus("Sending...");
+    try {
+      await sendReceiptSms(to, buildReceiptText(sale));
+      setStatus(`Receipt texted to ${to}.`);
+    } catch (error) {
+      setStatus(error.message || "The text could not be sent.");
+    } finally {
+      setSending(false);
+    }
   }
 
   return (
@@ -6515,7 +6670,7 @@ function SaleReceiptDialog({ sale, onClose }) {
         <div className="receipt-success">
           <span className="receipt-check" aria-hidden="true">&#10003;</span>
           <div>
-            <h3>Sale complete</h3>
+            <h3>{reprint ? `Receipt ${sale.receiptCode || ""}` : "Sale complete"}</h3>
             <p className="muted">{formatMoney(total)} paid by {sale.paymentMethod}</p>
             {salePayments.length > 1 ? (
               <p className="muted">
@@ -6551,12 +6706,60 @@ function SaleReceiptDialog({ sale, onClose }) {
           <strong>{formatMoney(total)}</strong>
         </div>
 
+        <div className="receipt-delivery">
+          <p className="eyebrow">Send this receipt</p>
+          <div className="receipt-delivery-buttons">
+            <button className="secondary-button" type="button" onClick={printReceipt}>Print</button>
+            <button
+              className={`secondary-button${mode === "email" ? " is-active" : ""}`}
+              type="button"
+              onClick={() => { setMode(mode === "email" ? "" : "email"); setStatus(""); }}
+            >
+              Email
+            </button>
+            <button
+              className={`secondary-button${mode === "text" ? " is-active" : ""}`}
+              type="button"
+              onClick={() => { setMode(mode === "text" ? "" : "text"); setStatus(""); }}
+            >
+              Text
+            </button>
+          </div>
+
+          {mode === "email" ? (
+            <div className="receipt-delivery-row">
+              <input
+                type="email"
+                value={emailTo}
+                autoFocus
+                placeholder="customer@example.com"
+                onChange={(event) => setEmailTo(event.target.value)}
+              />
+              <button className="secondary-button" type="button" onClick={emailReceipt}>Open email</button>
+            </div>
+          ) : null}
+
+          {mode === "text" ? (
+            <div className="receipt-delivery-row">
+              <input
+                inputMode="tel"
+                value={textTo}
+                autoFocus
+                placeholder="Mobile number"
+                onChange={(event) => setTextTo(event.target.value)}
+              />
+              <button className="secondary-button" type="button" onClick={textReceipt} disabled={sending}>
+                {sending ? "Sending..." : "Send text"}
+              </button>
+            </div>
+          ) : null}
+
+          {status ? <p className="muted receipt-delivery-status">{status}</p> : null}
+        </div>
+
         <div className="pos-form-actions">
           <button className="primary-button" type="button" onClick={onClose} autoFocus>
-            New sale
-          </button>
-          <button className="secondary-button" type="button" onClick={printReceipt}>
-            Print receipt
+            {reprint ? "Close" : "New sale"}
           </button>
         </div>
       </div>
@@ -7861,7 +8064,10 @@ function AuditRow({ report }) {
 
 function ReportRow({ report, onStatusChange, onUpdateReport, onDeleteReport, onReturn, activeEmployee, hasActions }) {
   const [open, setOpen] = useState(false);
+  const [showReceipt, setShowReceipt] = useState(false);
   const saleLineItems = report.details?.lineItems || [];
+  // Any sale with line items can have its receipt reprinted, emailed or texted.
+  const canReprint = (report.type === "sale" || report.type === "phoneOrder") && saleLineItems.length > 0;
   const returnableType = report.type === "sale" || report.type === "phoneOrder";
   const fullyReturned = report.details?.returnStatus === "Fully returned";
   const canReturn = Boolean(onReturn) && returnableType && saleLineItems.length > 0 && !fullyReturned;
@@ -7902,6 +8108,15 @@ function ReportRow({ report, onStatusChange, onUpdateReport, onDeleteReport, onR
         </td>
         {hasActions ? (
           <td className="pos-row-actions" onClick={stop}>
+            {canReprint ? (
+              <button
+                className="secondary-button compact-button"
+                type="button"
+                onClick={() => setShowReceipt(true)}
+              >
+                Receipt
+              </button>
+            ) : null}
             {canReturn ? (
               <button
                 className="secondary-button compact-button"
@@ -7919,6 +8134,9 @@ function ReportRow({ report, onStatusChange, onUpdateReport, onDeleteReport, onR
               >
                 Delete
               </button>
+            ) : null}
+            {showReceipt ? (
+              <SaleReceiptDialog sale={report} reprint onClose={() => setShowReceipt(false)} />
             ) : null}
           </td>
         ) : null}
@@ -8269,6 +8487,10 @@ function ReportDetails({ report, compact }) {
       ["Ticket", details.ticketNumber],
       ["Model", details.model],
       ["Damage", details.damage],
+      ["Also fixed", (details.additionalFixes || [])
+        .filter((fix) => fix?.description || fix?.price)
+        .map((fix) => `${fix.description || "Fix"}${fix.price ? ` (${formatMoney(Number(fix.price) || 0)})` : ""}`)
+        .join(", ")],
       ["SIM in phone", details.hadSim ? "Yes" : ""],
       ["SD card in phone", details.hadSdCard ? "Yes" : ""],
       ["Loaner phone given", details.borrowedTempPhone ? "Yes" : ""],

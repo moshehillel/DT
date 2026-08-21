@@ -592,6 +592,21 @@ async function sendCustomerNotification({ to, method, body }) {
   return sendSms({ to, body });
 }
 
+// Texts a sale receipt to the customer. Plain text only: the body carries the
+// receipt number and the same figures that print on paper, never an image.
+exports.sendSaleReceiptSms = onCall({ region: REGION }, async (request) => {
+  if (!request.auth) throw new HttpsError("unauthenticated", "Sign in required.");
+  const to = String(request.data?.to || "").trim();
+  const body = String(request.data?.body || "").trim();
+  if (!to) throw new HttpsError("invalid-argument", "A mobile number is required.");
+  if (!body) throw new HttpsError("invalid-argument", "The receipt text is empty.");
+  // A receipt is a few hundred characters; anything much longer is not one.
+  if (body.length > 1600) throw new HttpsError("invalid-argument", "The receipt text is too long to send.");
+
+  const result = await sendSms({ to, body });
+  return { sent: result.status === "Sent", status: result.status, detail: result.detail || "" };
+});
+
 async function logNotification(reportId, report, status, detail) {
   await db.collection("notificationLogs").add({
     reportId,
