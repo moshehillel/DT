@@ -607,7 +607,12 @@ function Workspace({ currentUser, isAdmin }) {
 
   async function savePosSale(sale) {
     const enriched = await attachAuthMetadata(sale);
-    upsertCustomer({ phone: sale.customerPhone });
+    // Pass the details captured at checkout so this never files a nameless record.
+    upsertCustomer({
+      phone: sale.customerPhone,
+      name: sale.details?.customerName || "",
+      address: sale.details?.customerAddress || "",
+    });
     setReports((current) => [enriched, ...current]);
     setProducts((current) =>
       current.map((product) => {
@@ -4449,9 +4454,12 @@ function PhoneOrderPage({ activeEmployee, sessionRole, activeLocation, storeLoca
     setMessage(`Order created and sent to ${order.location || "the store"}.`);
   }
 
-  function handleCustomerPromptSave(values) {
+  async function handleCustomerPromptSave(values) {
     if (!customerPrompt) return;
-    onSaveCustomer?.({
+    await onSaveCustomer?.({
+      // Keep the fields this dialog doesn't edit (email, contact details, notes)
+      // so saving here never blanks them on the stored record.
+      ...(customerPrompt.customer || {}),
       id: customerPrompt.customer?.id || "",
       phone: customerPrompt.phone,
       name: values.name.trim(),
@@ -4728,6 +4736,7 @@ function PhoneOrderPage({ activeEmployee, sessionRole, activeLocation, storeLoca
         <CustomerInfoDialog
           phone={customerPrompt.phone}
           customer={customerPrompt.customer}
+          saveLabel="Save & create order"
           onSave={handleCustomerPromptSave}
           onSkip={handleCustomerPromptSkip}
           onClose={() => setCustomerPrompt(null)}
@@ -5061,7 +5070,6 @@ function PosPage({ products, storeLocations = [], activeEmployee, activeLocation
   const [notes, setNotes] = useState("");
   const [message, setMessage] = useState("");
   const [completedSale, setCompletedSale] = useState(null);
-  const [customerPrompt, setCustomerPrompt] = useState(null);
   const [customAmountOpen, setCustomAmountOpen] = useState(false);
   const [card, setCard] = useState({ status: "idle", message: "", refNum: "" });
   const scanRef = useRef(null);
@@ -5283,13 +5291,12 @@ function PosPage({ products, storeLocations = [], activeEmployee, activeLocation
     }
     return "";
   })();
-  const customerDigits = localPhoneDigits(customerPhone);
   const saleCustomer = findSaleCustomer();
-  const customerIssue = customerDigits.length < 6 ? "Add the customer's phone number." : "";
+  // Customer details are optional: a sale can be rung up with no phone, name or
+  // address. Whatever is filled in still rides along to the receipt and the CRM.
   const canCheckout =
     cart.length > 0
     && !imeiIssue
-    && !customerIssue
     && cardChargeComplete
     && Boolean(paymentMethod);
 
@@ -5332,14 +5339,8 @@ function PosPage({ products, storeLocations = [], activeEmployee, activeLocation
   function handleCheckout() {
     if (!canCheckout) {
       if (imeiIssue) setMessage(imeiIssue);
-      else if (customerIssue) setMessage(customerIssue);
       else if (!paymentMethod) setMessage("Choose a payment method before completing the sale.");
       else if (!cardChargeComplete) setMessage("Charge the card before completing the sale.");
-      return;
-    }
-    // Every sale needs a customer on file with a name for the receipt + CRM.
-    if (!saleCustomer?.name?.trim()) {
-      setCustomerPrompt({ phone: customerPhone.trim(), customer: saleCustomer, required: true });
       return;
     }
     completeSale(saleCustomer);
@@ -5411,28 +5412,6 @@ function PosPage({ products, storeLocations = [], activeEmployee, activeLocation
     setOutOfState(false);
     setCard({ status: "idle", message: "", refNum: "" });
     setMessage("");
-  }
-
-  // Saves the entered/updated customer to the CRM, then finishes the sale with
-  // those details on the receipt.
-  function handleCustomerPromptSave(values) {
-    if (!customerPrompt) return;
-    const info = {
-      name: values.name.trim(),
-      mobile: values.mobile.trim(),
-      address: values.address.trim(),
-    };
-    const saved = {
-      id: customerPrompt.customer?.id || "",
-      phone: customerPrompt.phone,
-      mobile: info.mobile,
-      name: info.name,
-      address: info.address,
-    };
-    onSaveCustomer?.(saved);
-    setResolvedCustomer(saved);
-    setCustomerPrompt(null);
-    completeSale(saved);
   }
 
   function startNewSale() {
@@ -5661,9 +5640,10 @@ function PosPage({ products, storeLocations = [], activeEmployee, activeLocation
                         className="pos-product-restock"
                         type="button"
                         title={`Add stock to ${product.name}`}
+                        aria-label={`Add stock to ${product.name}`}
                         onClick={() => setRestock(product)}
                       >
-                        + Stock
+                        +
                       </button>
                     ) : null}
                   </div>
@@ -5696,16 +5676,11 @@ function PosPage({ products, storeLocations = [], activeEmployee, activeLocation
                 onSaveCustomer={onSaveCustomer}
                 onResolveCustomer={setResolvedCustomer}
                 onSelectCustomer={(customer) => { setCustomerPhone(customer.phone); setResolvedCustomer(customer); }}
-                placeholder="Required — search or add customer"
-                required
+                placeholder="Optional — search or add customer"
               />
             </label>
             {saleCustomer?.name ? (
               <p className="pos-customer-name">{saleCustomer.name}</p>
-            ) : customerIssue ? (
-              <p className="pos-warning pos-customer-hint">{customerIssue}</p>
-            ) : customerDigits.length >= 6 ? (
-              <p className="pos-warning pos-customer-hint">Customer name required — complete at checkout.</p>
             ) : null}
             <label className="field">
               <span>Payment method</span>
@@ -5764,8 +5739,7 @@ function PosPage({ products, storeLocations = [], activeEmployee, activeLocation
           </div>
           <div className="pos-checkout-actions">
             {imeiIssue ? <p className="pos-warning">{imeiIssue}</p> : null}
-            {!imeiIssue && customerIssue ? <p className="pos-warning">{customerIssue}</p> : null}
-            {!imeiIssue && !customerIssue && requiresCardCharge && !cardChargeComplete ? (
+            {!imeiIssue && requiresCardCharge && !cardChargeComplete ? (
               <p className="pos-warning">Charge the card before completing the sale.</p>
             ) : null}
             <button className="primary-button pos-complete-button" type="button" disabled={!canCheckout} onClick={handleCheckout}>
@@ -5785,16 +5759,6 @@ function PosPage({ products, storeLocations = [], activeEmployee, activeLocation
             }
           }}
           onClose={() => setCustomAmountOpen(false)}
-        />
-      ) : null}
-
-      {customerPrompt ? (
-        <CustomerInfoDialog
-          phone={customerPrompt.phone}
-          customer={customerPrompt.customer}
-          required={customerPrompt.required}
-          onSave={handleCustomerPromptSave}
-          onClose={() => setCustomerPrompt(null)}
         />
       ) : null}
 
@@ -6005,24 +5969,29 @@ function CustomAmountDialog({ onAdd, onClose }) {
 
 // Prompt shown at checkout when the entered phone is a new customer or is missing
 // a name / address — captures those for the receipt and the CRM.
-function CustomerInfoDialog({ phone, customer, onSave, onSkip, onClose, required = false }) {
-  const isNew = !customer;
+function CustomerInfoDialog({ phone, customer, onSave, onSkip, onClose, saveLabel = "Save customer" }) {
+  const isNew = !customer?.name && !customer?.address;
   const [name, setName] = useState(customer?.name || "");
   const [mobile, setMobile] = useState(customer?.mobile || "");
   const [address, setAddress] = useState(customer?.address || "");
-  const [nameError, setNameError] = useState("");
+  const [saving, setSaving] = useState(false);
 
-  function submit(event) {
+  // Every field here is optional — nothing in this dialog blocks a sale or an
+  // order; it only captures what the cashier has for the receipt and the CRM.
+  async function submit(event) {
     event.preventDefault();
     // Stop the submit from bubbling (through React's portal tree) to any parent
     // report/order form, which would otherwise also fire its own submit.
     event.stopPropagation();
-    if (required && !name.trim()) {
-      setNameError("Customer name is required.");
-      return;
+    if (saving) return;
+    // onSave may write to the CRM before it returns; block a second submit until
+    // it settles, so one click can't file two records.
+    setSaving(true);
+    try {
+      await onSave({ name, mobile, address });
+    } finally {
+      setSaving(false);
     }
-    setNameError("");
-    onSave({ name, mobile, address });
   }
 
   // Rendered through a portal so the dialog's <form> is never nested inside the
@@ -6033,25 +6002,24 @@ function CustomerInfoDialog({ phone, customer, onSave, onSkip, onClose, required
       <div className="dialog-card" role="dialog" aria-modal="true" onMouseDown={(event) => event.stopPropagation()}>
         <h2>{isNew ? "Add customer" : "Complete customer details"}</h2>
         <p className="muted">
-          {required
-            ? "A customer is required before completing this sale."
-            : isNew
-              ? `${phone} isn't in the CRM yet. Add their details for the receipt and follow-up.`
-              : `${phone} is missing some details. Add them for the receipt and follow-up.`}
+          {isNew
+            ? `${phone} isn't in the CRM yet. Add whatever you have — all of it is optional.`
+            : `${phone} is missing some details. Add them for the receipt and follow-up.`}
         </p>
         <form className="form-grid" onSubmit={submit}>
           <label className="field"><span>Phone</span><input value={phone} disabled /></label>
           <label className="field">
-            <span>Name{required ? " *" : ""}</span>
-            <input value={name} onChange={(event) => { setName(event.target.value); setNameError(""); }} autoFocus required={required} />
-            {nameError ? <p className="pos-warning">{nameError}</p> : null}
+            <span>Name (optional)</span>
+            <input value={name} onChange={(event) => setName(event.target.value)} autoFocus />
           </label>
           <label className="field"><span>Mobile (optional)</span><input value={mobile} inputMode="tel" onChange={(event) => setMobile(event.target.value)} /></label>
           <AddressAutocomplete value={address} onChange={setAddress} />
           <div className="pos-form-actions form-actions-row">
-            <button className="primary-button" type="submit">Save &amp; complete sale</button>
-            {!required && onSkip ? <button className="secondary-button" type="button" onClick={onSkip}>Skip</button> : null}
-            {required ? <button className="secondary-button" type="button" onClick={onClose}>Cancel</button> : null}
+            <button className="primary-button" type="submit" disabled={saving}>
+              {saving ? "Saving..." : saveLabel}
+            </button>
+            {onSkip ? <button className="secondary-button" type="button" onClick={onSkip}>Skip</button> : null}
+            <button className="secondary-button" type="button" onClick={onClose}>Cancel</button>
           </div>
         </form>
       </div>
@@ -8573,9 +8541,12 @@ function CustomerPhoneInput({ value, onChange, onSelectCustomer, onResolveCustom
     onSelectCustomer?.(customer);
   }
 
-  function saveDetails(values) {
+  async function saveDetails(values) {
     const customer = detailsPrompt;
-    onSaveCustomer?.({
+    await onSaveCustomer?.({
+      // Carry over the fields this dialog doesn't edit (email, contact details,
+      // notes); without them the save would blank those on the stored record.
+      ...customer,
       id: customer.id || "",
       phone: customer.phone || value,
       name: values.name.trim(),
