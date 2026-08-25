@@ -3507,10 +3507,29 @@ tr:last-child td {
 }
 
 .pos-quick-panel .pos-quick-actions .pos-search {
-  flex: 1 1 auto;
+  flex: 1 1 160px;
+  /* Without this the 240px min-width below stops the row from shrinking, so on a
+     narrow screen the search box spills over the "Find a product" heading. */
+  min-width: 0;
   max-width: 340px;
   min-height: 42px;
   font-size: 15px;
+}
+
+/* Let the search row give way instead of overlapping the heading: it shrinks
+   first, then wraps onto its own line once there is genuinely no room. */
+.pos-quick-panel .history-header {
+  flex-wrap: wrap;
+}
+
+.pos-quick-panel .history-header > div:first-child {
+  min-width: 0;
+}
+
+.pos-quick-panel .pos-quick-actions {
+  min-width: 0;
+  flex-wrap: wrap;
+  row-gap: 6px;
 }
 
 /* Extra jobs added to an existing repair ticket. */
@@ -3813,6 +3832,22 @@ tr:last-child td {
   min-height: 48px;
 }
 
+/* The card panel is pinned in the action footer with the Complete-sale button,
+   never inside the scrolling part of checkout: on a short screen the cashier
+   would otherwise have to scroll to find "Charge card" (or zoom the browser out
+   to 90%) before the sale could be finished. */
+.pos-checkout-actions .payment-panel-compact {
+  margin-top: 0;
+  gap: 6px;
+  padding: 8px 10px;
+}
+
+.pos-checkout-actions .payment-panel-compact .secondary-button {
+  width: 100%;
+  min-height: 44px;
+  font-weight: 700;
+}
+
 @media (max-width: 980px) {
   .pos-page .pos-layout {
     grid-template-columns: 1fr;
@@ -3897,3 +3932,58 @@ tr:last-child td {
 }
 
 .pos-customer-name {
+
+/* ---- Take-payment dialog (repairs) ---- */
+.pay-dialog {
+  width: min(520px, calc(100vw - 32px));
+}
+
+.pay-form {
+  grid-template-columns: 1fr;
+  gap: 12px;
+}
+
+.pay-amount-input {
+  font-size: 22px;
+  font-weight: 800;
+  min-height: 52px;
+}
+
+.pay-amount-hints {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-top: -8px;
+}
+
+/* Tap targets instead of a dropdown: the method the customer actually pays with
+   is usually not the one guessed at intake, so it has to be one press to change. */
+.pay-method-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(104px, 1fr));
+  gap: 8px;
+  margin-top: 6px;
+}
+
+.pay-method {
+  min-height: 46px;
+  padding: 0 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: #fbfcfd;
+  font-weight: 700;
+  color: var(--muted);
+}
+
+.pay-method:hover:not(:disabled) {
+  border-color: var(--brand);
+  color: var(--brand-dark);
+}
+
+.pay-method.selected {
+  border-color: var(--brand);
+  background: var(--brand-soft);
+  color: var(--brand-dark);
+  box-shadow: 0 0 0 2px rgba(20, 107, 99, 0.14);
+}

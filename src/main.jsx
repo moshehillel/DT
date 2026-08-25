@@ -3386,6 +3386,8 @@ function ReportHistory({
 
 function OpenRepairsPage({ reports, employees = [], onStatusChange, onSetReady, onMarkPaid, onEditRepair }) {
   const [paying, setPaying] = useState({ id: "", status: "", message: "" });
+  // When set, the take-payment dialog is open for this repair.
+  const [payPrompt, setPayPrompt] = useState(null);
   // When set, the final-price dialog is open for this repair before it goes Ready.
   const [finalPrompt, setFinalPrompt] = useState(null);
   // When set, the edit dialog is open for this repair.
@@ -3435,29 +3437,54 @@ function OpenRepairsPage({ reports, employees = [], onStatusChange, onSetReady, 
     setFinalPrompt(null);
   }
 
-  // Mark a repair paid. For card payments, run the charge on the local terminal
+  // Open the take-payment dialog for a repair. Everything the cashier needs to
+  // collect money lives in that one dialog — the amount and the method the
+  // customer is actually paying with, which is often not what was guessed at
+  // intake — so no one has to go and edit the ticket first.
+  function openPayment(repair) {
+    if (repair.details?.paymentStatus === "Paid") return;
+    setPaying({ id: "", status: "", message: "" });
+    setPayPrompt(repair);
+  }
+
+  // Take the payment. For card payments, run the charge on the local terminal
   // first and only mark paid once the card is approved. The "paid" SMS to the
   // customer is sent by the notifyRepairPaid Cloud Function on the status change.
-  async function handleMarkPaid(repair, manualEntry = false) {
-    if (repair.details?.paymentStatus === "Paid") return;
-    const needsTerminal = isCardPayment(repair.paymentMethod);
-
-    if (!needsTerminal) {
-      onMarkPaid(repair.id);
-      setPaying({ id: "", status: "", message: "" });
+  async function confirmPayment({ amount, method, manualEntry }) {
+    const repair = payPrompt;
+    if (!repair || repair.details?.paymentStatus === "Paid") {
+      setPayPrompt(null);
       return;
     }
 
-    const amount = Number.parseFloat(repair.paymentAmount);
-    if (!Number.isFinite(amount) || amount <= 0) {
-      window.alert("Set a payment amount on this repair before charging the card.");
+    const value = Number.parseFloat(amount);
+    if (!Number.isFinite(value) || value <= 0) {
+      setPaying({ id: repair.id, status: "error", message: "Enter the amount the customer is paying." });
+      return;
+    }
+    if (!method) {
+      setPaying({ id: repair.id, status: "error", message: "Pick how the customer is paying." });
+      return;
+    }
+
+    // Record what was actually collected before marking paid, so the ticket and
+    // the reports show the real amount and method instead of the intake guess.
+    const paidAmount = value.toFixed(2);
+    if (paidAmount !== String(repair.paymentAmount ?? "").trim() || method !== repair.paymentMethod) {
+      onEditRepair(repair.id, { paymentAmount: paidAmount, paymentMethod: method });
+    }
+
+    if (!isCardPayment(method)) {
+      onMarkPaid(repair.id);
+      setPaying({ id: "", status: "", message: "" });
+      setPayPrompt(null);
       return;
     }
 
     try {
       setPaying({ id: repair.id, status: "charging", message: manualEntry ? "Follow the terminal: key in the card by hand." : "Follow the terminal: tap, insert, or swipe the card." });
       const result = await chargeOnLocalTerminal({
-        amount: amount.toFixed(2),
+        amount: paidAmount,
         externalRequestId: `repair-${repair.id}`.slice(0, 32),
         manualEntry,
         onStatus: (text) => setPaying((current) => ({ ...current, message: text })),
@@ -3468,6 +3495,7 @@ function OpenRepairsPage({ reports, employees = [], onStatusChange, onSetReady, 
         maskedCardNumber: result.maskedCardNumber || "",
       });
       setPaying({ id: "", status: "", message: "" });
+      setPayPrompt(null);
     } catch (error) {
       setPaying({ id: repair.id, status: "error", message: error.message || "Card payment failed." });
     }
@@ -3513,7 +3541,6 @@ function OpenRepairsPage({ reports, employees = [], onStatusChange, onSetReady, 
               openRepairs.map((repair) => {
                 const isPaid = repair.details?.paymentStatus === "Paid";
                 const isCharging = paying.id === repair.id && paying.status === "charging";
-                const needsTerminal = isCardPayment(repair.paymentMethod);
                 return (
                   <tr key={repair.id}>
                     <td>
@@ -3542,26 +3569,16 @@ function OpenRepairsPage({ reports, employees = [], onStatusChange, onSetReady, 
                       {isPaid ? null : (
                         <div className="pos-row-actions">
                           <button
-                            className="secondary-button compact-button"
+                            className="primary-button compact-button"
                             type="button"
                             disabled={isCharging}
-                            onClick={() => handleMarkPaid(repair)}
+                            onClick={() => openPayment(repair)}
                           >
-                            {isCharging ? "Charging…" : needsTerminal ? "Charge card & mark paid" : "Mark paid"}
+                            {isCharging ? "Charging…" : "Take payment"}
                           </button>
-                          {needsTerminal ? (
-                            <button
-                              className="secondary-button compact-button"
-                              type="button"
-                              disabled={isCharging}
-                              onClick={() => handleMarkPaid(repair, true)}
-                            >
-                              Manual entry
-                            </button>
-                          ) : null}
                         </div>
                       )}
-                      {paying.id === repair.id && paying.message ? (
+                      {!payPrompt && paying.id === repair.id && paying.message ? (
                         <p className={paying.status === "error" ? "summary-error" : "muted"}>{paying.message}</p>
                       ) : null}
                     </td>
@@ -3610,6 +3627,18 @@ function OpenRepairsPage({ reports, employees = [], onStatusChange, onSetReady, 
           </tbody>
         </table>
       </div>
+
+      {payPrompt ? (
+        <RepairPaymentDialog
+          repair={payPrompt}
+          paying={paying}
+          onConfirm={confirmPayment}
+          onClose={() => {
+            setPayPrompt(null);
+            setPaying({ id: "", status: "", message: "" });
+          }}
+        />
+      ) : null}
 
       {finalPrompt ? (
         <FinalPriceDialog
@@ -3782,6 +3811,122 @@ function EditRepairDialog({ repair, employees = [], onSave, onClose }) {
           <div className="pos-form-actions form-actions-row">
             <button className="primary-button" type="submit">Save changes</button>
             <button className="secondary-button" type="button" onClick={onClose}>Cancel</button>
+          </div>
+        </form>
+      </div>
+    </div>,
+    document.body,
+  );
+}
+
+// One dialog for taking money on a repair: confirm the amount, tap how the
+// customer is actually paying, and charge/mark paid in a single press. Before
+// this, the row buttons could only charge the method picked at intake and only
+// the amount already on the ticket, so a cashier had to open Edit first.
+function RepairPaymentDialog({ repair, paying, onConfirm, onClose }) {
+  const details = repair.details || {};
+  const fixesTotal = (details.additionalFixes || []).reduce(
+    (sum, fix) => sum + (Number(fix?.price) || 0),
+    0,
+  );
+  const basePrice = Number(details.finalPrice || details.estimatedPrice || repair.paymentAmount) || 0;
+  const suggested = Number(repair.paymentAmount) || basePrice;
+  const withFixes = basePrice + fixesTotal;
+
+  const [amount, setAmount] = useState(suggested ? String(suggested) : "");
+  const [method, setMethod] = useState(repair.paymentMethod || "");
+  const [manualEntry, setManualEntry] = useState(false);
+
+  const charging = paying.status === "charging";
+  const needsTerminal = isCardPayment(method);
+  const value = Number.parseFloat(amount);
+  const amountLabel = Number.isFinite(value) && value > 0 ? formatMoney(value) : "";
+
+  function submit(event) {
+    event.preventDefault();
+    event.stopPropagation();
+    if (charging) return;
+    onConfirm({ amount, method, manualEntry });
+  }
+
+  return createPortal(
+    <div className="dialog-backdrop" role="presentation" onMouseDown={charging ? undefined : onClose}>
+      <div className="dialog-card pay-dialog" role="dialog" aria-modal="true" onMouseDown={(event) => event.stopPropagation()}>
+        <h2>Take payment</h2>
+        <p className="muted">
+          {details.ticketNumber ? `Repair #${details.ticketNumber}` : "Repair"}
+          {details.customerName ? ` · ${details.customerName}` : ""}
+          {details.model ? ` · ${details.model}` : ""}
+        </p>
+        <form className="form-grid pay-form" onSubmit={submit}>
+          <label className="field full">
+            <span>Amount</span>
+            <input
+              className="pay-amount-input"
+              inputMode="decimal"
+              placeholder="0.00"
+              value={amount}
+              onChange={(event) => setAmount(event.target.value)}
+              autoFocus
+            />
+          </label>
+          <div className="pay-amount-hints full">
+            <span className="muted">
+              {details.finalPrice
+                ? `Final ${formatPayment(details.finalPrice)}`
+                : `Est. ${formatPayment(details.estimatedPrice || repair.paymentAmount)}`}
+            </span>
+            {fixesTotal > 0 && withFixes !== value ? (
+              <button className="secondary-button compact-button" type="button" onClick={() => setAmount(String(withFixes))}>
+                Use {formatMoney(withFixes)} (with extra jobs)
+              </button>
+            ) : null}
+          </div>
+
+          <div className="field full">
+            <span>Paying with</span>
+            <div className="pay-method-grid">
+              {paymentMethods.map((option) => (
+                <button
+                  key={option}
+                  className={`pay-method${option === method ? " selected" : ""}`}
+                  type="button"
+                  disabled={charging}
+                  onClick={() => setMethod(option)}
+                >
+                  {option}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {needsTerminal ? (
+            <label className="checkbox-field full">
+              <input
+                type="checkbox"
+                checked={manualEntry}
+                disabled={charging}
+                onChange={(event) => setManualEntry(event.target.checked)}
+              />
+              <span>Key the card in by hand (no tap / dip / swipe)</span>
+            </label>
+          ) : null}
+
+          {paying.message ? (
+            <p className={`full ${paying.status === "error" ? "summary-error" : "muted"}`}>{paying.message}</p>
+          ) : null}
+
+          <div className="pos-form-actions form-actions-row">
+            <button className="primary-button" type="submit" disabled={charging}>
+              {charging
+                ? "Charging…"
+                : needsTerminal
+                  ? `Charge card${amountLabel ? ` · ${amountLabel}` : ""}`
+                  : `Mark paid${amountLabel ? ` · ${amountLabel}` : ""}`}
+            </button>
+            <button className="secondary-button" type="button" onClick={onClose} disabled={charging}>
+              Cancel
+            </button>
           </div>
         </form>
       </div>
@@ -5922,32 +6067,31 @@ function PosPage({ products, reports = [], storeLocations = [], activeEmployee, 
             ) : null}
             <div className="pos-totals-row pos-totals-grand"><span>Grand total</span><strong>{formatMoney(total)}</strong></div>
           </div>
-
-          {requiresCardCharge ? (
-            <div className="payment-panel payment-panel-stack payment-panel-compact">
-              <div className="card-reader-row">
-                <span className="reader-dot connected" aria-hidden="true" />
-                <span className="muted">Verifone P200 · charge {formatMoney(cardAmount)}</span>
-              </div>
-              <button
-                className="secondary-button"
-                type="button"
-                onClick={chargeCard}
-                disabled={!total || card.status === "charging" || card.status === "paid"}
-              >
-                {card.status === "paid"
-                  ? "Card charged ✓"
-                  : card.status === "charging"
-                    ? "Waiting for card…"
-                    : "Charge card (tap / dip / swipe)"}
-              </button>
-              {card.message ? (
-                <p className={card.status === "error" ? "summary-error" : "muted"}>{card.message}</p>
-              ) : null}
-            </div>
-          ) : null}
           </div>
           <div className="pos-checkout-actions">
+            {requiresCardCharge ? (
+              <div className="payment-panel payment-panel-stack payment-panel-compact">
+                <div className="card-reader-row">
+                  <span className="reader-dot connected" aria-hidden="true" />
+                  <span className="muted">Verifone P200 · charge {formatMoney(cardAmount)}</span>
+                </div>
+                <button
+                  className="secondary-button"
+                  type="button"
+                  onClick={chargeCard}
+                  disabled={!total || card.status === "charging" || card.status === "paid"}
+                >
+                  {card.status === "paid"
+                    ? "Card charged ✓"
+                    : card.status === "charging"
+                      ? "Waiting for card…"
+                      : "Charge card (tap / dip / swipe)"}
+                </button>
+                {card.message ? (
+                  <p className={card.status === "error" ? "summary-error" : "muted"}>{card.message}</p>
+                ) : null}
+              </div>
+            ) : null}
             {imeiIssue ? <p className="pos-warning">{imeiIssue}</p> : null}
             {!imeiIssue && splitIssue ? <p className="pos-warning">{splitIssue}</p> : null}
             {!imeiIssue && !splitIssue && requiresCardCharge && !cardChargeComplete ? (
