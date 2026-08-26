@@ -299,6 +299,20 @@ export async function upsertCollectionItems(collectionName, items) {
   );
 }
 
+// Removes specific documents by id. Used by the sync outbox when it replays a
+// deletion that couldn't reach Firestore at the time it was made.
+export async function deleteCollectionItems(collectionName, ids) {
+  if (!ids.length) return;
+  await ensureFirebaseAuth();
+  const { db } = await getFirebase();
+  const collectionRef = collection(db, collectionName);
+
+  await commitBatches(
+    db,
+    ids.map((id) => (batch) => batch.delete(doc(collectionRef, id))),
+  );
+}
+
 // Stable JSON for change detection: sort object keys so two equal objects with a
 // different key order aren't treated as "changed" and don't trigger a write.
 function stableStringify(value) {

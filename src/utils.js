@@ -130,6 +130,24 @@ export function localPhoneDigits(value) {
   return digits.startsWith("1") ? digits.slice(1) : digits;
 }
 
+// Does this CRM record belong to the number on screen? A record that came back
+// from a Firestore query carries phoneDigits/mobileDigits, but one just typed
+// into the "Add new customer" dialog has only `phone` — comparing the stored
+// fields alone silently failed to match it, so the customer's name never made it
+// onto the receipt. Fall back to deriving the digits from the raw fields.
+export function customerMatchesDigits(customer, digits) {
+  if (!customer || !digits) return false;
+  const target = localPhoneDigits(digits);
+  if (!target) return false;
+  const candidates = [
+    customer.phoneDigits,
+    customer.mobileDigits,
+    localPhoneDigits(customer.phone),
+    localPhoneDigits(customer.mobile),
+  ];
+  return candidates.some((entry) => entry && localPhoneDigits(entry) === target);
+}
+
 // Readable phone line for thermal receipts, e.g. 8456370687 -> "845 637 0687".
 export function formatReceiptPhone(value) {
   const digits = localPhoneDigits(value);
@@ -167,6 +185,47 @@ export function normalizeRcukSimNumber(value) {
   if (digits.startsWith("00030")) return `89441${digits}`;
   if (digits.startsWith("006")) return `894411${digits}`;
   return digits;
+}
+
+// The two RCUK SIM stocks, and how long a complete number is once the missing
+// prefix is put back. Vodafone SIMs are printed starting 00030 and belong under
+// 89441 (20 digits all told); O2 SIMs are printed starting 006 and belong under
+// 894411 (19 digits all told). Knowing the finished length is what lets the
+// rental form fire the RCUK check by itself the moment the last digit lands,
+// instead of waiting for someone to remember to press a button.
+export const RCUK_SIM_CARRIERS = [
+  { carrier: "Vodafone", entryPrefix: "00030", fullPrefix: "89441", fullLength: 20 },
+  { carrier: "O2", entryPrefix: "006", fullPrefix: "894411", fullLength: 19 },
+];
+
+// Describes what the operator has typed so far: which stock it belongs to, the
+// full ICCID, and whether it is finished. `complete` is the trigger to check.
+export function rcukSimEntry(value) {
+  const normalized = normalizeRcukSimNumber(value);
+  if (!normalized) {
+    return { normalized: "", carrier: "", fullLength: 0, complete: false, tooLong: false, recognized: false };
+  }
+  const match = RCUK_SIM_CARRIERS.find(
+    (entry) => normalized.startsWith(entry.fullPrefix + entry.entryPrefix),
+  );
+  if (!match) {
+    return {
+      normalized,
+      carrier: "",
+      fullLength: 0,
+      complete: false,
+      tooLong: false,
+      recognized: false,
+    };
+  }
+  return {
+    normalized,
+    carrier: match.carrier,
+    fullLength: match.fullLength,
+    complete: normalized.length === match.fullLength,
+    tooLong: normalized.length > match.fullLength,
+    recognized: true,
+  };
 }
 
 // Plain 6-digit numeric ticket numbers (100001-999999) so customers can key
@@ -268,6 +327,16 @@ export function formatShortDate(value) {
     hour: "numeric",
     minute: "2-digit",
   }).format(date);
+}
+
+// Customer-facing paperwork names staff by initials only ("Moshe Glick" -> "M.G."),
+// so a receipt never hands out an employee's full name.
+export function staffInitials(name) {
+  const parts = String(name || "")
+    .split(/[\s._-]+/)
+    .filter(Boolean);
+  if (!parts.length) return "";
+  return parts.map((part) => `${part[0].toUpperCase()}.`).join("");
 }
 
 export function formatPayment(value) {

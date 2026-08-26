@@ -73,11 +73,14 @@ import {
   isRentalFormComplete,
   isSolaPaidStatus,
   normalizeRcukSimNumber,
+  rcukSimEntry,
   numberValue,
   parsePriceAdjust,
   playScanBeep,
   playScanError,
   readJson,
+  customerMatchesDigits,
+  staffInitials,
   startOfDay,
   titleCaseName,
   toJsDate,
@@ -136,7 +139,7 @@ function Workspace({ currentUser, isAdmin }) {
   const sessionRole = isAdmin ? "admin" : "employee";
   const [activeType, setActiveType] = useState(defaultManualReportType);
   const [staff, setStaff] = useCloudDocumentState("staff", STAFF_KEY, [], { merge: unionByName });
-  const [reports, setReports] = useCloudCollectionState("reports", STORAGE_KEY, []);
+  const [reports, setReports, reportsPendingSync] = useCloudCollectionState("reports", STORAGE_KEY, []);
   const [pendingReports, setPendingReports] = useCloudCollectionState("pendingReports", PENDING_REPORTS_KEY, []);
   const [phoneOrders, setPhoneOrders] = useCloudCollectionState("phoneOrders", PHONE_ORDERS_KEY, []);
   const [orderHandlers, setOrderHandlers] = useCloudCollectionState("orderHandlers", ORDER_HANDLERS_KEY, defaultOrderHandlers);
@@ -1352,7 +1355,14 @@ function Workspace({ currentUser, isAdmin }) {
         <PaymentReminderBanner />
         {cloudOnline === false ? (
           <div className="cloud-offline-banner" role="alert">
-            ⚠️ Can't reach the cloud — changes you make now are <strong>not being saved</strong> and won't sync to other devices. Check the internet/filter and reload before editing.
+            ⚠️ Can't reach the cloud. Sales are being <strong>held on this computer</strong> and will upload
+            automatically once the connection is back — don't wipe this browser's data. Check the internet/filter.
+          </div>
+        ) : null}
+        {reportsPendingSync > 0 ? (
+          <div className="cloud-pending-banner" role="status">
+            ⏳ {reportsPendingSync} {reportsPendingSync === 1 ? "sale is" : "sales are"} still waiting to upload to the cloud.
+            They are saved here and retry automatically — leave this computer on and online until this clears.
           </div>
         ) : null}
         <div className="topbar">
@@ -1381,9 +1391,14 @@ function Workspace({ currentUser, isAdmin }) {
             onDismiss={dismissPendingReport}
           />
         ) : activeView === "openRepairs" ? (
+          // Open repairs are not a day's log: a phone booked in last week is still
+          // open today. The log's date range (which defaults to today) would hide
+          // it, so this page gets every report and does its own search.
           <OpenRepairsPage
-            reports={filteredReports}
+            reports={reports}
             employees={employees}
+            storeTax={storeTax}
+            activeTaxRate={activeTaxRate}
             onStatusChange={updateRepairStatus}
             onSetReady={markRepairReady}
             onMarkPaid={markRepairPaid}
@@ -1960,6 +1975,10 @@ function ReportForm({ activeType, activeEmployee, activeLocation, reports, activ
       // Who's fixing it, and (for a returned device) which ticket this follows up.
       details.technician = String(formData.get("technician") || "").trim();
       details.originalTicket = String(formData.get("originalTicket") || "").trim();
+      // Intake no longer asks whether the repair is paid — it never is at that
+      // point. Stamp it here so the Repairs queue, the take-payment dialog and
+      // the reports all keep reading a value that is actually there.
+      details.paymentStatus = "Not paid";
     }
 
     // Require a payment method whenever money is being recorded, so nothing is
@@ -1973,8 +1992,7 @@ function ReportForm({ activeType, activeEmployee, activeLocation, reports, activ
 
     // Snapshot store + customer details so the printed ticket is self-contained.
     const phoneDigits = localPhoneDigits(formData.get("customerPhone"));
-    const matchedCustomer = phoneDigits && resolvedCustomer
-      && (resolvedCustomer.phoneDigits === phoneDigits || resolvedCustomer.mobileDigits === phoneDigits)
+    const matchedCustomer = phoneDigits && customerMatchesDigits(resolvedCustomer, phoneDigits)
       ? resolvedCustomer
       : null;
     details.location = activeLocation || "";
@@ -2062,10 +2080,14 @@ function ReportForm({ activeType, activeEmployee, activeLocation, reports, activ
             </select>
           </label>
 
-          <label className="field">
-            <span>Served by</span>
-            <input value={activeEmployee} disabled readOnly />
-          </label>
+          {/* Repairs record servedBy on the report itself, so showing a
+              read-only copy of it here is just noise on the intake screen. */}
+          {isRepair ? null : (
+            <label className="field">
+              <span>Served by</span>
+              <input value={activeEmployee} disabled readOnly />
+            </label>
+          )}
         </div>
 
         <div className="form-grid">
@@ -2307,6 +2329,11 @@ function RentalReportForm({
   const isRcukRental = form.rentalRegion === "RCUK";
   const isSimpleRental = !isRcukRental;
   const normalizedSimNumber = normalizeRcukSimNumber(form.simNumber);
+  const simEntry = rcukSimEntry(form.simNumber);
+  // A SIM that RCUK turned down must not be rentable, and a half-typed one isn't
+  // ready to submit either.
+  const simRejected = simCheckState.status === "error";
+  const simUsable = !isRcukRental || (simEntry.complete && simCheckState.status === "checked");
   const zoneDaysValid = totalDays > 0 && zoneDays === totalDays;
   const needsUsNumber = form.usaNumber;
   const rentalSubmitted = submitState.status === "submitted" || submitState.status === "numbers-ready";
@@ -2319,6 +2346,7 @@ function RentalReportForm({
     && minimumDaysValid
     && totalPrice > 0
     && normalizedSimNumber
+    && simUsable
     && isRcukRental;
   const canSave = isSimpleRental
     ? isRentalFormComplete(form) && minimumDaysValid && totalPrice > 0 && cardChargeComplete
@@ -2362,6 +2390,10 @@ function RentalReportForm({
         checkedSimNumber: "",
         raw: null,
       });
+      // Clearing the check also has to clear the "already auto-checked this one"
+      // marker. Without it, correcting a digit and retyping the same number left
+      // the check idle with nothing to re-fire it — and the rental stuck.
+      autoCheckedSimRef.current = "";
     }
   }
 
@@ -2591,6 +2623,18 @@ function RentalReportForm({
       });
     }
   }
+
+  // Check the SIM the instant the last digit lands, instead of relying on someone
+  // pressing the button. Keyed on the finished number so re-renders don't re-fire
+  // it, and so correcting a digit runs a fresh check.
+  const autoCheckedSimRef = useRef("");
+  useEffect(() => {
+    if (!isRcukRental) return;
+    if (!simEntry.complete) return;
+    if (autoCheckedSimRef.current === simEntry.normalized) return;
+    autoCheckedSimRef.current = simEntry.normalized;
+    checkSimWithRcuk();
+  }, [isRcukRental, simEntry.complete, simEntry.normalized]);
 
   async function getRentalNumbers() {
     if (!FUNCTIONS_BASE_URL || !submitState.rentalId) return;
@@ -2869,9 +2913,28 @@ function RentalReportForm({
               </div>
               <input
                 inputMode="numeric"
+                className={isRcukRental && (simRejected || simEntry.tooLong) ? "input-invalid" : ""}
                 value={isRcukRental ? normalizedSimNumber : form.simNumber}
                 onChange={(event) => updateField("simNumber", event.target.value)}
               />
+              {isRcukRental && normalizedSimNumber ? (
+                simEntry.tooLong ? (
+                  <small className="field-error">
+                    That's {simEntry.normalized.length} digits — a {simEntry.carrier} SIM is {simEntry.fullLength}. Check the number.
+                  </small>
+                ) : simRejected ? (
+                  <small className="field-error">{simCheckState.message || "RCUK rejected this SIM."}</small>
+                ) : simCheckState.status === "checking" ? (
+                  <small className="field-hint">Checking this SIM with RCUK…</small>
+                ) : simCheckState.status === "checked" ? (
+                  <small className="field-ok">SIM is free — {simCheckState.message || "ready to rent."}</small>
+                ) : simEntry.recognized && !simEntry.complete ? (
+                  <small className="field-hint">
+                    {simEntry.carrier} SIM — {simEntry.fullLength - simEntry.normalized.length} more digit
+                    {simEntry.fullLength - simEntry.normalized.length === 1 ? "" : "s"} to go.
+                  </small>
+                ) : null
+              ) : null}
             </label>
           </div>
 
@@ -3384,7 +3447,7 @@ function ReportHistory({
   );
 }
 
-function OpenRepairsPage({ reports, employees = [], onStatusChange, onSetReady, onMarkPaid, onEditRepair }) {
+function OpenRepairsPage({ reports, employees = [], storeTax = [], activeTaxRate = 0, onStatusChange, onSetReady, onMarkPaid, onEditRepair }) {
   const [paying, setPaying] = useState({ id: "", status: "", message: "" });
   // When set, the take-payment dialog is open for this repair.
   const [payPrompt, setPayPrompt] = useState(null);
@@ -3397,6 +3460,12 @@ function OpenRepairsPage({ reports, employees = [], onStatusChange, onSetReady, 
   const allOpenRepairs = reports.filter((report) =>
     report.type === "repair" && !["Completed", "Cancelled"].includes(report.details?.status),
   );
+
+  function taxRateFor(repair) {
+    const name = repair?.location || repair?.details?.location || "";
+    const match = (storeTax || []).find((entry) => entry?.name === name);
+    return Number(match?.rate) || Number(activeTaxRate) || 0;
+  }
 
   const query = search.trim().toLowerCase();
   const openRepairs = query
@@ -3450,7 +3519,7 @@ function OpenRepairsPage({ reports, employees = [], onStatusChange, onSetReady, 
   // Take the payment. For card payments, run the charge on the local terminal
   // first and only mark paid once the card is approved. The "paid" SMS to the
   // customer is sent by the notifyRepairPaid Cloud Function on the status change.
-  async function confirmPayment({ amount, method, manualEntry }) {
+  async function confirmPayment({ amount, method, manualEntry, taxRate, taxAmount }) {
     const repair = payPrompt;
     if (!repair || repair.details?.paymentStatus === "Paid") {
       setPayPrompt(null);
@@ -3469,10 +3538,19 @@ function OpenRepairsPage({ reports, employees = [], onStatusChange, onSetReady, 
 
     // Record what was actually collected before marking paid, so the ticket and
     // the reports show the real amount and method instead of the intake guess.
-    const paidAmount = value.toFixed(2);
-    if (paidAmount !== String(repair.paymentAmount ?? "").trim() || method !== repair.paymentMethod) {
-      onEditRepair(repair.id, { paymentAmount: paidAmount, paymentMethod: method });
-    }
+    // paymentAmount is what the customer hands over — the repair price plus the
+    // sales tax — with the split kept in details for the paperwork.
+    const tax = Math.max(0, Number(taxAmount) || 0);
+    const paidAmount = (value + tax).toFixed(2);
+    onEditRepair(repair.id, {
+      paymentAmount: paidAmount,
+      paymentMethod: method,
+      details: {
+        subtotal: value.toFixed(2),
+        taxRate: tax > 0 ? Number(taxRate) || 0 : 0,
+        taxAmount: tax.toFixed(2),
+      },
+    });
 
     if (!isCardPayment(method)) {
       onMarkPaid(repair.id);
@@ -3631,6 +3709,7 @@ function OpenRepairsPage({ reports, employees = [], onStatusChange, onSetReady, 
       {payPrompt ? (
         <RepairPaymentDialog
           repair={payPrompt}
+          taxRate={taxRateFor(payPrompt)}
           paying={paying}
           onConfirm={confirmPayment}
           onClose={() => {
@@ -3670,6 +3749,7 @@ function EditRepairDialog({ repair, employees = [], onSave, onClose }) {
     model: details.model || "",
     damage: details.damage || "",
     imei: details.imei || "",
+    devicePin: details.devicePin || "",
     estimatedPrice: details.estimatedPrice || repair.paymentAmount || "",
     finalPrice: details.finalPrice || "",
     dueDate: details.dueDate || "",
@@ -3717,6 +3797,7 @@ function EditRepairDialog({ repair, employees = [], onSave, onClose }) {
         model: form.model.trim(),
         damage: form.damage.trim(),
         imei: form.imei.trim(),
+        devicePin: form.devicePin.trim(),
         estimatedPrice: String(form.estimatedPrice ?? "").trim(),
         finalPrice: String(form.finalPrice ?? "").trim(),
         dueDate: form.dueDate,
@@ -3736,6 +3817,15 @@ function EditRepairDialog({ repair, employees = [], onSave, onClose }) {
           <label className="field"><span>Phone model</span><input value={form.model} onChange={(event) => set("model", event.target.value)} autoFocus /></label>
           <label className="field"><span>What is damaged?</span><input value={form.damage} onChange={(event) => set("damage", event.target.value)} /></label>
           <label className="field"><span>Phone IMEI</span><input value={form.imei} inputMode="numeric" onChange={(event) => set("imei", event.target.value)} /></label>
+          <label className="field">
+            <span>Phone PIN / passcode</span>
+            <input
+              value={form.devicePin}
+              placeholder="Prints on the phone label only"
+              autoComplete="off"
+              onChange={(event) => set("devicePin", event.target.value)}
+            />
+          </label>
           <label className="field"><span>Customer phone</span><input value={form.customerPhone} inputMode="tel" onChange={(event) => set("customerPhone", event.target.value)} /></label>
           <label className="field"><span>Estimated price</span><input value={form.estimatedPrice} inputMode="decimal" placeholder="0.00" onChange={(event) => set("estimatedPrice", event.target.value)} /></label>
           <label className="field"><span>Final price</span><input value={form.finalPrice} inputMode="decimal" placeholder="0.00" onChange={(event) => set("finalPrice", event.target.value)} /></label>
@@ -3810,6 +3900,18 @@ function EditRepairDialog({ repair, employees = [], onSave, onClose }) {
           <label className="field full"><span>Notes</span><textarea rows={2} value={form.notes} onChange={(event) => set("notes", event.target.value)} /></label>
           <div className="pos-form-actions form-actions-row">
             <button className="primary-button" type="submit">Save changes</button>
+            {/* A PIN is often given after drop-off, so the bench label has to be
+                printable again without re-taking the whole ticket. */}
+            <button
+              className="secondary-button"
+              type="button"
+              onClick={() => printRepairPhoneLabel({
+                ...repair,
+                details: { ...details, model: form.model, imei: form.imei, damage: form.damage, devicePin: form.devicePin },
+              })}
+            >
+              Print phone label
+            </button>
             <button className="secondary-button" type="button" onClick={onClose}>Cancel</button>
           </div>
         </form>
@@ -3823,7 +3925,7 @@ function EditRepairDialog({ repair, employees = [], onSave, onClose }) {
 // customer is actually paying, and charge/mark paid in a single press. Before
 // this, the row buttons could only charge the method picked at intake and only
 // the amount already on the ticket, so a cashier had to open Edit first.
-function RepairPaymentDialog({ repair, paying, onConfirm, onClose }) {
+function RepairPaymentDialog({ repair, taxRate = 0, paying, onConfirm, onClose }) {
   const details = repair.details || {};
   const fixesTotal = (details.additionalFixes || []).reduce(
     (sum, fix) => sum + (Number(fix?.price) || 0),
@@ -3836,17 +3938,25 @@ function RepairPaymentDialog({ repair, paying, onConfirm, onClose }) {
   const [amount, setAmount] = useState(suggested ? String(suggested) : "");
   const [method, setMethod] = useState(repair.paymentMethod || "");
   const [manualEntry, setManualEntry] = useState(false);
+  // Repairs are taxed like any other sale. It is a checkbox, not a fixed rule,
+  // so a tax-exempt or out-of-state customer is one click rather than a
+  // recalculation done in the cashier's head.
+  const rate = Number(taxRate) || 0;
+  const [applyTax, setApplyTax] = useState(rate > 0);
 
   const charging = paying.status === "charging";
   const needsTerminal = isCardPayment(method);
   const value = Number.parseFloat(amount);
-  const amountLabel = Number.isFinite(value) && value > 0 ? formatMoney(value) : "";
+  const base = Number.isFinite(value) && value > 0 ? value : 0;
+  const taxAmount = applyTax && rate > 0 ? base * (rate / 100) : 0;
+  const dueTotal = base + taxAmount;
+  const amountLabel = dueTotal > 0 ? formatMoney(dueTotal) : "";
 
   function submit(event) {
     event.preventDefault();
     event.stopPropagation();
     if (charging) return;
-    onConfirm({ amount, method, manualEntry });
+    onConfirm({ amount, method, manualEntry, taxRate: rate, taxAmount });
   }
 
   return createPortal(
@@ -3881,6 +3991,25 @@ function RepairPaymentDialog({ repair, paying, onConfirm, onClose }) {
                 Use {formatMoney(withFixes)} (with extra jobs)
               </button>
             ) : null}
+          </div>
+
+          <div className="pay-totals full">
+            <div className="pay-totals-row"><span>Repair</span><span>{formatMoney(base)}</span></div>
+            {rate > 0 ? (
+              <label className="checkbox-field pay-tax-toggle">
+                <input
+                  type="checkbox"
+                  checked={applyTax}
+                  disabled={charging}
+                  onChange={(event) => setApplyTax(event.target.checked)}
+                />
+                <span>Sales tax ({rate}%)</span>
+                <strong>{formatMoney(taxAmount)}</strong>
+              </label>
+            ) : (
+              <p className="muted">No tax rate set for this store. Add the store address in Inventory.</p>
+            )}
+            <div className="pay-totals-row pay-totals-grand"><span>Total due</span><strong>{formatMoney(dueTotal)}</strong></div>
           </div>
 
           <div className="field full">
@@ -4586,10 +4715,7 @@ function PhoneOrderPage({ activeEmployee, sessionRole, activeLocation, storeLoca
   function handleCreateOrder() {
     if (!canCreate) return;
     const digits = localPhoneDigits(form.customerPhone);
-    const matched = resolvedCustomer
-      && (resolvedCustomer.phoneDigits === digits || resolvedCustomer.mobileDigits === digits)
-      ? resolvedCustomer
-      : null;
+    const matched = customerMatchesDigits(resolvedCustomer, digits) ? resolvedCustomer : null;
     // Prompt for a new/incomplete customer, just like POS, before creating.
     if (!matched || !matched.name) {
       setCustomerPrompt({ phone: form.customerPhone.trim(), customer: matched });
@@ -4669,14 +4795,15 @@ function PhoneOrderPage({ activeEmployee, sessionRole, activeLocation, storeLoca
   async function handleCustomerPromptSave(values) {
     if (!customerPrompt) return;
     await onSaveCustomer?.({
-      // Keep the fields this dialog doesn't edit (email, contact details, notes)
-      // so saving here never blanks them on the stored record.
+      // Keep the fields this dialog doesn't edit (contact details, notes) so
+      // saving here never blanks them on the stored record.
       ...(customerPrompt.customer || {}),
       id: customerPrompt.customer?.id || "",
       phone: customerPrompt.phone,
       name: values.name.trim(),
       mobile: values.mobile.trim(),
       address: values.address.trim(),
+      email: (values.email ?? customerPrompt.customer?.email ?? "").trim(),
     });
     const merged = {
       ...(customerPrompt.customer || {}),
@@ -5552,25 +5679,41 @@ function PosPage({ products, reports = [], storeLocations = [], activeEmployee, 
 
   const subtotal = cart.reduce((sum, line) => sum + effectiveLinePrice(line) * line.qty, 0);
   const taxRate = Number(activeTaxRate) || 0;
-  const taxApplies = !outOfState && taxRate > 0;
-  const taxAmount = taxApplies ? subtotal * (taxRate / 100) : 0;
-  const total = subtotal + taxAmount;
   const itemCount = cart.reduce((sum, line) => sum + line.qty, 0);
-  const splitFirstAmount = splitPayment ? Math.max(0, Number(splitFirstInput) || 0) : 0;
+
+  const firstIsCard = isCardPayment(paymentMethod);
+  const secondIsCard = isCardPayment(splitSecondMethod);
+  // Splitting a sale between cash and a card taxes the card share only: the
+  // amount typed for each side is its share of the pre-tax subtotal, and the
+  // sales tax rides on top of whichever side is the card.
+  const splitTaxOnCardOnly = splitPayment && Boolean(splitSecondMethod) && firstIsCard !== secondIsCard;
+  const splitFirstEntered = splitPayment ? Math.max(0, Number(splitFirstInput) || 0) : 0;
+  // What the split is measured against: the pre-tax subtotal when only the card
+  // share is taxed, otherwise the full total the customer owes.
+  const splitBasis = splitTaxOnCardOnly ? subtotal : 0;
+  const taxBase = splitTaxOnCardOnly
+    ? Math.min(subtotal, Math.max(0, firstIsCard ? splitFirstEntered : subtotal - splitFirstEntered))
+    : subtotal;
+  const taxApplies = !outOfState && taxRate > 0;
+  const taxAmount = taxApplies ? taxBase * (taxRate / 100) : 0;
+  const total = subtotal + taxAmount;
+  // The card side pays its share plus the tax; the cash side pays its share flat.
+  const splitFirstAmount = splitTaxOnCardOnly && firstIsCard ? splitFirstEntered + taxAmount : splitFirstEntered;
   const splitSecondAmount = splitPayment ? Math.max(0, total - splitFirstAmount) : 0;
   // Only the card's share goes to the terminal, not the whole sale.
   const cardAmount = splitPayment
-    ? (isCardPayment(paymentMethod) ? splitFirstAmount : 0)
-      + (isCardPayment(splitSecondMethod) ? splitSecondAmount : 0)
-    : (isCardPayment(paymentMethod) ? total : 0);
+    ? (firstIsCard ? splitFirstAmount : 0) + (secondIsCard ? splitSecondAmount : 0)
+    : (firstIsCard ? total : 0);
   const requiresCardCharge = cardAmount > 0;
   const cardChargeComplete = !requiresCardCharge || card.status === "paid";
   const splitIssue = (() => {
     if (!splitPayment) return "";
     if (!splitSecondMethod) return "Choose the second payment method.";
     if (splitSecondMethod === paymentMethod) return "Pick two different payment methods.";
-    if (!(splitFirstAmount > 0)) return "Enter how much goes on the first method.";
-    if (splitFirstAmount >= total) return `The first amount has to be less than ${formatMoney(total)}.`;
+    if (!(splitFirstEntered > 0)) return "Enter how much goes on the first method.";
+    if (splitFirstEntered >= (splitBasis || total)) {
+      return `The first amount has to be less than ${formatMoney(splitBasis || total)}.`;
+    }
     return "";
   })();
   const payments = splitPayment && !splitIssue
@@ -5631,10 +5774,7 @@ function PosPage({ products, reports = [], storeLocations = [], activeEmployee, 
   function findSaleCustomer() {
     const localDigits = localPhoneDigits(customerPhone);
     if (localDigits.length < 6) return null;
-    return resolvedCustomer
-      && (resolvedCustomer.phoneDigits === localDigits || resolvedCustomer.mobileDigits === localDigits)
-      ? resolvedCustomer
-      : null;
+    return customerMatchesDigits(resolvedCustomer, localDigits) ? resolvedCustomer : null;
   }
 
   function handleCheckout() {
@@ -6023,7 +6163,10 @@ function PosPage({ products, reports = [], storeLocations = [], activeEmployee, 
             {splitPayment ? (
               <div className="pos-split full">
                 <label className="field">
-                  <span>{paymentMethod || "First method"} amount</span>
+                  <span>
+                    {paymentMethod || "First method"} amount
+                    {splitTaxOnCardOnly ? <small className="muted"> (before tax)</small> : null}
+                  </span>
                   <input
                     inputMode="decimal"
                     placeholder="0.00"
@@ -6044,6 +6187,12 @@ function PosPage({ products, reports = [], storeLocations = [], activeEmployee, 
                   <span>{splitSecondMethod || "Second method"}</span>
                   <strong>{formatMoney(splitSecondAmount)}</strong>
                 </p>
+                {splitTaxOnCardOnly && taxApplies ? (
+                  <p className="pos-split-note muted">
+                    Sales tax ({taxRate}%) is charged on the {firstIsCard ? paymentMethod : splitSecondMethod} share
+                    only — {formatMoney(taxAmount)} on {formatMoney(taxBase)}.
+                  </p>
+                ) : null}
               </div>
             ) : null}
             <label className="field full">
@@ -6059,7 +6208,7 @@ function PosPage({ products, reports = [], storeLocations = [], activeEmployee, 
               <span>Out of state (no sales tax)</span>
             </label>
             <div className="pos-totals-row pos-totals-tax">
-              <span>Tax{taxApplies ? ` (${taxRate}%)` : ""}</span>
+              <span>Tax{taxApplies ? ` (${taxRate}%${splitTaxOnCardOnly ? " · card share" : ""})` : ""}</span>
               <span>{formatMoney(taxAmount)}</span>
             </div>
             {!outOfState && taxRate === 0 ? (
@@ -6329,7 +6478,9 @@ function CustomerInfoDialog({ phone, customer, onSave, onSkip, onClose, saveLabe
   const [name, setName] = useState(customer?.name || "");
   const [mobile, setMobile] = useState(customer?.mobile || "");
   const [address, setAddress] = useState(customer?.address || "");
+  const [email, setEmail] = useState(customer?.email || "");
   const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
 
   // Every field here is optional — nothing in this dialog blocks a sale or an
   // order; it only captures what the cashier has for the receipt and the CRM.
@@ -6342,8 +6493,14 @@ function CustomerInfoDialog({ phone, customer, onSave, onSkip, onClose, saveLabe
     // onSave may write to the CRM before it returns; block a second submit until
     // it settles, so one click can't file two records.
     setSaving(true);
+    setError("");
     try {
-      await onSave({ name, mobile, address });
+      await onSave({ name, mobile, address, email });
+    } catch (saveError) {
+      // A rejected save used to escape unhandled, which left the dialog sitting
+      // open with no explanation and nothing written — the "add customer doesn't
+      // save" report. Say what went wrong and let them try again.
+      setError(saveError?.message || "Could not save this customer. Check the connection and try again.");
     } finally {
       setSaving(false);
     }
@@ -6368,7 +6525,14 @@ function CustomerInfoDialog({ phone, customer, onSave, onSkip, onClose, saveLabe
             <input value={name} onChange={(event) => setName(event.target.value)} autoFocus />
           </label>
           <label className="field"><span>Mobile (optional)</span><input value={mobile} inputMode="tel" onChange={(event) => setMobile(event.target.value)} /></label>
+          {/* Captured here so emailing a receipt doesn't mean re-typing the
+              address at the till every single time. */}
+          <label className="field">
+            <span>Email (optional)</span>
+            <input type="email" value={email} autoComplete="off" placeholder="customer@example.com" onChange={(event) => setEmail(event.target.value)} />
+          </label>
           <AddressAutocomplete value={address} onChange={setAddress} />
+          {error ? <p className="form-error" role="alert">{error}</p> : null}
           <div className="pos-form-actions form-actions-row">
             <button className="primary-button" type="submit" disabled={saving}>
               {saving ? "Saving..." : saveLabel}
@@ -6511,7 +6675,7 @@ function buildReceiptText(sale) {
     "",
     `Receipt ${sale.receiptCode || "-"}`,
     soldAt.toLocaleString(),
-    sale.servedBy ? `Cashier: ${sale.servedBy}` : null,
+    sale.servedBy ? `Cashier: ${staffInitials(sale.servedBy)}` : null,
     details.customerName ? `Customer: ${details.customerName}` : null,
     "",
     ...lines,
@@ -6572,7 +6736,7 @@ function printSaleReceipt(sale) {
   const body = `
     ${receiptHeaderHtml(location, details.storeAddress)}
     <div class="divider"></div>
-    <div class="meta">${escapeHtml(soldAt.toLocaleString())} &middot; Cashier: ${escapeHtml(sale.servedBy || "-")}</div>
+    <div class="meta">${escapeHtml(soldAt.toLocaleString())} &middot; Cashier: ${escapeHtml(staffInitials(sale.servedBy) || "-")}</div>
     ${customerBlock}
     <div class="divider"></div>
     <table>${rows}</table>
@@ -6632,7 +6796,7 @@ function printPhoneOrderReceipt(order) {
     <div class="meta">${escapeHtml(createdAt)} &middot; Phone order</div>
     ${customerBlock}
     ${deliverBlock}
-    <div class="meta">Handler: ${escapeHtml(order.assignedTo || "-")}</div>
+    <div class="meta">Handler: ${escapeHtml(staffInitials(order.assignedTo) || "-")}</div>
     <div class="divider"></div>
     <table>${rows}</table>
     <div class="divider"></div>
@@ -6660,7 +6824,8 @@ function printRepairPhoneLabel(report) {
     .who { text-align: center; font-size: 16px; font-weight: 700; }
     .row { font-size: 15px; font-weight: 600; margin: 1mm 0; }
     .row strong { display: inline-block; min-width: 14mm; font-weight: 800; }
-    .issue { font-size: 17px; font-weight: 800; margin-top: 2mm; }`;
+    .issue { font-size: 17px; font-weight: 800; margin-top: 2mm; }
+    .pin { font-size: 20px; font-weight: 800; margin-top: 2mm; letter-spacing: 1px; }`;
   const body = `
     <div class="eyebrow">Repair — stick on phone</div>
     <div class="ticket">${escapeHtml(details.ticketNumber || "")}</div>
@@ -6668,7 +6833,8 @@ function printRepairPhoneLabel(report) {
     <div class="divider"></div>
     ${details.model ? `<div class="row"><strong>Model</strong> ${escapeHtml(details.model)}</div>` : ""}
     ${details.imei ? `<div class="row"><strong>IMEI</strong> ${escapeHtml(details.imei)}</div>` : ""}
-    ${details.damage ? `<div class="issue">Issue: ${escapeHtml(details.damage)}</div>` : ""}`;
+    ${details.damage ? `<div class="issue">Issue: ${escapeHtml(details.damage)}</div>` : ""}
+    ${details.devicePin ? `<div class="pin">PIN: ${escapeHtml(details.devicePin)}</div>` : ""}`;
 
   openThermalReceipt(`Repair label ${details.ticketNumber || ""}`, css, body);
 }
@@ -6699,7 +6865,7 @@ function printRepairTicket(report) {
     ["Paid", details.paymentStatus],
     ["Expected ready", details.dueDate],
     ["Notify by", details.notificationPreference],
-    ["Served by", report.servedBy],
+    ["Served by", staffInitials(report.servedBy)],
   ];
   const rows = rowsSource
     .filter(([, value]) => value)
@@ -6752,7 +6918,7 @@ function printRentalReceipt(report) {
     ["Rental days", details.totalDays],
     ["Rate", details.dailyRate ? `${formatMoney(Number(details.dailyRate))}/day` : details.pricingLabel],
     ["Late fee", lateFee > 0 ? `${formatMoney(lateFee)}/wk (${formatMoney(lateFee / 7)}/day overdue)` : ""],
-    ["Served by", report.servedBy],
+    ["Served by", staffInitials(report.servedBy)],
   ];
   const rows = rowsSource
     .filter(([, value]) => value)
@@ -6810,7 +6976,9 @@ function SaleReceiptDialog({ sale, onClose, reprint = false }) {
     setStatus("Sent to the printer.");
   }
 
-  // Hands the receipt to the default mail app, pre-addressed and pre-filled.
+  // Opens Gmail's web compose in a new tab, pre-addressed and pre-filled, and
+  // the cashier presses Send. A mailto: link was silently doing nothing on the
+  // kiosk, which has no mail app for Windows to hand the link to.
   function emailReceipt() {
     const to = emailTo.trim();
     if (!to.includes("@")) {
@@ -6818,9 +6986,36 @@ function SaleReceiptDialog({ sale, onClose, reprint = false }) {
       return;
     }
     const subject = `Diamant Telecom receipt ${sale.receiptCode || ""}`.trim();
-    const href = `mailto:${encodeURIComponent(to)}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(buildReceiptText(sale))}`;
-    window.location.href = href;
-    setStatus(`Opening your email app for ${to}.`);
+    const body = buildReceiptText(sale);
+    const compose = `https://mail.google.com/mail/?view=cm&fs=1&to=${encodeURIComponent(to)}&su=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
+    // Passing "noopener" in the feature string makes window.open return null even
+    // on success, so the old check always took the failure branch and then threw
+    // the register at a mailto: the kiosk can't handle — navigating the POS away
+    // mid-sale. Open plainly (null now really does mean blocked) and sever the
+    // opener reference by hand.
+    const tab = window.open(compose, "_blank");
+    if (tab) {
+      try {
+        tab.opener = null;
+      } catch {
+        /* cross-origin once Gmail loads; the reference is harmless either way */
+      }
+      setStatus(`Gmail opened for ${to} — press Send there.`);
+      return;
+    }
+    // Genuinely blocked. Never navigate this tab: the receipt is the only copy of
+    // a sale that just took money. Put it on the clipboard instead.
+    copyReceipt("Pop-up blocked, so the receipt is copied — paste it into an email.");
+  }
+
+  // Backstop for when Gmail is unreachable: the whole receipt on the clipboard.
+  async function copyReceipt(message) {
+    try {
+      await navigator.clipboard.writeText(buildReceiptText(sale));
+      setStatus(message || "Receipt copied — paste it into an email.");
+    } catch {
+      setStatus("Couldn't copy the receipt. Print it instead.");
+    }
   }
 
   // Plain text only — the receipt number and figures, never a picture.
@@ -6863,7 +7058,7 @@ function SaleReceiptDialog({ sale, onClose, reprint = false }) {
 
         <div className="receipt-meta">
           <span><strong>Store:</strong> {details.location || "-"}</span>
-          <span><strong>Cashier:</strong> {sale.servedBy || "-"}</span>
+          <span><strong>Cashier:</strong> {staffInitials(sale.servedBy) || "-"}</span>
           <span><strong>Time:</strong> {formatShortDate(sale.createdAt)}</span>
           {sale.customerPhone ? <span><strong>Customer:</strong> {sale.customerPhone}</span> : null}
         </div>
@@ -6914,7 +7109,8 @@ function SaleReceiptDialog({ sale, onClose, reprint = false }) {
                 placeholder="customer@example.com"
                 onChange={(event) => setEmailTo(event.target.value)}
               />
-              <button className="secondary-button" type="button" onClick={emailReceipt}>Open email</button>
+              <button className="secondary-button" type="button" onClick={emailReceipt}>Open Gmail</button>
+              <button className="secondary-button" type="button" onClick={() => copyReceipt()}>Copy receipt</button>
             </div>
           ) : null}
 
@@ -7238,6 +7434,10 @@ function InventoryPage({
     setForm({ ...emptyForm, location: form.location });
   }
 
+  // Editing opens its own dialog (see the render below) instead of quietly
+  // repurposing the "Add product" form at the top of the page — which meant
+  // scrolling away from the item you clicked and left it unclear whether you
+  // were adding or editing.
   function editProduct(product) {
     setForm({
       ...emptyForm,
@@ -7248,7 +7448,6 @@ function InventoryPage({
       imeis: product.imeis || [],
     });
     setSelectedKey("");
-    window.scrollTo({ top: 0, behavior: "smooth" });
   }
 
   // Group per-store product rows up by item so we can show, in one popup, how
@@ -7326,115 +7525,136 @@ function InventoryPage({
 
   const selectedGroup = selectedKey ? groups.find((group) => group.key === selectedKey) : null;
 
+  // One definition of the product form, shown inline when adding and inside a
+  // dialog when editing.
+  const productForm = (
+    <form className="form-grid inventory-form" onSubmit={submit}>
+      <p className="form-section-title">Product details</p>
+      <label className="field">
+        <span>SKU</span>
+        <input
+          value={form.sku}
+          onChange={(event) => updateField("sku", event.target.value)}
+          placeholder="Internal code"
+          autoComplete="off"
+          spellCheck={false}
+          required
+        />
+      </label>
+      <label className="field">
+        <span>Barcode</span>
+        <input
+          value={form.barcode}
+          onChange={(event) => updateField("barcode", event.target.value)}
+          placeholder="Scan UPC / EAN (optional)"
+          autoComplete="off"
+          spellCheck={false}
+        />
+      </label>
+      <label className="field">
+        <span>Name</span>
+        <input value={form.name} onChange={(event) => updateField("name", event.target.value)} required />
+      </label>
+      <label className="field">
+        <span>Price</span>
+        <input
+          inputMode="decimal"
+          value={form.price}
+          onChange={(event) => updateField("price", event.target.value)}
+          placeholder="0.00"
+        />
+      </label>
+      {isAdmin ? (
+        <label className="field">
+          <span>Cost of goods</span>
+          <input
+            inputMode="decimal"
+            value={form.cost}
+            onChange={(event) => updateField("cost", event.target.value)}
+            placeholder="0.00"
+          />
+        </label>
+      ) : null}
+      <label className="field">
+        <span>Category</span>
+        <select value={form.category} onChange={(event) => updateField("category", event.target.value)}>
+          {productCategories.map((category) => (
+            <option key={category}>{category}</option>
+          ))}
+        </select>
+      </label>
+      <label className="field">
+        <span>Store</span>
+        {/* Stock always belongs to one store — there is no "all stores" option. */}
+        <select value={form.location} onChange={(event) => updateField("location", event.target.value)} required>
+          <option value="" disabled>Select a store…</option>
+          {storeLocations.map((location) => (
+            <option key={location}>{location}</option>
+          ))}
+        </select>
+      </label>
+      <p className="form-section-title">Stock</p>
+      <label className="field">
+        <span>Stock quantity</span>
+        <input
+          type="number"
+          min="0"
+          value={form.quantity}
+          onChange={(event) => updateField("quantity", event.target.value)}
+        />
+      </label>
+      <label className="field checkbox-field">
+        <input
+          type="checkbox"
+          checked={form.requiresImei}
+          onChange={(event) => updateField("requiresImei", event.target.checked)}
+        />
+        <span>Require IMEI scan at checkout (phones)</span>
+      </label>
+      {form.requiresImei ? (
+        <ImeiLotCapture
+          imeis={form.imeis}
+          target={form.quantity}
+          onChangeImeis={(next) => updateField("imeis", next)}
+        />
+      ) : null}
+      <div className="pos-form-actions form-actions-row">
+        <button className="primary-button" type="submit">{form.id ? "Save changes" : "Add product"}</button>
+        {form.id ? (
+          <button className="secondary-button" type="button" onClick={() => setForm(emptyForm)}>
+            Cancel
+          </button>
+        ) : null}
+      </div>
+    </form>
+  );
+
   return (
     <>
-      <section className="workspace">
-        <div className="workspace-header">
-          <div>
-            <p className="eyebrow">Inventory</p>
-            <h2>{form.id ? "Edit product" : "Add product"}</h2>
+      {form.id ? null : (
+        <section className="workspace">
+          <div className="workspace-header">
+            <div>
+              <p className="eyebrow">Inventory</p>
+              <h2>Add product</h2>
+            </div>
+          </div>
+          {productForm}
+        </section>
+      )}
+
+      {form.id ? (
+        // No click-outside-to-close here: this form can hold a whole scanned IMEI
+        // lot, and a stray click on the backdrop would throw it away. The form's
+        // own Cancel button is the way out.
+        <div className="dialog-backdrop" role="presentation">
+          <div className="dialog-card inventory-edit-card" role="dialog" aria-modal="true">
+            <h2>Edit product</h2>
+            <p className="muted">{form.name || form.sku}</p>
+            {productForm}
           </div>
         </div>
-        <form className="form-grid inventory-form" onSubmit={submit}>
-          <p className="form-section-title">Product details</p>
-          <label className="field">
-            <span>SKU</span>
-            <input
-              value={form.sku}
-              onChange={(event) => updateField("sku", event.target.value)}
-              placeholder="Internal code"
-              autoComplete="off"
-              spellCheck={false}
-              required
-            />
-          </label>
-          <label className="field">
-            <span>Barcode</span>
-            <input
-              value={form.barcode}
-              onChange={(event) => updateField("barcode", event.target.value)}
-              placeholder="Scan UPC / EAN (optional)"
-              autoComplete="off"
-              spellCheck={false}
-            />
-          </label>
-          <label className="field">
-            <span>Name</span>
-            <input value={form.name} onChange={(event) => updateField("name", event.target.value)} required />
-          </label>
-          <label className="field">
-            <span>Price</span>
-            <input
-              inputMode="decimal"
-              value={form.price}
-              onChange={(event) => updateField("price", event.target.value)}
-              placeholder="0.00"
-            />
-          </label>
-          {isAdmin ? (
-            <label className="field">
-              <span>Cost of goods</span>
-              <input
-                inputMode="decimal"
-                value={form.cost}
-                onChange={(event) => updateField("cost", event.target.value)}
-                placeholder="0.00"
-              />
-            </label>
-          ) : null}
-          <label className="field">
-            <span>Category</span>
-            <select value={form.category} onChange={(event) => updateField("category", event.target.value)}>
-              {productCategories.map((category) => (
-                <option key={category}>{category}</option>
-              ))}
-            </select>
-          </label>
-          <label className="field">
-            <span>Store</span>
-            {/* Stock always belongs to one store — there is no "all stores" option. */}
-            <select value={form.location} onChange={(event) => updateField("location", event.target.value)} required>
-              <option value="" disabled>Select a store…</option>
-              {storeLocations.map((location) => (
-                <option key={location}>{location}</option>
-              ))}
-            </select>
-          </label>
-          <p className="form-section-title">Stock</p>
-          <label className="field">
-            <span>Stock quantity</span>
-            <input
-              type="number"
-              min="0"
-              value={form.quantity}
-              onChange={(event) => updateField("quantity", event.target.value)}
-            />
-          </label>
-          <label className="field checkbox-field">
-            <input
-              type="checkbox"
-              checked={form.requiresImei}
-              onChange={(event) => updateField("requiresImei", event.target.checked)}
-            />
-            <span>Require IMEI scan at checkout (phones)</span>
-          </label>
-          {form.requiresImei ? (
-            <ImeiLotCapture
-              imeis={form.imeis}
-              target={form.quantity}
-              onChangeImeis={(next) => updateField("imeis", next)}
-            />
-          ) : null}
-          <div className="pos-form-actions form-actions-row">
-            <button className="primary-button" type="submit">{form.id ? "Save changes" : "Add product"}</button>
-            {form.id ? (
-              <button className="secondary-button" type="button" onClick={() => setForm(emptyForm)}>
-                Cancel
-              </button>
-            ) : null}
-          </div>
-        </form>
-      </section>
+      ) : null}
 
       <section className="history">
         <div className="history-header">
@@ -8670,6 +8890,7 @@ function ReportDetails({ report, compact }) {
         .filter((fix) => fix?.description || fix?.price)
         .map((fix) => `${fix.description || "Fix"}${fix.price ? ` (${formatMoney(Number(fix.price) || 0)})` : ""}`)
         .join(", ")],
+      ["Phone PIN", details.devicePin],
       ["SIM in phone", details.hadSim ? "Yes" : ""],
       ["SD card in phone", details.hadSdCard ? "Yes" : ""],
       ["Loaner phone given", details.borrowedTempPhone ? "Yes" : ""],
@@ -9071,22 +9292,34 @@ function CustomerPhoneInput({ value, onChange, onSelectCustomer, onResolveCustom
 
   async function saveDetails(values) {
     const customer = detailsPrompt;
+    // Let a failure reach the dialog so it can show it, rather than escaping
+    // unhandled and leaving the dialog open with no explanation.
     await onSaveCustomer?.({
-      // Carry over the fields this dialog doesn't edit (email, contact details,
-      // notes); without them the save would blank those on the stored record.
+      // Carry over the fields this dialog doesn't edit (contact details, notes);
+      // without them the save would blank those on the stored record.
       ...customer,
       id: customer.id || "",
       phone: customer.phone || value,
       name: values.name.trim(),
       mobile: values.mobile.trim(),
       address: values.address.trim(),
+      email: (values.email ?? customer.email ?? "").trim(),
     });
     setDetailsPrompt(null);
+    // Hand back the same shape a CRM query returns — including the derived digit
+    // fields and the title-cased name that saveCustomer stores — so the caller can
+    // match this record to the number on screen and print the name on the receipt.
+    const savedPhone = customer.phone || value;
+    const savedMobile = values.mobile.trim() || customer.mobile || "";
     onSelectCustomer?.({
       ...customer,
-      name: values.name.trim() || customer.name,
-      mobile: values.mobile.trim() || customer.mobile,
-      address: values.address.trim() || customer.address,
+      phone: savedPhone,
+      phoneDigits: localPhoneDigits(savedPhone),
+      name: titleCaseName(values.name.trim()) || customer.name || "",
+      mobile: savedMobile,
+      mobileDigits: localPhoneDigits(savedMobile),
+      address: values.address.trim() || customer.address || "",
+      email: (values.email ?? customer.email ?? "").trim(),
     });
   }
 

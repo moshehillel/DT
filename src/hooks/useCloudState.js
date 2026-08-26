@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import {
+  deleteCollectionItems,
   logSyncError,
   replaceAppStateDocument,
   syncCollectionItems,
@@ -24,6 +25,65 @@ export function useStoredState(key, fallback) {
   return [value, setValue];
 }
 
+// ---- Sync outbox -----------------------------------------------------------
+//
+// A write used to be dropped on the floor in two situations: the Firestore
+// listener had not delivered its first snapshot yet (cloudReady still false), or
+// the write rejected and we only logged it. Either way the register kept the row
+// in localStorage and nobody else ever saw it — which is how a card could be
+// charged and the sale never turn up in reports.
+//
+// Every change now lands in a localStorage-backed outbox first and is only
+// cleared once Firestore confirms it, so a completed sale survives a blocked
+// network, a closed tab, and a reboot, and replays when the cloud comes back.
+
+const OUTBOX_SUFFIX = "::outbox";
+// How often to retry while anything is still waiting.
+const OUTBOX_RETRY_MS = 15000;
+
+function readOutbox(key) {
+  try {
+    const raw = JSON.parse(localStorage.getItem(key + OUTBOX_SUFFIX) || "null");
+    if (!raw || typeof raw !== "object") return { upserts: {}, deletes: [] };
+    return {
+      upserts: raw.upserts && typeof raw.upserts === "object" ? raw.upserts : {},
+      deletes: Array.isArray(raw.deletes) ? raw.deletes : [],
+    };
+  } catch {
+    return { upserts: {}, deletes: [] };
+  }
+}
+
+function writeOutbox(key, outbox) {
+  try {
+    if (!Object.keys(outbox.upserts).length && !outbox.deletes.length) {
+      localStorage.removeItem(key + OUTBOX_SUFFIX);
+      return;
+    }
+    localStorage.setItem(key + OUTBOX_SUFFIX, JSON.stringify(outbox));
+  } catch (error) {
+    // Out of quota is the realistic failure here. Log loudly: this is the one
+    // place where losing the record is possible.
+    console.error(`Could not persist pending ${key} writes`, error);
+  }
+}
+
+function outboxSize(outbox) {
+  return Object.keys(outbox.upserts).length + outbox.deletes.length;
+}
+
+// Which documents actually changed between two versions of the collection.
+function diffItems(previousItems, nextItems) {
+  const previousById = new Map(previousItems.map((item) => [item.id, item]));
+  const nextIds = new Set(nextItems.map((item) => item.id));
+  const changed = nextItems.filter((item) => {
+    const previous = previousById.get(item.id);
+    return !previous || JSON.stringify(previous) !== JSON.stringify(item);
+  });
+  const removed = [...previousById.keys()].filter((id) => !nextIds.has(id));
+  return { changed, removed };
+}
+
 export function useCloudCollectionState(collectionName, localKey, fallback, options = {}) {
   const enabled = options.enabled !== false;
   const [value, setValue] = useState(() => ensureArrayIds(readJson(localKey, fallback)));
@@ -31,11 +91,81 @@ export function useCloudCollectionState(collectionName, localKey, fallback, opti
   const cloudReadyRef = useRef(false);
   const saveQueuedRef = useRef(false);
   const pendingWritesRef = useRef(0);
+  // Anything written while the cloud was unreachable, replayed on reconnect.
+  // Read lazily: useRef evaluates its argument on every render, and this is a
+  // register that re-renders on every keystroke.
+  const outboxRef = useRef(null);
+  if (outboxRef.current === null) outboxRef.current = readOutbox(localKey);
+  const flushingRef = useRef(false);
+  const [pendingCount, setPendingCount] = useState(() => outboxSize(outboxRef.current));
 
   useEffect(() => {
     valueRef.current = value;
     localStorage.setItem(localKey, JSON.stringify(value));
   }, [localKey, value]);
+
+  function persistOutbox() {
+    writeOutbox(localKey, outboxRef.current);
+    setPendingCount(outboxSize(outboxRef.current));
+  }
+
+  // Queue a change for replay. An id that is being deleted drops any pending
+  // upsert for the same document, and vice versa, so the outbox can't fight
+  // itself and resurrect a deleted row.
+  function queueChanges(changed, removed) {
+    const outbox = outboxRef.current;
+    changed.forEach((item) => {
+      if (!item?.id) return;
+      outbox.upserts[item.id] = item;
+      outbox.deletes = outbox.deletes.filter((id) => id !== item.id);
+    });
+    removed.forEach((id) => {
+      delete outbox.upserts[id];
+      if (!outbox.deletes.includes(id)) outbox.deletes.push(id);
+    });
+    persistOutbox();
+  }
+
+  // Replay the outbox. Only entries confirmed written are cleared; anything that
+  // fails (or arrives while we were mid-flight) stays queued for the next try.
+  async function flushOutbox() {
+    if (flushingRef.current || !cloudReadyRef.current) return;
+    const outbox = outboxRef.current;
+    const upserts = Object.values(outbox.upserts);
+    const deletes = [...outbox.deletes];
+    if (!upserts.length && !deletes.length) return;
+
+    flushingRef.current = true;
+    pendingWritesRef.current += 1;
+    try {
+      if (upserts.length) await upsertCollectionItems(collectionName, upserts);
+      if (deletes.length) await deleteCollectionItems(collectionName, deletes);
+      upserts.forEach((item) => {
+        // Only clear if nothing newer was queued for this id while we were away.
+        if (outbox.upserts[item.id] === item) delete outbox.upserts[item.id];
+      });
+      outbox.deletes = outbox.deletes.filter((id) => !deletes.includes(id));
+      persistOutbox();
+    } catch (error) {
+      logSyncError(`Firestore ${collectionName} retry failed`, error);
+    } finally {
+      pendingWritesRef.current = Math.max(0, pendingWritesRef.current - 1);
+      flushingRef.current = false;
+    }
+  }
+
+  // Retry on a timer and whenever the browser says the network is back. The
+  // timer only runs while something is actually waiting.
+  useEffect(() => {
+    if (!enabled || !pendingCount) return undefined;
+    const timer = window.setInterval(() => { flushOutbox(); }, OUTBOX_RETRY_MS);
+    const onOnline = () => { flushOutbox(); };
+    window.addEventListener("online", onOnline);
+    return () => {
+      window.clearInterval(timer);
+      window.removeEventListener("online", onOnline);
+    };
+  }, [enabled, pendingCount, collectionName]);
 
   useEffect(() => {
     if (!enabled) return undefined;
@@ -43,6 +173,9 @@ export function useCloudCollectionState(collectionName, localKey, fallback, opti
       collectionName,
       (items) => {
         cloudReadyRef.current = true;
+        // The listener answering is the proof that Firestore is reachable, so
+        // this is the moment to replay anything stranded by an earlier outage.
+        flushOutbox();
         if (!items.length && valueRef.current.length && !saveQueuedRef.current) {
           saveQueuedRef.current = true;
           upsertCollectionItems(collectionName, valueRef.current)
@@ -54,6 +187,19 @@ export function useCloudCollectionState(collectionName, localKey, fallback, opti
         }
         if (pendingWritesRef.current > 0) return;
         const sorted = sortCloudItems(items);
+        // Adopting the cloud snapshot discards any local row the cloud doesn't
+        // have. That is correct for rows deleted on another register, but it is
+        // also how a write lost before the outbox existed disappeared without a
+        // trace. Name them in the console so a missing sale can still be found.
+        const cloudIds = new Set(items.map((item) => item.id));
+        const localOnly = valueRef.current.filter((item) => item?.id && !cloudIds.has(item.id));
+        if (localOnly.length) {
+          console.warn(
+            `Diamant Telecom: ${localOnly.length} ${collectionName} row(s) exist only on this computer ` +
+              `and are being replaced by the cloud copy.`,
+            localOnly,
+          );
+        }
         // Skip no-op updates (e.g. metadata-only snapshots) so we don't churn
         // identity and re-run downstream effects that can trigger more writes.
         if (!isSameArray(sorted, valueRef.current)) setValue(sorted);
@@ -72,22 +218,33 @@ export function useCloudCollectionState(collectionName, localKey, fallback, opti
         : nextValueOrUpdater;
       const normalized = ensureArrayIds(nextValue);
 
-      if (cloudReadyRef.current && !options.localOnly) {
-        pendingWritesRef.current += 1;
-        syncCollectionItems(collectionName, current, normalized)
-          .catch((error) => {
-            logSyncError(`Firestore ${collectionName} sync failed`, error);
-          })
-          .finally(() => {
-            pendingWritesRef.current = Math.max(0, pendingWritesRef.current - 1);
-          });
+      if (!options.localOnly) {
+        const { changed, removed } = diffItems(current, normalized);
+        if (changed.length || removed.length) {
+          if (!cloudReadyRef.current) {
+            // No confirmed connection yet — bank it rather than lose it.
+            queueChanges(changed, removed);
+          } else {
+            pendingWritesRef.current += 1;
+            syncCollectionItems(collectionName, current, normalized)
+              .catch((error) => {
+                logSyncError(`Firestore ${collectionName} sync failed`, error);
+                // The write failed, so it is still owed. Queue it and let the
+                // retry loop carry it until Firestore accepts it.
+                queueChanges(changed, removed);
+              })
+              .finally(() => {
+                pendingWritesRef.current = Math.max(0, pendingWritesRef.current - 1);
+              });
+          }
+        }
       }
 
       return normalized;
     });
   }
 
-  return [value, updateValue];
+  return [value, updateValue, pendingCount];
 }
 
 // `options.merge(localValue, cloudValue)` lets a caller reconcile a fresh cloud

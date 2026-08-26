@@ -262,7 +262,13 @@ export const reportTypes = {
       // The phone IMEI is captured once the device is in hand. Required when the
       // status is "Received" (see ReportForm's submit validation).
       { name: "imei", label: "Phone IMEI", placeholder: "Scan or type IMEI", showIf: { field: "status", equals: "Received" } },
-      { name: "paymentStatus", label: "Repair paid?", type: "select", options: ["Not paid", "Paid"] },
+      // Unlock code for the handset, so a tech can actually get into it. It
+      // prints on the label that goes on the phone and never on the customer's
+      // copy or any text message.
+      { name: "devicePin", label: "Phone PIN / passcode", placeholder: "Optional — prints on the phone label only" },
+      // No "Repair paid?" field: nobody pays before pickup, so asking at intake
+      // only invited a wrong answer. Intake stamps "Not paid" (see ReportForm)
+      // and the take-payment dialog on the Repairs page is what flips it.
       { name: "notificationPreference", label: "When ready notify by", type: "select", options: ["Text message", "Phone call", "Both"] },
       { name: "dueDate", label: "Expected ready date", type: "date" },
     ],

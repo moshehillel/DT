@@ -723,6 +723,18 @@ button:active {
   line-height: 1.4;
 }
 
+/* Amber, not red: the data is safe on this machine, it just hasn't uploaded. */
+.cloud-pending-banner {
+  margin-bottom: 12px;
+  padding: 12px 16px;
+  border-radius: 8px;
+  background: #fdf3d8;
+  border: 1px solid #efd08a;
+  color: #7a5510;
+  font-size: 14px;
+  line-height: 1.4;
+}
+
 .topbar {
   display: flex;
   justify-content: space-between;
@@ -1069,6 +1081,42 @@ button:active {
   color: var(--muted);
   font-size: 12px;
   font-weight: 600;
+}
+
+/* A dialog-level failure message (e.g. a customer save that didn't go through). */
+.form-error {
+  grid-column: 1 / -1;
+  margin: 0;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: #fdecea;
+  border: 1px solid #f5b5b5;
+  color: #8a1c1c;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+/* A SIM RCUK turned down, or one that is the wrong length for its stock. */
+.field-error {
+  color: #b3261e;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.field-ok {
+  color: #1a7f37;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+input.input-invalid,
+select.input-invalid {
+  border-color: #d93025;
+  background: #fdecea;
+}
+
+input.input-invalid:focus {
+  outline-color: #d93025;
 }
 
 input,
@@ -3342,7 +3390,8 @@ tr:last-child td {
   padding: 8px 12px;
 }
 
-.main.main-pos .cloud-offline-banner {
+.main.main-pos .cloud-offline-banner,
+.main.main-pos .cloud-pending-banner {
   margin-bottom: 0;
 }
 
@@ -3605,6 +3654,14 @@ tr:last-child td {
   display: flex;
   gap: 8px;
   margin-top: 10px;
+  /* Email offers two actions (Gmail + copy), so the row wraps rather than
+     squeezing the address field to nothing. */
+  flex-wrap: wrap;
+}
+
+.receipt-delivery-row button {
+  flex: 0 0 auto;
+  white-space: nowrap;
 }
 
 .receipt-delivery-row input {
@@ -3659,9 +3716,15 @@ tr:last-child td {
   margin-top: 2px;
 }
 
-/* Sort control sits beside the search box and stays out of its way. */
+/* Sort control sits beside the search box and stays out of its way. Every
+   select inherits width:100%, and with flex-basis:auto that made this one claim
+   the whole row — squashing the search box and pushing the row over the "Find a
+   product" heading. Sizing it to its own options is what keeps the row sane. */
 .pos-sort {
-  flex: 0 0 auto;
+  flex: 0 1 auto;
+  width: auto;
+  min-width: 0;
+  max-width: 170px;
   border: 1px solid var(--line);
   border-radius: 10px;
   padding: 0 10px;
@@ -3986,4 +4049,117 @@ tr:last-child td {
   background: var(--brand-soft);
   color: var(--brand-dark);
   box-shadow: 0 0 0 2px rgba(20, 107, 99, 0.14);
+}
+
+.pos-split-note {
+  grid-column: 1 / -1;
+  margin: 4px 0 0;
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+/* Totals inside the take-payment dialog: repair price, the tax it attracts, and
+   the number the customer actually hands over. */
+.pay-totals {
+  display: grid;
+  gap: 6px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: #f9fbfc;
+}
+
+.pay-totals-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  font-size: 14px;
+}
+
+.pay-totals-grand {
+  border-top: 1px solid var(--line);
+  padding-top: 6px;
+  font-size: 16px;
+  font-weight: 800;
+}
+
+.pay-tax-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 14px;
+}
+
+.pay-tax-toggle span {
+  flex: 1 1 auto;
+}
+
+/* ---- Compact POS ---------------------------------------------------------
+   The register runs on a small screen with the checkout column always open, so
+   the shared 44px control height ate the panel and pushed the totals and the
+   complete-sale button below the fold. Tighten only what lives inside the POS —
+   every other page keeps the roomier defaults. */
+
+.pos-search {
+  min-width: 180px;
+  min-height: 34px;
+  padding: 6px 11px;
+  border-radius: 8px;
+  font-size: 13px;
+}
+
+.pos-sort {
+  max-width: 140px;
+  min-height: 34px;
+  padding: 0 8px;
+  border-radius: 8px;
+  font-size: 12px;
+}
+
+.pos-quick-actions .compact-button {
+  min-height: 34px;
+  padding: 0 10px;
+  font-size: 12px;
+}
+
+/* Checkout column: labels, inputs and selects all a notch down. */
+.pos-checkout .field span {
+  font-size: 12px;
+}
+
+.pos-checkout .field input,
+.pos-checkout .field select,
+.pos-checkout .field textarea {
+  min-height: 34px;
+  padding: 6px 10px;
+  border-radius: 8px;
+  font-size: 13px;
+}
+
+.pos-checkout .form-grid {
+  gap: 8px;
+}
+
+.pos-checkout .pos-totals-row {
+  font-size: 13px;
+  padding: 3px 0;
+}
+
+/* The one control that stays big: taking the money is the tap that must not
+   be missed. */
+.pos-checkout .primary-button {
+  min-height: 46px;
+}
+
+.pos-checkout-scroll {
+  padding-bottom: 4px;
+}
+
+/* The product form is a two-column grid, so its dialog needs more room than the
+   default dialog card and has to scroll on a short screen. */
+.inventory-edit-card {
+  width: min(760px, 96vw);
+  max-height: 90vh;
+  overflow-y: auto;
 }
