@@ -2268,16 +2268,12 @@ function emptyRentalRow(defaults = {}) {
   return {
     id: crypto.randomUUID(),
     simNumber: "",
-    rentalType: "Daily",
-    months: "",
     package: "V&D",
     startDate: "",
     endDate: "",
     ukDays: "",
     euDays: "",
     wtsDays: "",
-    tpDays: "",
-    ilDdi: false,
     usDdi: false,
     sms: false,
     ref: "",
@@ -2373,15 +2369,12 @@ function RentalReportForm({
     // together are travelling together.
     const defaults = last
       ? {
-        rentalType: last.rentalType,
-        months: last.months,
         package: last.package,
         startDate: last.startDate,
         endDate: last.endDate,
         ukDays: last.ukDays,
         euDays: last.euDays,
         wtsDays: last.wtsDays,
-        tpDays: last.tpDays,
       }
       : {};
     setRows((current) => [...current, ...Array.from({ length: count }, () => emptyRentalRow(defaults))]);
@@ -2452,7 +2445,7 @@ function RentalReportForm({
   }
 
   function rowZoneDays(row) {
-    return numberValue(row.ukDays) + numberValue(row.euDays) + numberValue(row.wtsDays) + numberValue(row.tpDays);
+    return numberValue(row.ukDays) + numberValue(row.euDays) + numberValue(row.wtsDays);
   }
 
   // What is wrong with a row, in the words of whoever has to fix it. Empty means
@@ -2464,8 +2457,7 @@ function RentalReportForm({
     if (!row.startDate || !row.endDate) problems.push("start and end dates");
     else if (days <= 0) problems.push("an end date on or after the start date");
     if (isRcukRental) {
-      if (row.rentalType === "Monthly" && !numberValue(row.months)) problems.push("the number of months");
-      if (days > 0 && rowZoneDays(row) !== days) problems.push(`UK + EU + WTS + TP to add up to ${days}`);
+      if (days > 0 && rowZoneDays(row) !== days) problems.push(`UK + EU + WTS to add up to ${days}`);
       if (days > 0 && days < getMinimumRentalDays(shared.rentalRegion)) {
         problems.push(`at least ${getMinimumRentalDays(shared.rentalRegion)} days`);
       }
@@ -2510,8 +2502,10 @@ function RentalReportForm({
   function rcukPayloadFor(row) {
     return {
       sim_number: normalizeRcukSimNumber(row.simNumber),
-      rental_type: row.rentalType.toLowerCase(),
-      no_of_months: numberValue(row.months),
+      // Every rental this shop writes is a daily one, so the type and the
+      // monthly count are constants rather than columns nobody touches.
+      rental_type: "daily",
+      no_of_months: 0,
       rental_package: row.package,
       service_type: packageServiceType(row.package),
       start_date: row.startDate,
@@ -2519,8 +2513,6 @@ function RentalReportForm({
       uk_days: numberValue(row.ukDays),
       eu_days: numberValue(row.euDays),
       wts_days: numberValue(row.wtsDays),
-      tp_days: numberValue(row.tpDays),
-      il_ddi: row.ilDdi ? "yes" : "no",
       us_ddi: row.usDdi ? "yes" : "no",
       sms: row.sms ? "yes" : "no",
       customer_phone: shared.customerPhone,
@@ -2660,8 +2652,6 @@ function RentalReportForm({
           rentalId: row.rentalId,
           rentalRegion: shared.rentalRegion,
           serviceType: packageServiceType(row.package),
-          rcukRentalType: row.rentalType,
-          months: numberValue(row.months),
           // "Device" on the receipt: what physically went out with the SIM.
           rentalType: row.rentalPhoneId ? "Phone" : "SIM only",
           model: row.model,
@@ -2678,10 +2668,8 @@ function RentalReportForm({
           ukDays: numberValue(row.ukDays),
           euDays: numberValue(row.euDays),
           wtsDays: numberValue(row.wtsDays),
-          tpDays: numberValue(row.tpDays),
           addSms: row.sms ? "Yes" : "No",
           usaNumber: row.usDdi ? "Yes" : "No",
-          ilNumber: row.ilDdi ? "Yes" : "No",
           cli: row.cli,
           usDdi: row.usDdiNumber,
           rcukActivated: isRcukRental ? (row.rentalId ? "Yes" : "No") : "",
@@ -2714,8 +2702,8 @@ function RentalReportForm({
     });
   }
 
-  const zoneFields = ["ukDays", "euDays", "wtsDays", "tpDays"];
-  const flagFields = [["ilDdi", "IL DDI"], ["usDdi", "US DDI"], ["sms", "SMS"]];
+  const zoneFields = ["ukDays", "euDays", "wtsDays"];
+  const flagFields = [["usDdi", "US DDI"], ["sms", "SMS"]];
 
   return (
     <section className="workspace">
@@ -2794,8 +2782,6 @@ function RentalReportForm({
           <thead>
             <tr>
               <th className="rental-col-sim">SIM</th>
-              <th>Rental type</th>
-              <th>Months</th>
               <th>Package</th>
               <th>Start date</th>
               <th>End date</th>
@@ -2804,8 +2790,6 @@ function RentalReportForm({
               <th>UK</th>
               <th>EU</th>
               <th>WTS</th>
-              <th>TP</th>
-              <th>IL DDI</th>
               <th>US DDI</th>
               <th>SMS</th>
               <th>Phone issued</th>
@@ -2845,21 +2829,6 @@ function RentalReportForm({
                     {row.message ? (
                       <span className={row.status === "error" ? "rental-row-msg error" : "rental-row-msg"}>{row.message}</span>
                     ) : null}
-                  </td>
-                  <td>
-                    <select value={row.rentalType} onChange={(event) => editRow(row.id, { rentalType: event.target.value })} disabled={locked}>
-                      <option>Daily</option>
-                      <option>Monthly</option>
-                    </select>
-                  </td>
-                  <td>
-                    <input
-                      className="rental-cell-num"
-                      inputMode="numeric"
-                      value={row.months}
-                      onChange={(event) => editRow(row.id, { months: event.target.value })}
-                      disabled={locked || row.rentalType !== "Monthly"}
-                    />
                   </td>
                   <td>
                     <select value={row.package} onChange={(event) => editRow(row.id, { package: event.target.value })} disabled={locked}>
