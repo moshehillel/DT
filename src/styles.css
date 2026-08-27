@@ -4163,3 +4163,39 @@ tr:last-child td {
   max-height: 90vh;
   overflow-y: auto;
 }
+
+/* ---- POS search results: use the space that's actually there ---------------
+   The results grid carried a fixed 252px cap (156px on short screens) and the
+   panel a 350px one, while the cart below it kept `flex: 1 1 auto` and claimed
+   every remaining pixel — so a search showed ~3 rows in a short box with a big
+   empty cart underneath. While a search is on screen the panel grows into that
+   space instead, and the cart falls back to its content height. */
+
+.pos-left.is-searching .pos-quick-panel {
+  flex: 1 1 auto;
+  max-height: none;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.pos-left.is-searching .pos-quick-panel .history-header {
+  flex: 0 0 auto;
+}
+
+.pos-left.is-searching .pos-quick-panel .pos-product-grid {
+  flex: 1 1 auto;
+  max-height: none;
+  min-height: 0;
+  /* Tiles stay their own height and pack from the top; without this the grid
+     stretches its rows to fill and the tiles come out oddly tall. */
+  align-content: start;
+}
+
+/* The cart stays visible and scrollable, it just stops hogging the leftover
+   height. The floor keeps a few lines of the sale in view while searching. */
+.pos-left.is-searching .pos-cart {
+  flex: 0 1 auto;
+  min-height: 128px;
+  max-height: 45%;
+}

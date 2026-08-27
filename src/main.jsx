@@ -5904,7 +5904,9 @@ function PosPage({ products, reports = [], storeLocations = [], activeEmployee, 
 
       <div className="pos-body">
       <div className="pos-layout">
-        <div className="pos-left">
+        {/* `is-searching` lets the results panel claim the height the cart isn't
+            using; without it the list is capped short with dead space beneath. */}
+        <div className={`pos-left${searching ? " is-searching" : ""}`}>
         <section className="history pos-cart">
           <div className="history-header">
             <div>
