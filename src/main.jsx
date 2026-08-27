@@ -2394,16 +2394,14 @@ function RentalReportForm({
       : []),
   ];
 
-  // The RCUK round trip is the happy path, but it must never be able to strand a
-  // rental the customer has already paid for. Once the rental itself is complete
-  // and any card has gone through, the report can always be saved — flagged as
-  // not activated, with RCUK's own reason on it, so it can be finished by hand.
   const rentalBasicsReady = isRentalFormComplete(form)
     && minimumDaysValid
     && totalPrice > 0
     && cardChargeComplete;
+  // A RCUK rental only exists once RCUK has activated it, so it is not filed
+  // here until it has been — no local record of a rental that isn't really out.
   const rcukActivated = rentalSubmitted && submitState.getNumbersAttempted;
-  const canSave = rentalBasicsReady;
+  const canSave = rentalBasicsReady && (isSimpleRental || rcukActivated);
 
   // Only a real handset needs a fleet phone; a SIM-only rental doesn't.
   const needsHandset = form.deviceKind !== "SIM only";
@@ -2762,17 +2760,6 @@ function RentalReportForm({
 
   function saveRentalReport() {
     if (!canSave) return;
-    // Saving a RCUK rental that never came back with an ID is allowed (the card
-    // may already be charged) but it is never silent: it needs a yes, and the
-    // report carries the reason so someone can finish it on RCUK's own site.
-    if (isRcukRental && !rcukActivated) {
-      const confirmed = window.confirm(
-        "This rental was not activated on RCUK — no rental ID came back."
-        + (card.status === "paid" ? " The card has already been charged." : "")
-        + "\n\nSave it anyway? It will be filed as NOT ACTIVATED so it can be finished on RCUK.",
-      );
-      if (!confirmed) return;
-    }
 
     const report = {
       id: crypto.randomUUID(),
@@ -3106,13 +3093,8 @@ function RentalReportForm({
                 </button>
               </>
             ) : null}
-            <button
-              className={isRcukRental && !rcukActivated ? "secondary-button" : "primary-button"}
-              type="button"
-              onClick={saveRentalReport}
-              disabled={!canSave}
-            >
-              {isRcukRental && !rcukActivated ? "Save without RCUK activation" : "Save rental report"}
+            <button className="primary-button" type="button" onClick={saveRentalReport} disabled={!canSave}>
+              Save rental report
             </button>
           </div>
         </div>
@@ -3156,10 +3138,17 @@ function RentalReportForm({
               </ul>
             </div>
           ) : null}
-          {isRcukRental && !rcukActivated && canSave ? (
+          {isRcukRental && !rcukActivated && !submitBlockers.length ? (
             <div className="summary-error">
-              Not activated on RCUK yet. Submit it and get the numbers, or save it as not activated — the rental
-              is recorded either way and can be finished on RCUK afterwards.
+              {rentalSubmitted
+                ? "Submitted — now press Get numbers. It can be saved once RCUK returns them."
+                : "Not activated on RCUK yet. Press Submit rental, then Get numbers, before saving."}
+            </div>
+          ) : null}
+          {isRcukRental && !rcukActivated && card.status === "paid" ? (
+            <div className="summary-error">
+              ⚠ The card has been charged {formatMoney(totalPrice)} but RCUK has not activated this rental. Get it
+              activated — or refund the card — before the customer leaves.
             </div>
           ) : null}
           {requiresCardCharge && !cardChargeComplete ? (
