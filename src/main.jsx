@@ -2312,9 +2312,10 @@ function RentalReportForm({
   });
   const solaTokenRef = useRef("");
   const [addPhoneOpen, setAddPhoneOpen] = useState(false);
-  // What the last save did, so activating a second rental doesn't look like
-  // nothing happened when the RCUK panel clears itself.
-  const [savedNotice, setSavedNotice] = useState("");
+  // Rentals already activated on RCUK in this go, waiting to be filed. A family
+  // renting four SIMs is four rentals — four RCUK activations, four reports,
+  // four return dates — but one customer, one card charge and one Save.
+  const [queued, setQueued] = useState([]);
   // Card-present terminal state (Verifone P200 / Sola BBPOS), same as the POS.
   // Rentals are always charged card-present — no keyed-in entry option here.
   const [card, setCard] = useState({ status: "idle", message: "", refNum: "", cardType: "", maskedCardNumber: "" });
@@ -2379,7 +2380,6 @@ function RentalReportForm({
   const minimumDaysValid = getMinimumRentalDays(form.rentalRegion) <= totalDays;
   // CC/Card rentals must be charged on the in-store terminal before saving.
   const requiresCardCharge = isCardPayment(form.paymentMethod);
-  const cardChargeComplete = !requiresCardCharge || card.status === "paid";
   const canSubmitRental = isRentalFormComplete(form)
     && zoneDaysValid
     && minimumDaysValid
@@ -2419,12 +2419,24 @@ function RentalReportForm({
 
   const rentalBasicsReady = isRentalFormComplete(form)
     && minimumDaysValid
-    && totalPrice > 0
-    && cardChargeComplete;
+    && totalPrice > 0;
   // A RCUK rental only exists once RCUK has activated it, so it is not filed
   // here until it has been — no local record of a rental that isn't really out.
   const rcukActivated = rentalSubmitted && submitState.getNumbersAttempted;
-  const canSave = rentalBasicsReady && (isSimpleRental || rcukActivated);
+  // The SIM on the form right now, if it is ready to be filed.
+  const currentReady = rentalBasicsReady && (isSimpleRental || rcukActivated);
+  // Everything this Save will file: the ones already put aside plus the current
+  // one. Each is its own rental — its own SIM, numbers and return date — so each
+  // becomes its own report; they just share a customer and a single card charge.
+  // With rentals already put aside, an empty form is the normal resting state —
+  // it is waiting for the next SIM, not failing validation — so the blockers stay
+  // quiet until someone starts filling it in.
+  const currentStarted = queued.length === 0
+    || Boolean((isRcukRental ? normalizedSimNumber : form.simNumber).trim());
+  const batchCount = queued.length + (currentReady ? 1 : 0);
+  const batchTotal = queued.reduce((sum, entry) => sum + entry.price, 0) + (currentReady ? totalPrice : 0);
+  const cardChargeComplete = !requiresCardCharge || card.status === "paid";
+  const canSave = batchCount > 0 && cardChargeComplete;
 
   // Only a real handset needs a fleet phone; a SIM-only rental doesn't.
   const needsHandset = form.deviceKind !== "SIM only";
@@ -2449,7 +2461,6 @@ function RentalReportForm({
 
   function updateField(name, value) {
     setForm((current) => ({ ...current, [name]: value }));
-    setSavedNotice("");
     // A change that moves the price or the payment method invalidates any card
     // charge already taken — force it to be run again for the new amount.
     if (["paymentMethod", "priceOverride", "customerPhone", "startDate", "endDate", "serviceType", "addSms", "rentalRegion", "ukDays", "euDays", "wtsDays"].includes(name)) {
@@ -2760,11 +2771,11 @@ function RentalReportForm({
 
   // Card-present charge on the in-store terminal (Verifone P200), same as POS.
   async function chargeRentalCard() {
-    if (!requiresCardCharge || !totalPrice) return;
+    if (!requiresCardCharge || !batchTotal) return;
     try {
       setCard({ status: "charging", message: "Follow the terminal…", refNum: "", cardType: "", maskedCardNumber: "" });
       const result = await chargeOnLocalTerminal({
-        amount: Number(totalPrice).toFixed(2),
+        amount: Number(batchTotal).toFixed(2),
         externalRequestId: `rental-${Date.now()}`,
         onStatus: (text) => setCard((current) => ({ ...current, message: text })),
       });
@@ -2785,26 +2796,34 @@ function RentalReportForm({
   function saveRentalReport() {
     if (!canSave) return;
 
-    const report = {
+    // One report per rental — each SIM has its own numbers, its own return date
+    // and its own late fee, so each has to stand on its own in the log and in the
+    // overdue notices. They share a batch id and, when it's a card, one charge:
+    // the amounts add up to what the terminal actually took.
+    const entries = [...queued, ...(currentReady ? [currentRentalEntry()] : [])];
+    const batchId = crypto.randomUUID();
+    const createdAt = new Date().toISOString();
+
+    const reports = entries.map((entry) => ({
       id: crypto.randomUUID(),
       type: "rental",
-      createdAt: new Date().toISOString(),
+      createdAt,
       servedBy: activeEmployee,
       location: activeLocation || "",
       customerPhone: form.customerPhone.trim(),
       customerPhoneDigits: digitsOnly(form.customerPhone),
-      paymentAmount: String(totalPrice),
+      paymentAmount: String(entry.price),
       paymentMethod: form.paymentMethod,
       notes: form.notes.trim(),
       details: {
-        rentalId: submitState.rentalId,
+        rentalId: entry.rentalId,
         rentalRegion: form.rentalRegion,
-        serviceType: form.serviceType,
-        rentalType: form.deviceKind,
-        model: form.model,
-        imei: form.imei,
-        rentalPhoneId: form.rentalPhoneId,
-        simNumber: isRcukRental ? normalizedSimNumber : form.simNumber.trim(),
+        serviceType: entry.serviceType,
+        rentalType: entry.deviceKind,
+        model: entry.model,
+        imei: entry.imei,
+        rentalPhoneId: entry.rentalPhoneId,
+        simNumber: entry.simNumber,
         startDate: form.startDate,
         endDate: form.endDate,
         returnTime: `${form.returnDays || 0} days`,
@@ -2815,20 +2834,22 @@ function RentalReportForm({
         ukDays: numberValue(form.ukDays),
         euDays: numberValue(form.euDays),
         wtsDays: numberValue(form.wtsDays),
-        addSms: form.addSms ? "Yes" : "No",
-        usaNumber: form.usaNumber ? "Yes" : "No",
-        cli: submitState.cli,
-        usDdi: submitState.usDdi,
-        // Whether RCUK actually activated this SIM. "No" means the rental exists
-        // here (and may be paid) but still has to be created on RCUK.
-        rcukActivated: isRcukRental ? (rcukActivated ? "Yes" : "No") : "",
-        rcukError: isRcukRental && !rcukActivated ? submitState.message || "Not submitted to RCUK." : "",
+        addSms: entry.addSms ? "Yes" : "No",
+        usaNumber: entry.usaNumber ? "Yes" : "No",
+        cli: entry.cli,
+        usDdi: entry.usDdi,
+        // Whether RCUK actually activated this SIM.
+        rcukActivated: isRcukRental ? (entry.rentalId ? "Yes" : "No") : "",
+        // Several SIMs rented together: the batch ties the reports (and the one
+        // card charge) back to each other.
+        rentalBatchId: entries.length > 1 ? batchId : "",
+        rentalBatchSize: entries.length > 1 ? entries.length : "",
         dailyRate,
         // What was actually charged, plus what the formula said, so a discount
         // stays visible on the report instead of vanishing into the total.
-        totalPrice,
-        calculatedPrice,
-        priceOverridden: hasPriceOverride ? "Yes" : "",
+        totalPrice: entry.price,
+        calculatedPrice: entry.calculatedPrice,
+        priceOverridden: entry.priceOverridden ? "Yes" : "",
         pricingLabel: rentalPricing.label,
         location: activeLocation || "",
         storeAddress: activeStoreInfo?.address || "",
@@ -2837,27 +2858,56 @@ function RentalReportForm({
         cardRefNum: requiresCardCharge ? card.refNum : "",
         cardType: requiresCardCharge ? card.cardType : "",
         maskedCardNumber: requiresCardCharge ? card.maskedCardNumber : "",
+        // The charge covers the whole batch, so say so on every report in it.
+        batchChargeTotal: entries.length > 1 ? batchTotal : "",
       },
-    };
+    }));
 
-    onSave(report);
-    // The handset is now out with the customer — flag it so the fleet list and
-    // the next rental both know it isn't on the shelf.
-    if (form.rentalPhoneId && onIssueRentalPhone) {
-      onIssueRentalPhone(form.rentalPhoneId, { reportId: report.id, customerPhone: form.customerPhone });
-    }
-    printRentalReceipt(report);
-    startNextRental(report);
+    reports.forEach((report, index) => {
+      onSave(report);
+      // The handset is now out with the customer — flag it so the fleet list and
+      // the next rental both know it isn't on the shelf.
+      const phoneId = entries[index].rentalPhoneId;
+      if (phoneId && onIssueRentalPhone) {
+        onIssueRentalPhone(phoneId, { reportId: report.id, customerPhone: form.customerPhone });
+      }
+      printRentalReceipt(report);
+    });
   }
 
-  // Clear everything that belongs to the rental just saved so the next SIM can
-  // be activated straight away. Without this the form kept the finished rental's
-  // RCUK id, CLI and SIM check, and a second activation either re-sent the same
-  // SIM or filed the new rental under the old rental's numbers.
-  // What the next rental almost always shares — the customer, the dates, the
-  // zone split, how they're paying — stays put; a different customer just gets
-  // typed over, or use "Clear form" for a blank one.
-  function startNextRental(saved) {
+  // Everything about the rental on the form that is specific to this SIM. The
+  // customer, dates, zone split and payment stay on the form and are shared by
+  // every rental in the batch.
+  function currentRentalEntry() {
+    return {
+      key: crypto.randomUUID(),
+      simNumber: isRcukRental ? normalizedSimNumber : form.simNumber.trim(),
+      rentalId: submitState.rentalId,
+      cli: submitState.cli,
+      usDdi: submitState.usDdi,
+      serviceType: form.serviceType,
+      deviceKind: form.deviceKind,
+      model: form.model,
+      imei: form.imei,
+      rentalPhoneId: form.rentalPhoneId,
+      addSms: form.addSms,
+      usaNumber: form.usaNumber,
+      price: totalPrice,
+      calculatedPrice,
+      priceOverridden: hasPriceOverride,
+    };
+  }
+
+  // Put this SIM aside and clear the form for the next one. The RCUK state has
+  // to go with it, or the next activation would ride on the finished rental's id
+  // and numbers.
+  function addAnotherRental() {
+    if (!currentReady) return;
+    if (card.status === "paid") {
+      window.alert("The card has already been charged for this batch. Save it first, then start the next rental.");
+      return;
+    }
+    setQueued((current) => [...current, currentRentalEntry()]);
     setForm((current) => ({
       ...current,
       simNumber: "",
@@ -2865,7 +2915,6 @@ function RentalReportForm({
       imei: "",
       rentalPhoneId: "",
       priceOverride: "",
-      notes: "",
     }));
     setSubmitState({
       status: "idle",
@@ -2877,13 +2926,15 @@ function RentalReportForm({
       raw: null,
     });
     setSimCheckState({ status: "idle", message: "", checkedSimNumber: "", raw: null });
-    setCard({ status: "idle", message: "", refNum: "", cardType: "", maskedCardNumber: "" });
     autoCheckedSimRef.current = "";
-    const label = saved.details.rentalId ? `Rental ${saved.details.rentalId}` : "Rental";
-    setSavedNotice(
-      `${label} saved for ${saved.customerPhone}. Scan the next SIM to activate another rental for this customer, `
-      + "or change the customer phone for someone else.",
-    );
+  }
+
+  function removeQueuedRental(key) {
+    if (card.status === "paid") {
+      window.alert("The card has already been charged for this batch, so the rentals in it can't be changed.");
+      return;
+    }
+    setQueued((current) => current.filter((entry) => entry.key !== key));
   }
 
   function clearRentalForm() {
@@ -2914,7 +2965,7 @@ function RentalReportForm({
     setSimCheckState({ status: "idle", message: "", checkedSimNumber: "", raw: null });
     setCard({ status: "idle", message: "", refNum: "", cardType: "", maskedCardNumber: "" });
     autoCheckedSimRef.current = "";
-    setSavedNotice("");
+    setQueued([]);
   }
 
   return (
@@ -3153,7 +3204,10 @@ function RentalReportForm({
             <div className="payment-panel payment-panel-stack">
               <div>
                 <p className="eyebrow">Card payment (Verifone P200)</p>
-                <h3>Charge {formatMoney(totalPrice)} on the terminal</h3>
+                <h3>Charge {formatMoney(batchTotal)} on the terminal</h3>
+                {batchCount > 1 ? (
+                  <p className="muted">One charge for all {batchCount} rentals.</p>
+                ) : null}
               </div>
               <div className="card-reader-row">
                 <span className={`reader-dot ${card.status === "paid" ? "connected" : ""}`} aria-hidden="true" />
@@ -3163,9 +3217,9 @@ function RentalReportForm({
                 className="secondary-button"
                 type="button"
                 onClick={chargeRentalCard}
-                disabled={!totalPrice || card.status === "charging" || card.status === "paid"}
+                disabled={!batchTotal || card.status === "charging" || card.status === "paid"}
               >
-                {card.status === "paid" ? "Card charged ✓" : card.status === "charging" ? "Charging…" : `Charge ${formatMoney(totalPrice)}`}
+                {card.status === "paid" ? "Card charged ✓" : card.status === "charging" ? "Charging…" : `Charge ${formatMoney(batchTotal)}`}
               </button>
               <p className={card.status === "error" ? "summary-error" : "muted"}>{card.message}</p>
             </div>
@@ -3187,18 +3241,26 @@ function RentalReportForm({
                 </button>
               </>
             ) : null}
+            <button
+              className="secondary-button"
+              type="button"
+              onClick={addAnotherRental}
+              disabled={!currentReady || card.status === "paid"}
+              title="File this SIM with the batch and clear the form for the next one"
+            >
+              + Another rental for this customer
+            </button>
             <button className="primary-button" type="button" onClick={saveRentalReport} disabled={!canSave}>
-              Save rental report
+              {batchCount > 1 ? `Save ${batchCount} rental reports` : "Save rental report"}
             </button>
             <button className="secondary-button" type="button" onClick={clearRentalForm}>
               Clear form
             </button>
           </div>
-          {savedNotice ? <p className="rental-saved-notice">✓ {savedNotice}</p> : null}
         </div>
 
         <aside className="rental-summary">
-          <p className="eyebrow">Rental total</p>
+          <p className="eyebrow">{queued.length ? "This rental" : "Rental total"}</p>
           <h3>{formatMoney(totalPrice)}</h3>
           <div className="summary-line"><span>Daily rate</span><strong>{formatMoney(dailyRate)}</strong></div>
           <div className="summary-line"><span>Pricing</span><strong>{rentalPricing.label}</strong></div>
@@ -3225,10 +3287,47 @@ function RentalReportForm({
               UK + EU + WTS: {zoneDays || 0} / {totalDays || 0}
             </div>
           ) : null}
+
+          {queued.length ? (
+            <div className="rental-batch">
+              <p className="eyebrow">Renting together ({batchCount})</p>
+              {queued.map((entry, index) => (
+                <div className="rental-batch-row" key={entry.key}>
+                  <div>
+                    <strong>{index + 1}. {entry.rentalId ? `Rental ${entry.rentalId}` : "Rental"}</strong>
+                    <span className="muted">SIM …{entry.simNumber.slice(-6)}{entry.cli ? ` · ${entry.cli}` : ""}</span>
+                  </div>
+                  <span>{formatMoney(entry.price)}</span>
+                  <button
+                    className="dialog-close"
+                    type="button"
+                    aria-label={`Remove rental ${index + 1} from this batch`}
+                    title="Remove from this batch"
+                    onClick={() => removeQueuedRental(entry.key)}
+                  >
+                    &times;
+                  </button>
+                </div>
+              ))}
+              {currentReady ? (
+                <div className="rental-batch-row">
+                  <div>
+                    <strong>{queued.length + 1}. On the form now</strong>
+                    <span className="muted">SIM …{(isRcukRental ? normalizedSimNumber : form.simNumber).slice(-6)}</span>
+                  </div>
+                  <span>{formatMoney(totalPrice)}</span>
+                </div>
+              ) : null}
+              <div className="rental-batch-total">
+                <span>Batch total</span>
+                <strong>{formatMoney(batchTotal)}</strong>
+              </div>
+            </div>
+          ) : null}
           {!minimumDaysValid && totalDays > 0 ? (
             <div className="summary-error">Minimum rental is {getMinimumRentalDays(form.rentalRegion)} days.</div>
           ) : null}
-          {submitBlockers.length ? (
+          {submitBlockers.length && currentStarted ? (
             <div className="summary-error">
               <strong>{isRcukRental ? "Before submitting to RCUK:" : "Before saving:"}</strong>
               <ul className="blocker-list">
@@ -3236,7 +3335,7 @@ function RentalReportForm({
               </ul>
             </div>
           ) : null}
-          {isRcukRental && !rcukActivated && !submitBlockers.length ? (
+          {isRcukRental && !rcukActivated && !submitBlockers.length && currentStarted ? (
             <div className="summary-error">
               {rentalSubmitted
                 ? "Submitted — now press Get numbers. It can be saved once RCUK returns them."

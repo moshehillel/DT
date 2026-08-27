@@ -4314,15 +4314,47 @@ tr:last-child td {
   margin: -6px 0 0;
 }
 
-/* Confirms the rental that was just filed, and that the form is now waiting for
-   the next SIM rather than sitting there half-cleared for no reason. */
-.rental-saved-notice {
-  margin: 10px 0 0;
+/* Several SIMs going out together: what this one Save will file, and what the
+   card is being charged for the lot. */
+.rental-batch {
+  display: grid;
+  gap: 8px;
+  margin-top: 12px;
   padding: 10px 12px;
   border: 1px solid #bfe3d2;
   border-radius: 8px;
   background: #f1fbf6;
+}
+
+.rental-batch-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  font-size: 13px;
+}
+
+.rental-batch-row > div {
+  display: grid;
+  min-width: 0;
+}
+
+.rental-batch-row span.muted {
+  font-size: 12px;
+}
+
+.rental-batch-row .dialog-close {
+  min-width: 24px;
+  min-height: 24px;
+  font-size: 16px;
+  padding: 0 6px 2px;
+}
+
+.rental-batch-total {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  padding-top: 8px;
+  border-top: 1px solid #bfe3d2;
   color: #14603f;
-  font-weight: 650;
-  line-height: 1.4;
 }
