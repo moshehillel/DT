@@ -2307,8 +2307,8 @@ function RentalReportForm({
   const solaTokenRef = useRef("");
   const [addPhoneOpen, setAddPhoneOpen] = useState(false);
   // Card-present terminal state (Verifone P200 / Sola BBPOS), same as the POS.
+  // Rentals are always charged card-present — no keyed-in entry option here.
   const [card, setCard] = useState({ status: "idle", message: "", refNum: "", cardType: "", maskedCardNumber: "" });
-  const [cardEntryMode, setCardEntryMode] = useState("terminal");
 
   useEffect(() => {
     const timer = window.setInterval(() => setNow(new Date()), 30000);
@@ -2691,7 +2691,6 @@ function RentalReportForm({
       const result = await chargeOnLocalTerminal({
         amount: Number(totalPrice).toFixed(2),
         externalRequestId: `rental-${Date.now()}`,
-        manualEntry: cardEntryMode === "manual",
         onStatus: (text) => setCard((current) => ({ ...current, message: text })),
       });
       setCard({
@@ -2997,17 +2996,13 @@ function RentalReportForm({
                 <span className={`reader-dot ${card.status === "paid" ? "connected" : ""}`} aria-hidden="true" />
                 <span className="muted">Sola BBPOS · local terminal</span>
               </div>
-              <div className="segmented-control" role="tablist" aria-label="Card entry mode">
-                <button type="button" className={cardEntryMode === "terminal" ? "selected" : ""} onClick={() => setCardEntryMode("terminal")} disabled={card.status === "charging" || card.status === "paid"}>Tap / dip / swipe</button>
-                <button type="button" className={cardEntryMode === "manual" ? "selected" : ""} onClick={() => setCardEntryMode("manual")} disabled={card.status === "charging" || card.status === "paid"}>Manual entry</button>
-              </div>
               <button
                 className="secondary-button"
                 type="button"
                 onClick={chargeRentalCard}
                 disabled={!totalPrice || card.status === "charging" || card.status === "paid"}
               >
-                {card.status === "paid" ? "Card charged ✓" : card.status === "charging" ? "Charging…" : cardEntryMode === "manual" ? `Charge ${formatMoney(totalPrice)} (manual entry)` : `Charge ${formatMoney(totalPrice)}`}
+                {card.status === "paid" ? "Card charged ✓" : card.status === "charging" ? "Charging…" : `Charge ${formatMoney(totalPrice)}`}
               </button>
               <p className={card.status === "error" ? "summary-error" : "muted"}>{card.message}</p>
             </div>
@@ -3110,6 +3105,18 @@ function RentalReportForm({
 
 // Register a handset into the rental fleet without leaving the rental form —
 // scan the IMEI, name it, and it's immediately selectable as the phone issued.
+// Every popup closes the same way: an X in its top-right corner. Several of
+// these cards scroll (a long form, a receipt), so the header it sits in is
+// pinned — see `.dialog-head` in the stylesheet — and the way out never
+// scrolls off with the content.
+function DialogCloseButton({ onClose, label = "Close" }) {
+  return (
+    <button className="dialog-close" type="button" aria-label={label} title={label} onClick={onClose}>
+      &times;
+    </button>
+  );
+}
+
 function AddRentalPhoneDialog({ existingPhones = [], onAdd, onClose }) {
   const [name, setName] = useState("");
   const [imei, setImei] = useState("");
@@ -3130,9 +3137,12 @@ function AddRentalPhoneDialog({ existingPhones = [], onAdd, onClose }) {
   return createPortal(
     <div className="dialog-backdrop" role="presentation" onMouseDown={onClose}>
       <div className="dialog-card" role="dialog" aria-modal="true" onMouseDown={(event) => event.stopPropagation()}>
-        <div>
-          <p className="eyebrow">Rental fleet</p>
-          <h3>Add a phone</h3>
+        <div className="dialog-head">
+          <div>
+            <p className="eyebrow">Rental fleet</p>
+            <h3>Add a phone</h3>
+          </div>
+          <DialogCloseButton onClose={onClose} label="Close add a phone" />
         </div>
         <form className="form-grid dialog-form" onSubmit={submit}>
           <label className="field full">
@@ -3812,7 +3822,10 @@ function EditRepairDialog({ repair, employees = [], onSave, onClose }) {
   return createPortal(
     <div className="dialog-backdrop" role="presentation" onMouseDown={onClose}>
       <div className="dialog-card dialog-card-wide" role="dialog" aria-modal="true" onMouseDown={(event) => event.stopPropagation()}>
-        <h2>Edit repair {details.ticketNumber ? `#${details.ticketNumber}` : ""}</h2>
+        <div className="dialog-head">
+          <h2>Edit repair {details.ticketNumber ? `#${details.ticketNumber}` : ""}</h2>
+          <DialogCloseButton onClose={onClose} label="Close edit repair" />
+        </div>
         <form className="form-grid" onSubmit={submit}>
           <label className="field"><span>Phone model</span><input value={form.model} onChange={(event) => set("model", event.target.value)} autoFocus /></label>
           <label className="field"><span>What is damaged?</span><input value={form.damage} onChange={(event) => set("damage", event.target.value)} /></label>
@@ -3962,12 +3975,17 @@ function RepairPaymentDialog({ repair, taxRate = 0, paying, onConfirm, onClose }
   return createPortal(
     <div className="dialog-backdrop" role="presentation" onMouseDown={charging ? undefined : onClose}>
       <div className="dialog-card pay-dialog" role="dialog" aria-modal="true" onMouseDown={(event) => event.stopPropagation()}>
-        <h2>Take payment</h2>
-        <p className="muted">
-          {details.ticketNumber ? `Repair #${details.ticketNumber}` : "Repair"}
-          {details.customerName ? ` · ${details.customerName}` : ""}
-          {details.model ? ` · ${details.model}` : ""}
-        </p>
+        <div className="dialog-head">
+          <div>
+            <h2>Take payment</h2>
+            <p className="muted">
+              {details.ticketNumber ? `Repair #${details.ticketNumber}` : "Repair"}
+              {details.customerName ? ` · ${details.customerName}` : ""}
+              {details.model ? ` · ${details.model}` : ""}
+            </p>
+          </div>
+          {charging ? null : <DialogCloseButton onClose={onClose} label="Close take payment" />}
+        </div>
         <form className="form-grid pay-form" onSubmit={submit}>
           <label className="field full">
             <span>Amount</span>
@@ -4074,11 +4092,16 @@ function FinalPriceDialog({ prompt, onChange, onConfirm, onClose }) {
   return createPortal(
     <div className="dialog-backdrop" role="presentation" onMouseDown={onClose}>
       <div className="dialog-card" role="dialog" aria-modal="true" onMouseDown={(event) => event.stopPropagation()}>
-        <h2>Final price</h2>
-        <p className="muted">
-          Enter the final price for repair {prompt.ticket ? `#${prompt.ticket}` : ""} before marking it Ready.
-          This becomes the amount the customer owes.
-        </p>
+        <div className="dialog-head">
+          <div>
+            <h2>Final price</h2>
+            <p className="muted">
+              Enter the final price for repair {prompt.ticket ? `#${prompt.ticket}` : ""} before marking it Ready.
+              This becomes the amount the customer owes.
+            </p>
+          </div>
+          <DialogCloseButton onClose={onClose} label="Close final price" />
+        </div>
         <form className="form-grid" onSubmit={submit}>
           <label className="field">
             <span>Final price</span>
@@ -6441,8 +6464,13 @@ function CustomAmountDialog({ onAdd, onClose }) {
   return createPortal(
     <div className="dialog-backdrop" role="presentation" onMouseDown={onClose}>
       <div className="dialog-card" role="dialog" aria-modal="true" onMouseDown={(event) => event.stopPropagation()}>
-        <h2>Custom item</h2>
-        <p className="muted">Enter an item name and amount. The receipt lists the name you enter (or “Custom item” if left blank).</p>
+        <div className="dialog-head">
+          <div>
+            <h2>Custom item</h2>
+            <p className="muted">Enter an item name and amount. The receipt lists the name you enter (or “Custom item” if left blank).</p>
+          </div>
+          <DialogCloseButton onClose={onClose} label="Close custom item" />
+        </div>
         <form className="form-grid" onSubmit={submit}>
           <label className="field">
             <span>Item name</span>
@@ -6514,12 +6542,17 @@ function CustomerInfoDialog({ phone, customer, onSave, onSkip, onClose, saveLabe
   return createPortal(
     <div className="dialog-backdrop" role="presentation" onMouseDown={onClose}>
       <div className="dialog-card" role="dialog" aria-modal="true" onMouseDown={(event) => event.stopPropagation()}>
-        <h2>{isNew ? "Add customer" : "Complete customer details"}</h2>
-        <p className="muted">
-          {isNew
-            ? `${phone} isn't in the CRM yet. Add whatever you have — all of it is optional.`
-            : `${phone} is missing some details. Add them for the receipt and follow-up.`}
-        </p>
+        <div className="dialog-head">
+          <div>
+            <h2>{isNew ? "Add customer" : "Complete customer details"}</h2>
+            <p className="muted">
+              {isNew
+                ? `${phone} isn't in the CRM yet. Add whatever you have — all of it is optional.`
+                : `${phone} is missing some details. Add them for the receipt and follow-up.`}
+            </p>
+          </div>
+          <DialogCloseButton onClose={onClose} label="Close customer details" />
+        </div>
         <form className="form-grid" onSubmit={submit}>
           <label className="field"><span>Phone</span><input value={phone} disabled /></label>
           <label className="field">
@@ -7042,6 +7075,9 @@ function SaleReceiptDialog({ sale, onClose, reprint = false }) {
   return (
     <div className="dialog-backdrop" role="presentation">
       <div className="dialog-card receipt-card" role="dialog" aria-modal="true">
+        <div className="dialog-head dialog-head-bare">
+          <DialogCloseButton onClose={onClose} label="Close receipt" />
+        </div>
         <img className="receipt-logo" src="/logo.webp" alt="Diamant Telecom" />
         <div className="receipt-success">
           <span className="receipt-check" aria-hidden="true">&#10003;</span>
@@ -7291,10 +7327,13 @@ function RestockDialog({ product, storeLocations, onClose, onAddStock }) {
   return (
     <div className="dialog-backdrop" role="presentation">
       <div className="dialog-card dialog-card-wide" role="dialog" aria-modal="true">
-        <div>
-          <p className="eyebrow">Add stock</p>
-          <h3>{product.name}</h3>
-          <p className="muted">In stock now: {currentStock}{requiresImei ? " IMEIs" : ""}</p>
+        <div className="dialog-head">
+          <div>
+            <p className="eyebrow">Add stock</p>
+            <h3>{product.name}</h3>
+            <p className="muted">In stock now: {currentStock}{requiresImei ? " IMEIs" : ""}</p>
+          </div>
+          <DialogCloseButton onClose={onClose} label="Close add stock" />
         </div>
         <form className="form-grid dialog-form" onSubmit={submit}>
           {needsBarcode ? (
@@ -7651,8 +7690,13 @@ function InventoryPage({
         // own Cancel button is the way out.
         <div className="dialog-backdrop" role="presentation">
           <div className="dialog-card inventory-edit-card" role="dialog" aria-modal="true">
-            <h2>Edit product</h2>
-            <p className="muted">{form.name || form.sku}</p>
+            <div className="dialog-head">
+              <div>
+                <h2>Edit product</h2>
+                <p className="muted">{form.name || form.sku}</p>
+              </div>
+              <DialogCloseButton onClose={() => setForm(emptyForm)} label="Close edit product" />
+            </div>
             {productForm}
           </div>
         </div>
@@ -7925,10 +7969,13 @@ function ItemDetailsDialog({ group, sessionRole, onClose, onRestock, onEdit, onD
         aria-labelledby="item-dialog-title"
         onClick={(event) => event.stopPropagation()}
       >
-        <div>
-          <p className="eyebrow">Inventory</p>
-          <h2 id="item-dialog-title">{group.name}</h2>
-          {subtitle ? <p className="muted">{subtitle}</p> : null}
+        <div className="dialog-head">
+          <div>
+            <p className="eyebrow">Inventory</p>
+            <h2 id="item-dialog-title">{group.name}</h2>
+            {subtitle ? <p className="muted">{subtitle}</p> : null}
+          </div>
+          <DialogCloseButton onClose={onClose} label="Close item details" />
         </div>
 
         <div className="table-wrap catalog-table">
@@ -8799,12 +8846,17 @@ function RentalEditDialog({ report, onSave, onClose }) {
   return createPortal(
     <div className="dialog-backdrop" role="presentation" onMouseDown={onClose}>
       <div className="dialog-card dialog-card-wide" role="dialog" aria-modal="true" onMouseDown={(event) => event.stopPropagation()}>
-        <h2>Edit rental{rentalId ? ` #${rentalId}` : ""}</h2>
-        <p className={isRcuk ? "summary-error" : "muted"}>
-          {isRcuk
-            ? "⚠ This rental is live on RCUK. Saving updates the real rental on RCUK's system — you'll be asked to confirm."
-            : "This rental has no RCUK ID, so changes are saved locally only."}
-        </p>
+        <div className="dialog-head">
+          <div>
+            <h2>Edit rental{rentalId ? ` #${rentalId}` : ""}</h2>
+            <p className={isRcuk ? "summary-error" : "muted"}>
+              {isRcuk
+                ? "⚠ This rental is live on RCUK. Saving updates the real rental on RCUK's system — you'll be asked to confirm."
+                : "This rental has no RCUK ID, so changes are saved locally only."}
+            </p>
+          </div>
+          <DialogCloseButton onClose={onClose} label="Close edit rental" />
+        </div>
         <form className="form-grid" onSubmit={submit}>
           <label className="field"><span>Customer phone</span><input value={form.customerPhone} inputMode="tel" onChange={(event) => set("customerPhone", event.target.value)} autoFocus /></label>
           <label className="field"><span>Payment amount</span><input value={form.paymentAmount} inputMode="decimal" placeholder="0.00" onChange={(event) => set("paymentAmount", event.target.value)} /></label>
@@ -9103,12 +9155,15 @@ function ReturnDialog({ report, onClose, onSubmit }) {
   return (
     <div className="dialog-backdrop" role="presentation">
       <div className="dialog-card dialog-card-wide" role="dialog" aria-modal="true">
-        <div>
-          <p className="eyebrow">Return / refund</p>
-          <h3>Return items from this sale</h3>
-          <p className="muted">
-            {formatShortDate(report.createdAt)} · {report.customerPhone || "no phone"} · paid {formatPayment(report.paymentAmount)} ({report.paymentMethod || "-"})
-          </p>
+        <div className="dialog-head">
+          <div>
+            <p className="eyebrow">Return / refund</p>
+            <h3>Return items from this sale</h3>
+            <p className="muted">
+              {formatShortDate(report.createdAt)} · {report.customerPhone || "no phone"} · paid {formatPayment(report.paymentAmount)} ({report.paymentMethod || "-"})
+            </p>
+          </div>
+          <DialogCloseButton onClose={onClose} label="Close return" />
         </div>
 
         <div className="return-lines">
