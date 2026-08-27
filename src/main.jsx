@@ -2376,7 +2376,6 @@ function RentalReportForm({
     [form.customerPhone, "customer phone"],
     [form.returnDays, "return days"],
     [form.paymentMethod, "payment method"],
-    ...(isRcukRental ? [[form.ukDays, "UK days"], [form.euDays, "EU days"], [form.wtsDays, "WTS days"]] : []),
     ...(form.deviceKind !== "SIM only" ? [[form.model, "phone model"], [form.imei, "IMEI"]] : []),
   ]
     .filter(([value]) => String(value ?? "").trim() === "")

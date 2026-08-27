@@ -464,9 +464,12 @@ export function isRentalFormComplete(form) {
     form.paymentMethod,
   ];
 
-  if (form.rentalRegion === "RCUK") {
-    required.push(form.ukDays, form.euDays, form.wtsDays);
-  }
+  // The zone days are deliberately NOT required to be typed in: a blank box is
+  // zero days in that zone, and 8 UK / blank / blank is a perfectly ordinary
+  // rental. Requiring text in all three left Submit disabled on a form that was
+  // filled in correctly — with "UK + EU + WTS: 8 / 8" showing green next to it.
+  // What actually matters is that they add up to the rental's total days, and
+  // the rental form checks that separately (zoneDaysValid).
 
   if (form.deviceKind !== "SIM only") {
     required.push(form.model, form.imei);
