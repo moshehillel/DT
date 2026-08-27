@@ -832,7 +832,9 @@ function Workspace({ currentUser, isAdmin }) {
     setPhoneOrders((current) => current.filter((item) => item.id !== orderId));
   }
 
-  async function completePhoneOrder(orderId) {
+  // `payment` is what the driver collected at the door on a collect-on-delivery
+  // order; prepaid orders arrive here with it already recorded by the store.
+  async function completePhoneOrder(orderId, payment = null) {
     const order = phoneOrders.find((item) => item.id === orderId);
     if (!order) return;
 
@@ -846,7 +848,7 @@ function Workspace({ currentUser, isAdmin }) {
       customerPhone: order.customerPhone,
       customerPhoneDigits: digitsOnly(order.customerPhone),
       paymentAmount: order.orderTotal,
-      paymentMethod: order.paymentMethod,
+      paymentMethod: payment?.paymentMethod || order.paymentMethod,
       notes: order.notes,
       details: {
         status: "Delivered",
@@ -864,7 +866,11 @@ function Workspace({ currentUser, isAdmin }) {
         taxAmount: order.taxAmount,
         outOfState: order.outOfState,
         orderTotal: order.orderTotal,
-        paymentStatus: order.paymentStatus,
+        paymentStatus: payment ? "Paid" : order.paymentStatus,
+        paymentMethod: payment?.paymentMethod || order.paymentMethod,
+        solaRefNum: payment?.refNum || order.solaRefNum || "",
+        collectedBy: payment ? activeEmployee : order.readyBy || "",
+        paidAt: payment ? deliveredAt : order.paidAt || "",
         createdBy: order.createdBy,
         orderedAt: order.createdAt,
         deliveredAt,
@@ -2039,7 +2045,7 @@ function ReportForm({ activeType, activeEmployee, activeLocation, reports, activ
         <div className="clock-pill">{formatDateTime(now)}</div>
       </div>
 
-      <form className="report-form" onSubmit={handleSubmit}>
+      <form className="report-form" onSubmit={handleSubmit} onKeyDown={preventEnterSubmit}>
         <div className="form-grid">
           <label className="field">
             <span>Customer / caller number</span>
@@ -3105,6 +3111,20 @@ function RentalReportForm({
 
 // Register a handset into the rental fleet without leaving the rental form —
 // scan the IMEI, name it, and it's immediately selectable as the phone issued.
+// A barcode / IMEI scanner types the code and then sends Enter. In a plain
+// <form> that Enter means "submit", so scanning the IMEI at repair intake saved
+// the ticket before the rest of the details were filled in — and scanning a
+// barcode into the product form added the product. Enter inside a single-line
+// field no longer submits; the Save button (or Enter while it is focused, which
+// arrives as a click on the button) still does. Textareas keep their newline.
+function preventEnterSubmit(event) {
+  if (event.key !== "Enter") return;
+  const target = event.target;
+  if (target instanceof HTMLInputElement && target.type !== "submit" && target.type !== "button") {
+    event.preventDefault();
+  }
+}
+
 // Every popup closes the same way: an X in its top-right corner. Several of
 // these cards scroll (a long form, a receipt), so the header it sits in is
 // pinned — see `.dialog-head` in the stylesheet — and the way out never
@@ -3826,7 +3846,7 @@ function EditRepairDialog({ repair, employees = [], onSave, onClose }) {
           <h2>Edit repair {details.ticketNumber ? `#${details.ticketNumber}` : ""}</h2>
           <DialogCloseButton onClose={onClose} label="Close edit repair" />
         </div>
-        <form className="form-grid" onSubmit={submit}>
+        <form className="form-grid" onSubmit={submit} onKeyDown={preventEnterSubmit}>
           <label className="field"><span>Phone model</span><input value={form.model} onChange={(event) => set("model", event.target.value)} autoFocus /></label>
           <label className="field"><span>What is damaged?</span><input value={form.damage} onChange={(event) => set("damage", event.target.value)} /></label>
           <label className="field"><span>Phone IMEI</span><input value={form.imei} inputMode="numeric" onChange={(event) => set("imei", event.target.value)} /></label>
@@ -5184,29 +5204,26 @@ function StoreFulfillmentBoard({ orders, products, onMarkReady, onCancel }) {
   );
 }
 
-function StoreOrderCard({ order, products, onMarkReady, onCancel }) {
-  const imeiLines = (order.lineItems || []).filter((line) => line.requiresImei);
-  const [imeis, setImeis] = useState(() => imeiLines.map((line) => line.imei || ""));
+// Taking the money for a phone order. Used twice: by the store before it marks
+// a prepaid order ready, and by whoever closes out a "Collect on delivery" one.
+// A card can be run on the in-store terminal from here, and there is always a
+// manual path — the terminal lives on one PC, and an order must never be stuck
+// with no way to record what the customer actually paid.
+function OrderPaymentDialog({ order, heading, confirmLabel, onConfirm, onClose }) {
+  const amount = Number(order.orderTotal) || 0;
+  const [method, setMethod] = useState(order.paymentMethod || "");
   const [cardEntryMode, setCardEntryMode] = useState("terminal");
   const [card, setCard] = useState({ status: "idle", message: "", refNum: "" });
+  const needsTerminal = isCardPayment(method);
+  const charging = card.status === "charging";
 
-  const requiresCardCharge = order.paymentStatus === "Paid" && isCardPayment(order.paymentMethod);
-  const cardCharged = !requiresCardCharge || card.status === "paid";
-
-  function imeiStatus(index) {
-    const value = imeis[index];
-    if (!value) return "missing";
-    if (imeis.filter((other) => other === value).length > 1) return "duplicate";
-    const stock = products.find((product) => product.id === imeiLines[index].productId)?.imeis || [];
-    if (stock.length > 0 && !stock.includes(value)) return "notstock";
-    return "ok";
+  function pickMethod(next) {
+    setMethod(next);
+    setCard({ status: "idle", message: "", refNum: "" });
   }
-  const imeisOk = imeiLines.every((_, index) => imeiStatus(index) === "ok");
-  const canReady = imeisOk && cardCharged;
 
   async function chargeCard() {
-    const amount = Number(order.orderTotal) || 0;
-    if (!requiresCardCharge || !amount) return;
+    if (!amount) return;
     try {
       setCard({ status: "charging", message: "Sending sale to the terminal...", refNum: "" });
       const result = await chargeOnLocalTerminal({
@@ -5227,6 +5244,96 @@ function StoreOrderCard({ order, products, onMarkReady, onCancel }) {
     }
   }
 
+  return createPortal(
+    <div className="dialog-backdrop" role="presentation" onMouseDown={charging ? undefined : onClose}>
+      <div className="dialog-card" role="dialog" aria-modal="true" onMouseDown={(event) => event.stopPropagation()}>
+        <div className="dialog-head">
+          <div>
+            <h2>{heading}</h2>
+            <p className="muted">{order.customerName || order.customerPhone} · {order.itemsText || order.model}</p>
+          </div>
+          {charging ? null : <DialogCloseButton onClose={onClose} label="Close take payment" />}
+        </div>
+
+        <div className="pos-totals">
+          <div className="pos-totals-row pos-totals-grand">
+            <span>Amount due</span>
+            <strong>{formatMoney(amount)}</strong>
+          </div>
+        </div>
+
+        <label className="field">
+          <span>Paid by</span>
+          <select value={method} onChange={(event) => pickMethod(event.target.value)} disabled={charging || card.status === "paid"}>
+            <option value="" disabled>Select one</option>
+            {paymentMethods.map((entry) => <option key={entry}>{entry}</option>)}
+          </select>
+        </label>
+
+        {needsTerminal ? (
+          <div className="payment-panel payment-panel-stack">
+            <div>
+              <p className="eyebrow">Card payment</p>
+              <h3>Charge {formatMoney(amount)} on the terminal</h3>
+            </div>
+            <div className="segmented-control" role="tablist" aria-label="Card entry mode">
+              <button type="button" className={cardEntryMode === "terminal" ? "selected" : ""} onClick={() => setCardEntryMode("terminal")} disabled={charging || card.status === "paid"}>Tap / dip / swipe</button>
+              <button type="button" className={cardEntryMode === "manual" ? "selected" : ""} onClick={() => setCardEntryMode("manual")} disabled={charging || card.status === "paid"}>Manual entry</button>
+            </div>
+            <button className="secondary-button" type="button" onClick={chargeCard} disabled={charging || card.status === "paid" || !amount}>
+              {card.status === "paid" ? "Card charged ✓" : charging ? "Waiting for card..." : cardEntryMode === "manual" ? "Charge card (manual entry)" : "Charge card (tap / dip / swipe)"}
+            </button>
+            {card.message ? <p className={card.status === "error" ? "summary-error" : "muted"}>{card.message}</p> : null}
+            {card.status !== "paid" ? (
+              <p className="muted">
+                No terminal on this computer, or the card was run somewhere else? Record the payment anyway — the
+                order still needs to move on.
+              </p>
+            ) : null}
+          </div>
+        ) : null}
+
+        <div className="pos-form-actions form-actions-row">
+          <button
+            className="primary-button"
+            type="button"
+            disabled={!method || charging}
+            onClick={() => onConfirm({ paymentMethod: method, refNum: card.refNum, amount })}
+          >
+            {confirmLabel}
+          </button>
+          <button className="secondary-button" type="button" onClick={onClose} disabled={charging}>
+            Cancel
+          </button>
+        </div>
+      </div>
+    </div>,
+    document.body,
+  );
+}
+
+function StoreOrderCard({ order, products, onMarkReady, onCancel }) {
+  const imeiLines = (order.lineItems || []).filter((line) => line.requiresImei);
+  const [imeis, setImeis] = useState(() => imeiLines.map((line) => line.imei || ""));
+  const [payOpen, setPayOpen] = useState(false);
+  // What was actually collected here, once it has been. Prepaid orders can't go
+  // out until this is filled in; collect-on-delivery ones are paid at the door.
+  const [payment, setPayment] = useState(null);
+
+  const needsPayment = order.paymentStatus === "Paid";
+  const paid = !needsPayment || Boolean(payment);
+
+  function imeiStatus(index) {
+    const value = imeis[index];
+    if (!value) return "missing";
+    if (imeis.filter((other) => other === value).length > 1) return "duplicate";
+    const stock = products.find((product) => product.id === imeiLines[index].productId)?.imeis || [];
+    if (stock.length > 0 && !stock.includes(value)) return "notstock";
+    return "ok";
+  }
+  const imeisOk = imeiLines.every((_, index) => imeiStatus(index) === "ok");
+  const canReady = imeisOk && paid;
+
   function markReady() {
     if (!canReady) return;
     let cursor = 0;
@@ -5238,9 +5345,11 @@ function StoreOrderCard({ order, products, onMarkReady, onCancel }) {
     });
     onMarkReady(order.id, {
       lineItems,
-      cardStatus: requiresCardCharge ? "paid" : "",
-      solaRefNum: requiresCardCharge ? card.refNum : "",
-      paymentStatus: requiresCardCharge ? "Paid" : order.paymentStatus,
+      cardStatus: payment?.refNum ? "paid" : "",
+      solaRefNum: payment?.refNum || "",
+      paymentMethod: payment?.paymentMethod || order.paymentMethod,
+      paymentStatus: payment ? "Paid" : order.paymentStatus,
+      paidAt: payment ? new Date().toISOString() : "",
     });
   }
 
@@ -5274,25 +5383,29 @@ function StoreOrderCard({ order, products, onMarkReady, onCancel }) {
         </div>
       ) : null}
 
-      {requiresCardCharge ? (
+      {needsPayment ? (
         <div className="payment-panel payment-panel-stack">
           <div>
-            <p className="eyebrow">Card payment</p>
-            <h3>Charge {formatPayment(order.orderTotal)} on the terminal</h3>
+            <p className="eyebrow">Payment</p>
+            <h3>{payment ? `Paid · ${payment.paymentMethod}` : `${formatPayment(order.orderTotal)} due before this goes out`}</h3>
           </div>
-          <div className="segmented-control" role="tablist" aria-label="Card entry mode">
-            <button type="button" className={cardEntryMode === "terminal" ? "selected" : ""} onClick={() => setCardEntryMode("terminal")} disabled={card.status === "charging" || card.status === "paid"}>Tap / dip / swipe</button>
-            <button type="button" className={cardEntryMode === "manual" ? "selected" : ""} onClick={() => setCardEntryMode("manual")} disabled={card.status === "charging" || card.status === "paid"}>Manual entry</button>
-          </div>
-          <button className="secondary-button" type="button" onClick={chargeCard} disabled={card.status === "charging" || card.status === "paid"}>
-            {card.status === "paid" ? "Card charged" : card.status === "charging" ? "Waiting for card..." : cardEntryMode === "manual" ? "Charge card (manual entry)" : "Charge card (tap / dip / swipe)"}
-          </button>
-          {card.message ? <p className={card.status === "error" ? "summary-error" : "muted"}>{card.message}</p> : null}
+          {payment ? (
+            <p className="muted">
+              Recorded as {payment.paymentMethod}{payment.refNum ? ` · ref ${payment.refNum}` : ""}.
+              <button className="ghost-button compact-button" type="button" onClick={() => setPayment(null)}>Undo</button>
+            </p>
+          ) : (
+            <button className="secondary-button" type="button" onClick={() => setPayOpen(true)}>
+              Take payment {formatPayment(order.orderTotal)}
+            </button>
+          )}
         </div>
-      ) : null}
+      ) : (
+        <p className="muted">Collect on delivery — the driver takes the {formatPayment(order.orderTotal)} at the door.</p>
+      )}
 
       {!imeisOk ? <p className="muted pos-warning">Scan a valid in-stock IMEI for every phone.</p> : null}
-      {imeisOk && !cardCharged ? <p className="muted pos-warning">Charge the card before marking ready.</p> : null}
+      {imeisOk && !paid ? <p className="muted pos-warning">Take the payment before marking ready.</p> : null}
       <div className="order-card-actions">
         <button className="primary-button" type="button" disabled={!canReady} onClick={markReady}>
           Mark ready
@@ -5301,6 +5414,19 @@ function StoreOrderCard({ order, products, onMarkReady, onCancel }) {
           Cancel order
         </button>
       </div>
+
+      {payOpen ? (
+        <OrderPaymentDialog
+          order={order}
+          heading="Take payment"
+          confirmLabel="Record payment"
+          onConfirm={(taken) => {
+            setPayment(taken);
+            setPayOpen(false);
+          }}
+          onClose={() => setPayOpen(false)}
+        />
+      ) : null}
     </article>
   );
 }
@@ -5386,33 +5512,72 @@ function DeliveryBoard({ orders, activeEmployee, sessionRole, activeLocation, on
             || order.assignedTo === activeEmployee
             || order.location === activeLocation;
           return (
-            <article className="pending-card" key={order.id}>
-              <div className="pending-card-head">
-                <div>
-                  <p className="eyebrow">{order.location}</p>
-                  <h3>{order.model}</h3>
-                </div>
-                <span className="badge phoneOrder">{order.paymentStatus}</span>
-              </div>
-              <PhoneOrderSummary order={order} />
-              <div className="details">
-                <span><strong>Driver:</strong> {order.assignedTo || "-"}</span>
-              </div>
-              <div className="order-card-actions">
-                <button className="primary-button" type="button" disabled={!canDeliver} onClick={() => onDelivered(order.id)}>
-                  Mark delivered
-                </button>
-                <button className="secondary-button" type="button" disabled={!canDeliver} onClick={() => confirmCancelOrder(order, onCancel)}>
-                  Cancel order
-                </button>
-              </div>
-            </article>
+            <DeliveryCard
+              key={order.id}
+              order={order}
+              canDeliver={canDeliver}
+              onDelivered={onDelivered}
+              onCancel={onCancel}
+            />
           );
         }) : (
           <p className="empty-state">No open deliveries.</p>
         )}
       </div>
     </div>
+  );
+}
+
+// One open delivery. A collect-on-delivery order takes its payment here — the
+// money changes hands at the door, and this is the last point where the app can
+// record what it was. Prepaid orders were already settled at the store.
+function DeliveryCard({ order, canDeliver, onDelivered, onCancel }) {
+  const [payOpen, setPayOpen] = useState(false);
+  const collectOnDelivery = order.paymentStatus !== "Paid";
+
+  return (
+    <article className="pending-card">
+      <div className="pending-card-head">
+        <div>
+          <p className="eyebrow">{order.location}</p>
+          <h3>{order.model}</h3>
+        </div>
+        <span className="badge phoneOrder">{order.paymentStatus}</span>
+      </div>
+      <PhoneOrderSummary order={order} />
+      <div className="details">
+        <span><strong>Driver:</strong> {order.assignedTo || "-"}</span>
+      </div>
+      {collectOnDelivery ? (
+        <p className="muted pos-warning">Collect {formatPayment(order.orderTotal)} from the customer, then mark it delivered.</p>
+      ) : null}
+      <div className="order-card-actions">
+        <button
+          className="primary-button"
+          type="button"
+          disabled={!canDeliver}
+          onClick={() => (collectOnDelivery ? setPayOpen(true) : onDelivered(order.id))}
+        >
+          {collectOnDelivery ? `Take payment · mark delivered` : "Mark delivered"}
+        </button>
+        <button className="secondary-button" type="button" disabled={!canDeliver} onClick={() => confirmCancelOrder(order, onCancel)}>
+          Cancel order
+        </button>
+      </div>
+
+      {payOpen ? (
+        <OrderPaymentDialog
+          order={order}
+          heading="Collect payment"
+          confirmLabel="Record payment & mark delivered"
+          onConfirm={(taken) => {
+            setPayOpen(false);
+            onDelivered(order.id, taken);
+          }}
+          onClose={() => setPayOpen(false)}
+        />
+      ) : null}
+    </article>
   );
 }
 
@@ -7569,7 +7734,7 @@ function InventoryPage({
   // One definition of the product form, shown inline when adding and inside a
   // dialog when editing.
   const productForm = (
-    <form className="form-grid inventory-form" onSubmit={submit}>
+    <form className="form-grid inventory-form" onSubmit={submit} onKeyDown={preventEnterSubmit}>
       <p className="form-section-title">Product details</p>
       <label className="field">
         <span>SKU</span>
@@ -7852,7 +8017,7 @@ function RentalPhoneFleet({ phones = [], isAdmin, onSavePhone, onReleasePhone, o
         offered when a rental issues a device.
       </p>
 
-      <form className="form-grid inventory-form" onSubmit={addPhone}>
+      <form className="form-grid inventory-form" onSubmit={addPhone} onKeyDown={preventEnterSubmit}>
         <label className="field">
           <span>IMEI</span>
           <input
