@@ -70,10 +70,8 @@ import {
   formatShortDate,
   generateRepairTicketNumber,
   getMinimumRentalDays,
-  isRentalFormComplete,
   isSolaPaidStatus,
   normalizeRcukSimNumber,
-  rcukSimEntry,
   numberValue,
   parsePriceAdjust,
   playScanBeep,
@@ -2250,6 +2248,62 @@ function NotificationCenter({ notifications, onDismiss }) {
   );
 }
 
+// ---- The rental screen: one row per SIM -----------------------------------
+// Modelled on RCUK's own multi-rental table. Fill in a row per SIM, press the
+// one button, and every row is checked, activated on RCUK, stamped with its
+// rental ID and filed as its own report — a family taking four SIMs is four
+// rentals with four return dates, but one customer and one card charge.
+
+const RENTAL_PACKAGES = [
+  { value: "V&D", serviceType: "Voice and data" },
+  { value: "Voice", serviceType: "Voice" },
+  { value: "Data", serviceType: "Data only" },
+];
+
+function packageServiceType(value) {
+  return RENTAL_PACKAGES.find((entry) => entry.value === value)?.serviceType || "Voice";
+}
+
+function emptyRentalRow(defaults = {}) {
+  return {
+    id: crypto.randomUUID(),
+    simNumber: "",
+    rentalType: "Daily",
+    months: "",
+    package: "V&D",
+    startDate: "",
+    endDate: "",
+    ukDays: "",
+    euDays: "",
+    wtsDays: "",
+    tpDays: "",
+    ilDdi: false,
+    usDdi: false,
+    sms: false,
+    ref: "",
+    // The handset, if one goes out with this SIM.
+    rentalPhoneId: "",
+    model: "",
+    imei: "",
+    // Filled in by the activation run.
+    rentalId: "",
+    cli: "",
+    usDdiNumber: "",
+    status: "idle", // idle | checking | activating | active | error
+    message: "",
+    ...defaults,
+  };
+}
+
+// Days between today and the end of the rental — "Days left" in RCUK's table.
+function rentalDaysLeft(endDate) {
+  if (!endDate) return "";
+  const end = new Date(`${endDate}T00:00:00`);
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  return Math.round((end - today) / 86400000);
+}
+
 function RentalReportForm({
   activeEmployee,
   activeLocation,
@@ -2262,1132 +2316,688 @@ function RentalReportForm({
   onSave,
 }) {
   const [now, setNow] = useState(new Date());
-  const [form, setForm] = useState({
+  // Everything every rental in this batch shares.
+  const [shared, setShared] = useState({
     rentalRegion: "RCUK",
-    serviceType: "Voice",
-    startDate: "",
-    endDate: "",
-    ukDays: "",
-    euDays: "",
-    wtsDays: "",
-    addSms: false,
-    usaNumber: false,
-    deviceKind: "SIM only",
-    model: "",
-    imei: "",
-    // Which fleet handset was handed over (empty for SIM-only rentals).
-    rentalPhoneId: "",
-    simNumber: "",
+    customerPhone: "",
     returnDays: "",
     paymentMethod: "",
-    // Blank = charge the calculated price. Any number here overrides it.
-    priceOverride: "",
     returnReminderPreference: "Text message",
     lateFeeWeekly: "",
-    customerPhone: "",
     notes: "",
   });
-  const [submitState, setSubmitState] = useState({
-    status: "idle",
-    message: "",
-    rentalId: "",
-    cli: "",
-    usDdi: "",
-    getNumbersAttempted: false,
-    raw: null,
-  });
-  const [simCheckState, setSimCheckState] = useState({
-    status: "idle",
-    message: "",
-    checkedSimNumber: "",
-    raw: null,
-  });
-  const [solaState, setSolaState] = useState({
-    status: "idle",
-    message: "",
-    paymentToken: "",
-    transactionId: "",
-    paymentUrl: "",
-    raw: null,
-  });
-  const solaTokenRef = useRef("");
-  const [addPhoneOpen, setAddPhoneOpen] = useState(false);
-  // Rentals already activated on RCUK in this go, waiting to be filed. A family
-  // renting four SIMs is four rentals — four RCUK activations, four reports,
-  // four return dates — but one customer, one card charge and one Save.
-  const [queued, setQueued] = useState([]);
-  // Card-present terminal state (Verifone P200 / Sola BBPOS), same as the POS.
-  // Rentals are always charged card-present — no keyed-in entry option here.
+  const [rows, setRows] = useState(() => [emptyRentalRow()]);
   const [card, setCard] = useState({ status: "idle", message: "", refNum: "", cardType: "", maskedCardNumber: "" });
+  const [run, setRun] = useState({ status: "idle", message: "" });
+  const [addPhoneRow, setAddPhoneRow] = useState("");
 
   useEffect(() => {
     const timer = window.setInterval(() => setNow(new Date()), 30000);
     return () => window.clearInterval(timer);
   }, []);
 
-  const totalDays = calculateInclusiveDays(form.startDate, form.endDate);
-  const zoneDays = numberValue(form.ukDays) + numberValue(form.euDays) + numberValue(form.wtsDays);
+  const isRcukRental = shared.rentalRegion === "RCUK";
+  const busy = run.status === "running" || card.status === "charging";
 
-  // A zone box left blank is zero days there. Once the boxes that ARE filled in
-  // account for every day of the rental (6 days, UK 3, EU 3), put the 0 into the
-  // empty ones so the form says what it means and RCUK gets an explicit zero.
-  // setForm directly, not updateField: this is bookkeeping, and it must not
-  // invalidate a card charge the way a real zone-day edit does.
-  useEffect(() => {
-    if (!isRcukRental || totalDays <= 0) return;
-    const zones = ["ukDays", "euDays", "wtsDays"];
-    const blanks = zones.filter((key) => String(form[key] ?? "").trim() === "");
-    if (!blanks.length) return;
-    const filled = zones
-      .filter((key) => !blanks.includes(key))
-      .reduce((sum, key) => sum + numberValue(form[key]), 0);
-    if (filled !== totalDays) return;
-    setForm((current) => {
-      const next = { ...current };
-      blanks.forEach((key) => { next[key] = "0"; });
-      return next;
-    });
-  }, [isRcukRental, totalDays, form.ukDays, form.euDays, form.wtsDays]);
-  const rentalPricing = calculateRentalPrice(form, totalDays);
-  const dailyRate = rentalPricing.dailyRate;
-  // The formula gives the standard price; an employee can charge something else
-  // (discount, deposit, agreed rate). Both are kept so the report shows what was
-  // charged AND what it would have been.
-  const calculatedPrice = rentalPricing.totalPrice;
-  const overrideAmount = Number.parseFloat(form.priceOverride);
-  const hasPriceOverride = form.priceOverride.trim() !== "" && Number.isFinite(overrideAmount) && overrideAmount >= 0;
-  const totalPrice = hasPriceOverride ? overrideAmount : calculatedPrice;
-  const isRcukRental = form.rentalRegion === "RCUK";
-  const isSimpleRental = !isRcukRental;
-  const normalizedSimNumber = normalizeRcukSimNumber(form.simNumber);
-  const simEntry = rcukSimEntry(form.simNumber);
-  // A SIM that RCUK turned down must not be rentable, and a half-typed one isn't
-  // ready to submit either.
-  const simRejected = simCheckState.status === "error";
-  // RCUK is the authority on whether a SIM can be rented — not our local prefix
-  // table. That table (RCUK_SIM_CARRIERS) exists so the check can fire by itself
-  // the moment a familiar number is finished; requiring `simEntry.complete` on
-  // top of RCUK's own verdict meant a SIM from any stock we don't list could be
-  // checked, come back "SIM is free", and still leave Submit rental disabled
-  // with nothing on screen saying why. The check has to be for the number that
-  // is in the box right now, so correcting a digit can't ride on a stale pass.
-  const simChecked = simCheckState.status === "checked"
-    && digitsOnly(simCheckState.checkedSimNumber) === digitsOnly(normalizedSimNumber);
-  const simUsable = !isRcukRental || simChecked;
-  const zoneDaysValid = totalDays > 0 && zoneDays === totalDays;
-  const needsUsNumber = form.usaNumber;
-  const rentalSubmitted = submitState.status === "submitted" || submitState.status === "numbers-ready";
-  const minimumDaysValid = getMinimumRentalDays(form.rentalRegion) <= totalDays;
-  // CC/Card rentals must be charged on the in-store terminal before saving.
-  const requiresCardCharge = isCardPayment(form.paymentMethod);
-  const canSubmitRental = isRentalFormComplete(form)
-    && zoneDaysValid
-    && minimumDaysValid
-    && totalPrice > 0
-    && normalizedSimNumber
-    && simUsable
-    && isRcukRental;
-  // Exactly what is standing between this rental and RCUK. The sidebar used to
-  // say "complete all rental fields" without saying which one, which is no help
-  // to whoever is holding the customer's card.
-  const missingFields = [
-    [form.rentalRegion, "region"],
-    [form.serviceType, "service type"],
-    [form.startDate, "start date"],
-    [form.endDate, "end date"],
-    [form.deviceKind, "device kind"],
-    [form.simNumber, "SIM number"],
-    [form.customerPhone, "customer phone"],
-    [form.returnDays, "return days"],
-    [form.paymentMethod, "payment method"],
-    ...(form.deviceKind !== "SIM only" ? [[form.model, "phone model"], [form.imei, "IMEI"]] : []),
-  ]
-    .filter(([value]) => String(value ?? "").trim() === "")
-    .map(([, label]) => label);
-
-  const submitBlockers = [
-    ...(missingFields.length ? [`Fill in: ${missingFields.join(", ")}.`] : []),
-    ...(totalDays > 0 ? [] : ["Pick a start and end date."]),
-    ...(isRcukRental && totalDays > 0 && !zoneDaysValid ? ["UK + EU + WTS days must add up to the total days."] : []),
-    ...(!minimumDaysValid && totalDays > 0 ? [`Minimum rental for ${form.rentalRegion} is ${getMinimumRentalDays(form.rentalRegion)} days.`] : []),
-    ...(totalPrice > 0 ? [] : ["The rental price is 0 — set a price to charge."]),
-    ...(isRcukRental && !normalizedSimNumber ? ["Enter the SIM number."] : []),
-    ...(isRcukRental && normalizedSimNumber && !simUsable
-      ? [simRejected ? "RCUK turned this SIM down — use another SIM." : "Check the SIM with RCUK first."]
-      : []),
-  ];
-
-  const rentalBasicsReady = isRentalFormComplete(form)
-    && minimumDaysValid
-    && totalPrice > 0;
-  // A RCUK rental only exists once RCUK has activated it, so it is not filed
-  // here until it has been — no local record of a rental that isn't really out.
-  const rcukActivated = rentalSubmitted && submitState.getNumbersAttempted;
-  // The SIM on the form right now, if it is ready to be filed.
-  const currentReady = rentalBasicsReady && (isSimpleRental || rcukActivated);
-  // Everything this Save will file: the ones already put aside plus the current
-  // one. Each is its own rental — its own SIM, numbers and return date — so each
-  // becomes its own report; they just share a customer and a single card charge.
-  // With rentals already put aside, an empty form is the normal resting state —
-  // it is waiting for the next SIM, not failing validation — so the blockers stay
-  // quiet until someone starts filling it in.
-  const currentStarted = queued.length === 0
-    || Boolean((isRcukRental ? normalizedSimNumber : form.simNumber).trim());
-  const batchCount = queued.length + (currentReady ? 1 : 0);
-  const batchTotal = queued.reduce((sum, entry) => sum + entry.price, 0) + (currentReady ? totalPrice : 0);
-  const cardChargeComplete = !requiresCardCharge || card.status === "paid";
-  const canSave = batchCount > 0 && cardChargeComplete;
-
-  // Only a real handset needs a fleet phone; a SIM-only rental doesn't.
-  const needsHandset = form.deviceKind !== "SIM only";
-  // Phones on the shelf, plus whichever one is already picked on this form so it
-  // doesn't vanish from its own dropdown.
-  const availableFleetPhones = useMemo(
-    () => rentalPhones.filter((phone) => phone.status !== RENTAL_PHONE_WITH_CUSTOMER || phone.id === form.rentalPhoneId),
-    [rentalPhones, form.rentalPhoneId],
-  );
-
-  // Picking a fleet phone fills the model and IMEI from the registry, so the
-  // report and the fleet can't describe the same handset differently.
-  function selectFleetPhone(phoneId) {
-    const phone = rentalPhones.find((entry) => entry.id === phoneId);
-    setForm((current) => ({
-      ...current,
-      rentalPhoneId: phoneId,
-      imei: phone?.imei || "",
-      model: phone?.name || current.model,
-    }));
-  }
-
-  function updateField(name, value) {
-    setForm((current) => ({ ...current, [name]: value }));
-    // A change that moves the price or the payment method invalidates any card
-    // charge already taken — force it to be run again for the new amount.
-    if (["paymentMethod", "priceOverride", "customerPhone", "startDate", "endDate", "serviceType", "addSms", "rentalRegion", "ukDays", "euDays", "wtsDays"].includes(name)) {
+  function updateShared(name, value) {
+    setShared((current) => ({ ...current, [name]: value }));
+    // Changing how they pay invalidates a charge already taken.
+    if (name === "paymentMethod") {
       setCard({ status: "idle", message: "", refNum: "", cardType: "", maskedCardNumber: "" });
     }
-    setSubmitState((current) => (
-      current.status === "idle" ? current : { ...current, message: "Rental changed. Submit to RCUK again before saving.", status: "idle", rentalId: "", cli: "", usDdi: "", getNumbersAttempted: false, raw: null }
-    ));
-    if (name === "simNumber") {
-      setSimCheckState({
+  }
+
+  function updateRow(id, patch) {
+    setRows((current) => current.map((row) => (row.id === id ? { ...row, ...patch } : row)));
+  }
+
+  // Editing a row moves the total, so a card charge already taken no longer
+  // covers it and has to be run again. Rows that are live on RCUK are read-only:
+  // the screen must not say something different from what RCUK activated.
+  function editRow(id, patch) {
+    updateRow(id, { ...patch, status: "idle", message: "" });
+    if (card.status === "paid") {
+      setCard({
         status: "idle",
-        message: "",
-        checkedSimNumber: "",
-        raw: null,
+        message: "The rentals changed, so the card has to be charged again.",
+        refNum: "",
+        cardType: "",
+        maskedCardNumber: "",
       });
-      // Clearing the check also has to clear the "already auto-checked this one"
-      // marker. Without it, correcting a digit and retyping the same number left
-      // the check idle with nothing to re-fire it — and the rental stuck.
-      autoCheckedSimRef.current = "";
     }
   }
 
-  function updateSolaToken(value) {
-    solaTokenRef.current = value;
-    setSolaState((current) => ({
-      ...current,
-      paymentToken: value,
-      status: current.status === "paid" ? "idle" : current.status,
-      transactionId: current.status === "paid" ? "" : current.transactionId,
-      message: value.trim() ? "Sola token ready to charge." : "",
-    }));
+  function addRow(count = 1) {
+    const last = rows[rows.length - 1];
+    // A new row inherits the trip from the one above it — people renting
+    // together are travelling together.
+    const defaults = last
+      ? {
+        rentalType: last.rentalType,
+        months: last.months,
+        package: last.package,
+        startDate: last.startDate,
+        endDate: last.endDate,
+        ukDays: last.ukDays,
+        euDays: last.euDays,
+        wtsDays: last.wtsDays,
+        tpDays: last.tpDays,
+      }
+      : {};
+    setRows((current) => [...current, ...Array.from({ length: count }, () => emptyRentalRow(defaults))]);
   }
 
-  function buildRentalPayload() {
+  function duplicateRow(id) {
+    const source = rows.find((row) => row.id === id);
+    if (!source) return;
+    // Everything but the things that must be unique per rental.
+    const copy = emptyRentalRow({
+      ...source,
+      simNumber: "",
+      rentalPhoneId: "",
+      model: "",
+      imei: "",
+      rentalId: "",
+      cli: "",
+      usDdiNumber: "",
+      status: "idle",
+      message: "",
+    });
+    copy.id = crypto.randomUUID();
+    setRows((current) => {
+      const index = current.findIndex((row) => row.id === id);
+      const next = [...current];
+      next.splice(index + 1, 0, copy);
+      return next;
+    });
+  }
+
+  function removeRow(id) {
+    const row = rows.find((entry) => entry.id === id);
+    if (row?.rentalId) {
+      window.alert(
+        `Rental ${row.rentalId} is already live on RCUK, so it has to be filed. Cancel it on RCUK if it shouldn't exist.`,
+      );
+      return;
+    }
+    setRows((current) => (current.length === 1 ? [emptyRentalRow()] : current.filter((entry) => entry.id !== id)));
+  }
+
+  // Phones on the shelf, plus any already picked on a row so they don't vanish
+  // from their own dropdown.
+  const pickedPhoneIds = rows.map((row) => row.rentalPhoneId).filter(Boolean);
+  const availableFleetPhones = rentalPhones.filter(
+    (phone) => phone.status !== RENTAL_PHONE_WITH_CUSTOMER || pickedPhoneIds.includes(phone.id),
+  );
+
+  function selectFleetPhone(rowId, phoneId) {
+    const phone = rentalPhones.find((entry) => entry.id === phoneId);
+    editRow(rowId, {
+      rentalPhoneId: phoneId,
+      model: phone?.name || "",
+      imei: phone?.imei || "",
+    });
+  }
+
+  // ---- per-row derived values ---------------------------------------------
+  function rowDays(row) {
+    return calculateInclusiveDays(row.startDate, row.endDate);
+  }
+
+  function rowPricing(row) {
+    return calculateRentalPrice(
+      { rentalRegion: shared.rentalRegion, serviceType: packageServiceType(row.package), addSms: row.sms },
+      rowDays(row),
+    );
+  }
+
+  function rowZoneDays(row) {
+    return numberValue(row.ukDays) + numberValue(row.euDays) + numberValue(row.wtsDays) + numberValue(row.tpDays);
+  }
+
+  // What is wrong with a row, in the words of whoever has to fix it. Empty means
+  // the row is ready to go to RCUK.
+  function rowProblems(row) {
+    const days = rowDays(row);
+    const problems = [];
+    if (!digitsOnly(row.simNumber)) problems.push("a SIM number");
+    if (!row.startDate || !row.endDate) problems.push("start and end dates");
+    else if (days <= 0) problems.push("an end date on or after the start date");
+    if (isRcukRental) {
+      if (row.rentalType === "Monthly" && !numberValue(row.months)) problems.push("the number of months");
+      if (days > 0 && rowZoneDays(row) !== days) problems.push(`UK + EU + WTS + TP to add up to ${days}`);
+      if (days > 0 && days < getMinimumRentalDays(shared.rentalRegion)) {
+        problems.push(`at least ${getMinimumRentalDays(shared.rentalRegion)} days`);
+      }
+    }
+    if (rowPricing(row).totalPrice <= 0) problems.push("a price above zero");
+    return problems;
+  }
+
+  const filledRows = rows.filter((row) => digitsOnly(row.simNumber) || row.rentalId);
+  const batchTotal = filledRows.reduce((sum, row) => sum + rowPricing(row).totalPrice, 0);
+  const activeRows = rows.filter((row) => row.rentalId);
+  const requiresCardCharge = isCardPayment(shared.paymentMethod);
+
+  const sharedProblems = [
+    ...(localPhoneDigits(shared.customerPhone).length >= 6 ? [] : ["Enter the customer's phone number."]),
+    ...(shared.paymentMethod ? [] : ["Choose a payment method."]),
+    ...(String(shared.returnDays).trim() ? [] : ["Enter how many days until the phone comes back."]),
+    ...(filledRows.length ? [] : ["Add at least one SIM."]),
+  ];
+  const rowProblemList = filledRows
+    .filter((row) => !row.rentalId)
+    .map((row) => ({ row, problems: rowProblems(row) }))
+    .filter((entry) => entry.problems.length);
+  const readyToRun = !sharedProblems.length && !rowProblemList.length && !busy;
+
+  // ---- talking to RCUK ----------------------------------------------------
+  async function postFunction(path, body) {
+    const response = await fetch(`${FUNCTIONS_BASE_URL}${path}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    let data = {};
+    try {
+      data = await response.json();
+    } catch {
+      data = { message: "The server sent something that wasn't JSON." };
+    }
+    return { ok: response.ok && data.ok, data };
+  }
+
+  function rcukPayloadFor(row) {
     return {
-      rental_region: form.rentalRegion,
-      service_type: form.serviceType,
-      total_days: totalDays,
-      uk_days: numberValue(form.ukDays),
-      eu_days: numberValue(form.euDays),
-      wts_days: numberValue(form.wtsDays),
-      add_sms: form.addSms ? "yes" : "no",
-      usa_number: form.usaNumber ? "yes" : "no",
-      device_kind: form.deviceKind,
-      model: form.model,
-      imei: form.imei,
-      sim_number: normalizedSimNumber,
-      start_date: form.startDate,
-      end_date: form.endDate,
-      return_days: form.returnDays,
-      customer_phone: form.customerPhone,
-      payment_method: form.paymentMethod,
-      return_reminder_preference: form.returnReminderPreference,
-      total_price: totalPrice,
-      notes: form.notes,
+      sim_number: normalizeRcukSimNumber(row.simNumber),
+      rental_type: row.rentalType.toLowerCase(),
+      no_of_months: numberValue(row.months),
+      rental_package: row.package,
+      service_type: packageServiceType(row.package),
+      start_date: row.startDate,
+      end_date: row.endDate,
+      uk_days: numberValue(row.ukDays),
+      eu_days: numberValue(row.euDays),
+      wts_days: numberValue(row.wtsDays),
+      tp_days: numberValue(row.tpDays),
+      il_ddi: row.ilDdi ? "yes" : "no",
+      us_ddi: row.usDdi ? "yes" : "no",
+      sms: row.sms ? "yes" : "no",
+      customer_phone: shared.customerPhone,
+      notes: row.ref || shared.notes,
     };
   }
 
-  async function chargeWithSola() {
-    if (!requiresSolaCharge || !totalPrice) return;
+  // The whole run in one press: check every SIM, take the money, activate every
+  // row, file them. Nothing is charged until RCUK agrees every SIM can be
+  // rented, and nothing is filed until every row is live — a row that fails
+  // keeps its reason on screen and the run can be pressed again once it's fixed.
+  async function activateAndFile() {
+    if (!readyToRun) return;
 
     if (!FUNCTIONS_BASE_URL) {
-      setSolaState((current) => ({
-        ...current,
-        status: "error",
-        message: "Set VITE_FUNCTIONS_BASE_URL to your Firebase Functions URL before charging with Sola.",
-      }));
+      setRun({ status: "error", message: "Set VITE_FUNCTIONS_BASE_URL before activating rentals." });
       return;
     }
 
-    setSolaState((current) => ({ ...current, status: "charging", message: "Opening Sola charge..." }));
-    const paymentToken = solaTokenRef.current.trim();
+    const pending = rows.filter((row) => digitsOnly(row.simNumber) && !row.rentalId);
+    setRun({ status: "running", message: "Checking the SIMs with RCUK..." });
 
-    try {
-      const response = await fetch(`${FUNCTIONS_BASE_URL}/solaCreateCharge`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          amount: totalPrice,
-          currency: "USD",
-          customerPhone: form.customerPhone,
-          rentalId: submitState.rentalId,
-          paymentToken,
-          description: `${form.rentalRegion} ${form.deviceKind} rental`,
-        }),
-      });
-      const data = await response.json();
-      const status = isSolaPaidStatus(data.status) ? "paid" : "pending";
-
-      if (!response.ok || !data.ok) {
-        setSolaState({
+    // 1. Every SIM has to check out before any money moves.
+    if (isRcukRental) {
+      let simsOk = true;
+      for (const row of pending) {
+        updateRow(row.id, { status: "checking", message: "Checking with RCUK..." });
+        const { ok, data } = await postFunction("/rcukCheckSim", { sim_number: row.simNumber });
+        if (ok) {
+          updateRow(row.id, { status: "idle", message: data.message || "SIM is free." });
+        } else {
+          simsOk = false;
+          updateRow(row.id, { status: "error", message: data.message || "RCUK turned this SIM down." });
+        }
+      }
+      if (!simsOk) {
+        setRun({
           status: "error",
-          message: data.message || "Sola charge could not be started.",
-          paymentToken,
-          transactionId: data.transactionId || "",
-          paymentUrl: data.paymentUrl || "",
-          raw: data.raw || data,
+          message: "Some SIMs were turned down. Nothing was charged — fix those rows and run it again.",
         });
         return;
       }
-
-      if (data.paymentUrl) {
-        window.open(data.paymentUrl, "_blank", "noopener,noreferrer");
-      }
-
-      setSolaState({
-        status,
-        message: status === "paid"
-          ? "Sola payment approved."
-          : "Sola payment started, but approval was not returned yet.",
-        paymentToken,
-        transactionId: data.transactionId || data.paymentId || "",
-        paymentUrl: data.paymentUrl || "",
-        raw: data.raw || data,
-      });
-    } catch (error) {
-      setSolaState({
-        status: "error",
-        message: error.message || "Could not connect to Sola.",
-        paymentToken,
-        transactionId: "",
-        paymentUrl: "",
-        raw: null,
-      });
-    }
-  }
-
-  async function submitRentalToRcuk() {
-    if (!isRcukRental) return;
-
-    if (!FUNCTIONS_BASE_URL) {
-      setSubmitState((current) => ({
-        ...current,
-        status: "error",
-        message: "Set VITE_FUNCTIONS_BASE_URL to your Firebase Functions URL before submitting rentals.",
-      }));
-      return;
     }
 
-    if (!zoneDaysValid) {
-      setSubmitState((current) => ({
-        ...current,
-        status: "error",
-        message: "UK + EU + WTS days must equal total rental days.",
-      }));
-      return;
-    }
-
-    setSubmitState((current) => ({ ...current, status: "submitting", message: "Submitting rental to RCUK..." }));
-
-    try {
-      const response = await fetch(`${FUNCTIONS_BASE_URL}/rcukAddRental`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(buildRentalPayload()),
-      });
-      const data = await response.json();
-
-      if (!response.ok || !data.ok) {
-        setSubmitState({
-          status: "error",
-          message: data.message || "RCUK rejected the rental.",
-          rentalId: "",
-          cli: "",
-          usDdi: "",
-          raw: data.raw || data,
-          getNumbersAttempted: false,
+    // 2. The card, once, for the lot.
+    if (requiresCardCharge && card.status !== "paid") {
+      setRun({ status: "running", message: "Charging the card..." });
+      try {
+        setCard({ status: "charging", message: "Follow the terminal...", refNum: "", cardType: "", maskedCardNumber: "" });
+        const result = await chargeOnLocalTerminal({
+          amount: Number(batchTotal).toFixed(2),
+          externalRequestId: `rental-${Date.now()}`,
+          onStatus: (text) => setCard((current) => ({ ...current, message: text })),
         });
+        setCard({
+          status: "paid",
+          message: result.maskedCardNumber
+            ? `Card approved (${result.cardType || "card"} ${result.maskedCardNumber}).`
+            : "Card approved.",
+          refNum: result.refNum || "",
+          cardType: result.cardType || "",
+          maskedCardNumber: result.maskedCardNumber || "",
+        });
+      } catch (error) {
+        setCard({ status: "error", message: error.message || "Card payment failed.", refNum: "", cardType: "", maskedCardNumber: "" });
+        setRun({ status: "error", message: "The card was declined, so nothing was activated." });
         return;
       }
-
-      setSubmitState({
-        status: "submitted",
-        message: data.rentalId
-          ? "Rental submitted. Click Get numbers until CLI / US DDI are returned."
-          : "Rental submitted, but no rental ID was returned. Check RCUK response.",
-        rentalId: data.rentalId || "",
-        cli: "",
-        usDdi: "",
-        getNumbersAttempted: false,
-        raw: data.raw || data,
-      });
-    } catch (error) {
-      setSubmitState({
-        status: "error",
-        message: error.message || "Could not submit rental.",
-        rentalId: "",
-        cli: "",
-        usDdi: "",
-        getNumbersAttempted: false,
-        raw: null,
-      });
     }
-  }
 
-  async function checkSimWithRcuk() {
-    if (!isRcukRental || !normalizedSimNumber) return;
+    // 3. Activate, then ask RCUK for the numbers.
+    const activated = [];
+    let allOk = true;
 
-    if (!FUNCTIONS_BASE_URL) {
-      setSimCheckState({
+    if (isRcukRental) {
+      setRun({ status: "running", message: "Activating on RCUK..." });
+      for (const row of pending) {
+        updateRow(row.id, { status: "activating", message: "Activating on RCUK..." });
+        const { ok, data } = await postFunction("/rcukAddRental", rcukPayloadFor(row));
+        if (!ok || !data.rentalId) {
+          allOk = false;
+          updateRow(row.id, { status: "error", message: data.message || "RCUK did not activate this SIM." });
+          continue;
+        }
+
+        const numbers = await postFunction("/rcukGetRental", { rental_id: data.rentalId });
+        const patch = {
+          rentalId: data.rentalId,
+          cli: numbers.ok ? numbers.data.cli || "" : "",
+          usDdiNumber: numbers.ok ? numbers.data.usDdi || "" : "",
+          status: "active",
+          message: numbers.ok && numbers.data.cli ? "Active." : "Active — numbers still pending.",
+        };
+        updateRow(row.id, patch);
+        activated.push({ ...row, ...patch });
+      }
+    } else {
+      // Israel / Local / Canada rentals are ours alone — nothing to activate.
+      pending.forEach((row) => activated.push(row));
+    }
+
+    if (!allOk) {
+      setRun({
         status: "error",
-        message: "Set VITE_FUNCTIONS_BASE_URL to your Firebase Functions URL before checking SIMs.",
-        checkedSimNumber: "",
-        raw: null,
+        message: requiresCardCharge
+          ? "Not every SIM activated. The card HAS been charged — fix the rows that failed and run it again. Nothing is filed until they are all live."
+          : "Not every SIM activated. Fix the rows that failed and run it again.",
       });
       return;
     }
 
-    setSimCheckState({
-      status: "checking",
-      message: "Checking SIM with RCUK...",
-      checkedSimNumber: normalizedSimNumber,
-      raw: null,
-    });
-
-    try {
-      const response = await fetch(`${FUNCTIONS_BASE_URL}/rcukCheckSim`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ sim_number: normalizedSimNumber }),
-      });
-      const data = await response.json();
-
-      if (!response.ok || !data.ok) {
-        setSimCheckState({
-          status: "error",
-          message: data.message || "RCUK rejected the SIM check.",
-          checkedSimNumber: data.simNumber || normalizedSimNumber,
-          raw: data.raw || data,
-        });
-        return;
-      }
-
-      setSimCheckState({
-        status: "checked",
-        message: data.message || "SIM check complete.",
-        checkedSimNumber: data.simNumber || normalizedSimNumber,
-        raw: data.raw || data,
-      });
-    } catch (error) {
-      setSimCheckState({
-        status: "error",
-        message: error.message || "Could not check SIM.",
-        checkedSimNumber: normalizedSimNumber,
-        raw: null,
-      });
-    }
+    // 4. All live — file them.
+    setRun({ status: "running", message: "Saving..." });
+    fileRentals([...activeRows, ...activated]);
   }
 
-  // Check the SIM the instant the last digit lands, instead of relying on someone
-  // pressing the button. Keyed on the finished number so re-renders don't re-fire
-  // it, and so correcting a digit runs a fresh check.
-  const autoCheckedSimRef = useRef("");
-  useEffect(() => {
-    if (!isRcukRental) return;
-    if (!simEntry.complete) return;
-    if (autoCheckedSimRef.current === simEntry.normalized) return;
-    autoCheckedSimRef.current = simEntry.normalized;
-    checkSimWithRcuk();
-  }, [isRcukRental, simEntry.complete, simEntry.normalized]);
-
-  async function getRentalNumbers() {
-    if (!FUNCTIONS_BASE_URL || !submitState.rentalId) return;
-
-    setSubmitState((current) => ({ ...current, status: "getting-numbers", message: "Checking numbers..." }));
-
-    try {
-      const response = await fetch(`${FUNCTIONS_BASE_URL}/rcukGetRental`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ rental_id: submitState.rentalId }),
-      });
-      const data = await response.json();
-
-      if (!response.ok || !data.ok) {
-        setSubmitState((current) => ({
-          ...current,
-          status: "submitted",
-          message: data.message || "Numbers are not ready yet. You can save the report or try Get numbers again.",
-          getNumbersAttempted: true,
-          raw: data.raw || data,
-        }));
-        return;
-      }
-
-      const cli = data.cli || "";
-      const usDdi = data.usDdi || "";
-      const ready = Boolean(cli) && (!needsUsNumber || (usDdi && usDdi.toLowerCase() !== "yes"));
-
-      setSubmitState((current) => ({
-        ...current,
-        status: ready ? "numbers-ready" : "submitted",
-        message: ready ? "Numbers returned. You can save the rental report." : "Numbers still pending. You can save the report or try Get numbers again.",
-        cli,
-        usDdi,
-        getNumbersAttempted: true,
-        raw: data.raw || data,
-      }));
-    } catch (error) {
-      setSubmitState((current) => ({
-        ...current,
-        status: "submitted",
-        message: error.message || "Could not get rental numbers. You can still save the report.",
-        getNumbersAttempted: true,
-      }));
-    }
-  }
-
-  // Card-present charge on the in-store terminal (Verifone P200), same as POS.
-  async function chargeRentalCard() {
-    if (!requiresCardCharge || !batchTotal) return;
-    try {
-      setCard({ status: "charging", message: "Follow the terminal…", refNum: "", cardType: "", maskedCardNumber: "" });
-      const result = await chargeOnLocalTerminal({
-        amount: Number(batchTotal).toFixed(2),
-        externalRequestId: `rental-${Date.now()}`,
-        onStatus: (text) => setCard((current) => ({ ...current, message: text })),
-      });
-      setCard({
-        status: "paid",
-        message: result.maskedCardNumber
-          ? `Card approved (${result.cardType || "card"} ${result.maskedCardNumber}).`
-          : "Card approved.",
-        refNum: result.refNum || "",
-        cardType: result.cardType || "",
-        maskedCardNumber: result.maskedCardNumber || "",
-      });
-    } catch (error) {
-      setCard({ status: "error", message: error.message || "Card payment failed.", refNum: "", cardType: "", maskedCardNumber: "" });
-    }
-  }
-
-  function saveRentalReport() {
-    if (!canSave) return;
-
-    // One report per rental — each SIM has its own numbers, its own return date
-    // and its own late fee, so each has to stand on its own in the log and in the
-    // overdue notices. They share a batch id and, when it's a card, one charge:
-    // the amounts add up to what the terminal actually took.
-    const entries = [...queued, ...(currentReady ? [currentRentalEntry()] : [])];
+  function fileRentals(entries) {
+    if (!entries.length) return;
     const batchId = crypto.randomUUID();
     const createdAt = new Date().toISOString();
 
-    const reports = entries.map((entry) => ({
-      id: crypto.randomUUID(),
-      type: "rental",
-      createdAt,
-      servedBy: activeEmployee,
-      location: activeLocation || "",
-      customerPhone: form.customerPhone.trim(),
-      customerPhoneDigits: digitsOnly(form.customerPhone),
-      paymentAmount: String(entry.price),
-      paymentMethod: form.paymentMethod,
-      notes: form.notes.trim(),
-      details: {
-        rentalId: entry.rentalId,
-        rentalRegion: form.rentalRegion,
-        serviceType: entry.serviceType,
-        rentalType: entry.deviceKind,
-        model: entry.model,
-        imei: entry.imei,
-        rentalPhoneId: entry.rentalPhoneId,
-        simNumber: entry.simNumber,
-        startDate: form.startDate,
-        endDate: form.endDate,
-        returnTime: `${form.returnDays || 0} days`,
-        returnDueDate: calculateReturnDueDate(form.endDate, form.returnDays),
-        returnReminderPreference: form.returnReminderPreference,
-        lateFeeWeekly: Number.parseFloat(form.lateFeeWeekly) || 0,
-        totalDays,
-        ukDays: numberValue(form.ukDays),
-        euDays: numberValue(form.euDays),
-        wtsDays: numberValue(form.wtsDays),
-        addSms: entry.addSms ? "Yes" : "No",
-        usaNumber: entry.usaNumber ? "Yes" : "No",
-        cli: entry.cli,
-        usDdi: entry.usDdi,
-        // Whether RCUK actually activated this SIM.
-        rcukActivated: isRcukRental ? (entry.rentalId ? "Yes" : "No") : "",
-        // Several SIMs rented together: the batch ties the reports (and the one
-        // card charge) back to each other.
-        rentalBatchId: entries.length > 1 ? batchId : "",
-        rentalBatchSize: entries.length > 1 ? entries.length : "",
-        dailyRate,
-        // What was actually charged, plus what the formula said, so a discount
-        // stays visible on the report instead of vanishing into the total.
-        totalPrice: entry.price,
-        calculatedPrice: entry.calculatedPrice,
-        priceOverridden: entry.priceOverridden ? "Yes" : "",
-        pricingLabel: rentalPricing.label,
+    entries.forEach((row) => {
+      const days = rowDays(row);
+      const pricing = rowPricing(row);
+      const report = {
+        id: crypto.randomUUID(),
+        type: "rental",
+        createdAt,
+        servedBy: activeEmployee,
         location: activeLocation || "",
-        storeAddress: activeStoreInfo?.address || "",
-        storeHours: activeStoreInfo?.hours || "",
-        cardStatus: requiresCardCharge ? card.status : "",
-        cardRefNum: requiresCardCharge ? card.refNum : "",
-        cardType: requiresCardCharge ? card.cardType : "",
-        maskedCardNumber: requiresCardCharge ? card.maskedCardNumber : "",
-        // The charge covers the whole batch, so say so on every report in it.
-        batchChargeTotal: entries.length > 1 ? batchTotal : "",
-      },
-    }));
+        customerPhone: shared.customerPhone.trim(),
+        customerPhoneDigits: digitsOnly(shared.customerPhone),
+        paymentAmount: String(pricing.totalPrice),
+        paymentMethod: shared.paymentMethod,
+        notes: [shared.notes.trim(), row.ref.trim()].filter(Boolean).join(" · "),
+        details: {
+          rentalId: row.rentalId,
+          rentalRegion: shared.rentalRegion,
+          serviceType: packageServiceType(row.package),
+          rcukRentalType: row.rentalType,
+          months: numberValue(row.months),
+          // "Device" on the receipt: what physically went out with the SIM.
+          rentalType: row.rentalPhoneId ? "Phone" : "SIM only",
+          model: row.model,
+          imei: row.imei,
+          rentalPhoneId: row.rentalPhoneId,
+          simNumber: normalizeRcukSimNumber(row.simNumber),
+          startDate: row.startDate,
+          endDate: row.endDate,
+          returnTime: `${shared.returnDays || 0} days`,
+          returnDueDate: calculateReturnDueDate(row.endDate, shared.returnDays),
+          returnReminderPreference: shared.returnReminderPreference,
+          lateFeeWeekly: Number.parseFloat(shared.lateFeeWeekly) || 0,
+          totalDays: days,
+          ukDays: numberValue(row.ukDays),
+          euDays: numberValue(row.euDays),
+          wtsDays: numberValue(row.wtsDays),
+          tpDays: numberValue(row.tpDays),
+          addSms: row.sms ? "Yes" : "No",
+          usaNumber: row.usDdi ? "Yes" : "No",
+          ilNumber: row.ilDdi ? "Yes" : "No",
+          cli: row.cli,
+          usDdi: row.usDdiNumber,
+          rcukActivated: isRcukRental ? (row.rentalId ? "Yes" : "No") : "",
+          // Several SIMs rented together: the batch ties the reports (and the
+          // single card charge) back to each other.
+          rentalBatchId: entries.length > 1 ? batchId : "",
+          rentalBatchSize: entries.length > 1 ? entries.length : "",
+          dailyRate: pricing.dailyRate,
+          totalPrice: pricing.totalPrice,
+          calculatedPrice: pricing.totalPrice,
+          pricingLabel: pricing.label,
+          location: activeLocation || "",
+          storeAddress: activeStoreInfo?.address || "",
+          storeHours: activeStoreInfo?.hours || "",
+          cardStatus: requiresCardCharge ? card.status : "",
+          cardRefNum: requiresCardCharge ? card.refNum : "",
+          cardType: requiresCardCharge ? card.cardType : "",
+          maskedCardNumber: requiresCardCharge ? card.maskedCardNumber : "",
+          batchChargeTotal: entries.length > 1 ? batchTotal : "",
+        },
+      };
 
-    reports.forEach((report, index) => {
       onSave(report);
       // The handset is now out with the customer — flag it so the fleet list and
       // the next rental both know it isn't on the shelf.
-      const phoneId = entries[index].rentalPhoneId;
-      if (phoneId && onIssueRentalPhone) {
-        onIssueRentalPhone(phoneId, { reportId: report.id, customerPhone: form.customerPhone });
+      if (row.rentalPhoneId && onIssueRentalPhone) {
+        onIssueRentalPhone(row.rentalPhoneId, { reportId: report.id, customerPhone: shared.customerPhone });
       }
       printRentalReceipt(report);
     });
   }
 
-  // Everything about the rental on the form that is specific to this SIM. The
-  // customer, dates, zone split and payment stay on the form and are shared by
-  // every rental in the batch.
-  function currentRentalEntry() {
-    return {
-      key: crypto.randomUUID(),
-      simNumber: isRcukRental ? normalizedSimNumber : form.simNumber.trim(),
-      rentalId: submitState.rentalId,
-      cli: submitState.cli,
-      usDdi: submitState.usDdi,
-      serviceType: form.serviceType,
-      deviceKind: form.deviceKind,
-      model: form.model,
-      imei: form.imei,
-      rentalPhoneId: form.rentalPhoneId,
-      addSms: form.addSms,
-      usaNumber: form.usaNumber,
-      price: totalPrice,
-      calculatedPrice,
-      priceOverridden: hasPriceOverride,
-    };
-  }
-
-  // Put this SIM aside and clear the form for the next one. The RCUK state has
-  // to go with it, or the next activation would ride on the finished rental's id
-  // and numbers.
-  function addAnotherRental() {
-    if (!currentReady) return;
-    if (card.status === "paid") {
-      window.alert("The card has already been charged for this batch. Save it first, then start the next rental.");
-      return;
-    }
-    setQueued((current) => [...current, currentRentalEntry()]);
-    setForm((current) => ({
-      ...current,
-      simNumber: "",
-      model: "",
-      imei: "",
-      rentalPhoneId: "",
-      priceOverride: "",
-    }));
-    setSubmitState({
-      status: "idle",
-      message: "",
-      rentalId: "",
-      cli: "",
-      usDdi: "",
-      getNumbersAttempted: false,
-      raw: null,
-    });
-    setSimCheckState({ status: "idle", message: "", checkedSimNumber: "", raw: null });
-    autoCheckedSimRef.current = "";
-  }
-
-  function removeQueuedRental(key) {
-    if (card.status === "paid") {
-      window.alert("The card has already been charged for this batch, so the rentals in it can't be changed.");
-      return;
-    }
-    setQueued((current) => current.filter((entry) => entry.key !== key));
-  }
-
-  function clearRentalForm() {
-    setForm({
-      rentalRegion: "RCUK",
-      serviceType: "Voice",
-      startDate: "",
-      endDate: "",
-      ukDays: "",
-      euDays: "",
-      wtsDays: "",
-      addSms: false,
-      usaNumber: false,
-      deviceKind: "SIM only",
-      model: "",
-      imei: "",
-      rentalPhoneId: "",
-      simNumber: "",
-      returnDays: "",
-      paymentMethod: "",
-      priceOverride: "",
-      returnReminderPreference: "Text message",
-      lateFeeWeekly: "",
-      customerPhone: "",
-      notes: "",
-    });
-    setSubmitState({ status: "idle", message: "", rentalId: "", cli: "", usDdi: "", getNumbersAttempted: false, raw: null });
-    setSimCheckState({ status: "idle", message: "", checkedSimNumber: "", raw: null });
-    setCard({ status: "idle", message: "", refNum: "", cardType: "", maskedCardNumber: "" });
-    autoCheckedSimRef.current = "";
-    setQueued([]);
-  }
+  const zoneFields = ["ukDays", "euDays", "wtsDays", "tpDays"];
+  const flagFields = [["ilDdi", "IL DDI"], ["usDdi", "US DDI"], ["sms", "SMS"]];
 
   return (
     <section className="workspace">
       <div className="workspace-header">
         <div>
           <p className="eyebrow">New customer report</p>
-          <h2>Phone rental report</h2>
+          <h2>Phone rental</h2>
         </div>
         <div className="clock-pill">{formatDateTime(now)}</div>
       </div>
 
-      <div className="rental-layout">
-        <div className="report-form">
-          <div className="form-grid">
-            <label className="field">
-              <span>Rental region</span>
-              <select value={form.rentalRegion} onChange={(event) => updateField("rentalRegion", event.target.value)}>
-                <option>RCUK</option>
-                <option>Canada</option>
-                <option>Israel</option>
-                <option>Local</option>
-              </select>
-            </label>
-            <label className="field">
-              <span>Service</span>
-              <select value={form.serviceType} onChange={(event) => updateField("serviceType", event.target.value)} disabled={isSimpleRental}>
-                <option>Voice</option>
-                <option>Voice and data</option>
-                <option>Data only</option>
-              </select>
-            </label>
-            <label className="field">
-              <span>Start date</span>
-              <input type="date" value={form.startDate} onChange={(event) => updateField("startDate", event.target.value)} />
-            </label>
-            <label className="field">
-              <span>End date</span>
-              <input type="date" value={form.endDate} onChange={(event) => updateField("endDate", event.target.value)} />
-            </label>
-          </div>
-
-          <p className="field-hint rental-day-note">
-            {totalDays > 0
-              ? `${totalDays} rental day${totalDays === 1 ? "" : "s"} — set by the start and end dates.`
-              : "Pick a start and end date to set the rental length."}
-          </p>
-
-          {isRcukRental ? (
-            <>
-              <div className="form-grid">
-                <label className="field">
-                  <span>UK days</span>
-                  <input inputMode="numeric" value={form.ukDays} onChange={(event) => updateField("ukDays", event.target.value)} />
-                </label>
-                <label className="field">
-                  <span>EU days</span>
-                  <input inputMode="numeric" value={form.euDays} onChange={(event) => updateField("euDays", event.target.value)} />
-                </label>
-                <label className="field">
-                  <span>WTS days</span>
-                  <input inputMode="numeric" value={form.wtsDays} onChange={(event) => updateField("wtsDays", event.target.value)} />
-                </label>
-                <label className="field">
-                  <span>Zone day total</span>
-                  <input value={zoneDays || ""} readOnly disabled />
-                </label>
-              </div>
-
-              <div className="toggle-row">
-                <label><input type="checkbox" checked={form.addSms} onChange={(event) => updateField("addSms", event.target.checked)} /> Add SMS</label>
-                <label><input type="checkbox" checked={form.usaNumber} onChange={(event) => updateField("usaNumber", event.target.checked)} /> USA number</label>
-              </div>
-            </>
+      <div className="form-grid">
+        <label className="field">
+          <span>Rental region</span>
+          <select
+            value={shared.rentalRegion}
+            onChange={(event) => updateShared("rentalRegion", event.target.value)}
+            disabled={Boolean(activeRows.length)}
+          >
+            <option>RCUK</option>
+            <option>Canada</option>
+            <option>Israel</option>
+            <option>Local</option>
+          </select>
+        </label>
+        <label className="field">
+          <span>Customer phone</span>
+          <CustomerPhoneInput
+            value={shared.customerPhone}
+            onChange={(value) => updateShared("customerPhone", value)}
+            onSaveCustomerName={onSaveCustomerName}
+            onSaveCustomer={onSaveCustomer}
+            onSelectCustomer={(customer) => updateShared("customerPhone", customer.phone)}
+            required
+          />
+        </label>
+        <label className="field">
+          <span>Days until return</span>
+          <input inputMode="numeric" value={shared.returnDays} onChange={(event) => updateShared("returnDays", event.target.value)} />
+        </label>
+        <label className="field">
+          <span>Payment method</span>
+          <select value={shared.paymentMethod} onChange={(event) => updateShared("paymentMethod", event.target.value)}>
+            <option value="" disabled>Select one</option>
+            {paymentMethods.map((method) => <option key={method}>{method}</option>)}
+          </select>
+        </label>
+        <label className="field">
+          <span>Return reminder</span>
+          <select value={shared.returnReminderPreference} onChange={(event) => updateShared("returnReminderPreference", event.target.value)}>
+            <option>Text message</option>
+            <option>Phone call</option>
+            <option>Both</option>
+          </select>
+        </label>
+        <label className="field">
+          <span>Late fee per week (if overdue)</span>
+          <input
+            inputMode="decimal"
+            value={shared.lateFeeWeekly}
+            onChange={(event) => updateShared("lateFeeWeekly", event.target.value)}
+            placeholder="0.00"
+          />
+          {(Number.parseFloat(shared.lateFeeWeekly) || 0) > 0 ? (
+            <small className="muted">{formatMoney((Number.parseFloat(shared.lateFeeWeekly) || 0) / 7)}/day after the return date</small>
           ) : null}
-
-          <div className="form-grid">
-            <label className="field">
-              <span>Device kind</span>
-              <select value={form.deviceKind} onChange={(event) => updateField("deviceKind", event.target.value)}>
-                <option>SIM only</option>
-                <option>Basic phone</option>
-                <option>Upgraded phone</option>
-              </select>
-            </label>
-            <label className="field">
-              <span>Phone model</span>
-              <input value={form.model} onChange={(event) => updateField("model", event.target.value)} placeholder="Optional for SIM only" />
-            </label>
-            {needsHandset ? (
-              /* A physical phone goes out, so pick it from the tracked fleet rather
-                 than retyping an IMEI — that's what keeps "who has which phone"
-                 accurate. Adding a new handset is available right in the list. */
-              <label className="field">
-                <span>Phone issued (from fleet)</span>
-                <select
-                  value={form.rentalPhoneId}
-                  onChange={(event) => {
-                    const value = event.target.value;
-                    if (value === "__add__") { setAddPhoneOpen(true); return; }
-                    selectFleetPhone(value);
-                  }}
-                >
-                  <option value="">Select a phone…</option>
-                  {availableFleetPhones.map((phone) => (
-                    <option key={phone.id} value={phone.id}>
-                      {phone.name} · {phone.imei}
-                    </option>
-                  ))}
-                  <option value="__add__">+ Add a phone / IMEI…</option>
-                </select>
-                <small className="muted">
-                  {availableFleetPhones.length
-                    ? `${availableFleetPhones.length} phone${availableFleetPhones.length === 1 ? "" : "s"} in store`
-                    : "No phones in store — add one to issue it."}
-                </small>
-              </label>
-            ) : null}
-            <label className="field">
-              <span>IMEI / device ID</span>
-              <input
-                value={form.imei}
-                onChange={(event) => updateField("imei", event.target.value)}
-                inputMode="numeric"
-                autoComplete="off"
-                spellCheck={false}
-                placeholder="Scan or type IMEI"
-                readOnly={Boolean(form.rentalPhoneId)}
-              />
-            </label>
-            <label className="field">
-              <div className="field-label-row">
-                <span>SIM number</span>
-                {isRcukRental ? (
-                  <button
-                    className="sim-check-btn"
-                    type="button"
-                    onClick={checkSimWithRcuk}
-                    disabled={!normalizedSimNumber || simCheckState.status === "checking"}
-                  >
-                    {simCheckState.status === "checking" ? "Checking…" : "Check SIM"}
-                  </button>
-                ) : null}
-              </div>
-              <input
-                inputMode="numeric"
-                className={isRcukRental && (simRejected || simEntry.tooLong) ? "input-invalid" : ""}
-                value={isRcukRental ? normalizedSimNumber : form.simNumber}
-                onChange={(event) => updateField("simNumber", event.target.value)}
-                // An unfamiliar SIM stock never trips the auto-check (we don't know
-                // how long it is), so run it when they leave the field rather than
-                // relying on anyone noticing the button.
-                onBlur={() => {
-                  if (!isRcukRental || simEntry.recognized) return;
-                  if (normalizedSimNumber.length < 15) return;
-                  if (autoCheckedSimRef.current === normalizedSimNumber) return;
-                  autoCheckedSimRef.current = normalizedSimNumber;
-                  checkSimWithRcuk();
-                }}
-              />
-              {isRcukRental && normalizedSimNumber ? (
-                simEntry.tooLong ? (
-                  <small className="field-error">
-                    That's {simEntry.normalized.length} digits — a {simEntry.carrier} SIM is {simEntry.fullLength}. Check the number.
-                  </small>
-                ) : simRejected ? (
-                  <small className="field-error">{simCheckState.message || "RCUK rejected this SIM."}</small>
-                ) : simCheckState.status === "checking" ? (
-                  <small className="field-hint">Checking this SIM with RCUK…</small>
-                ) : simCheckState.status === "checked" ? (
-                  <small className="field-ok">SIM is free — {simCheckState.message || "ready to rent."}</small>
-                ) : simEntry.recognized && !simEntry.complete ? (
-                  <small className="field-hint">
-                    {simEntry.carrier} SIM — {simEntry.fullLength - simEntry.normalized.length} more digit
-                    {simEntry.fullLength - simEntry.normalized.length === 1 ? "" : "s"} to go.
-                  </small>
-                ) : !simEntry.recognized ? (
-                  <small className="field-hint">
-                    This isn't one of the SIM stocks the app recognises. Press Check SIM — RCUK has the final say.
-                  </small>
-                ) : null
-              ) : null}
-            </label>
-          </div>
-
-          <div className="form-grid">
-            <label className="field">
-              <span>Customer phone</span>
-              <CustomerPhoneInput
-                value={form.customerPhone}
-                onChange={(value) => updateField("customerPhone", value)}
-                onSaveCustomerName={onSaveCustomerName}
-                onSaveCustomer={onSaveCustomer}
-                onSelectCustomer={(customer) => updateField("customerPhone", customer.phone)}
-                required
-              />
-            </label>
-            <label className="field">
-              <span>Days until return</span>
-              <input inputMode="numeric" value={form.returnDays} onChange={(event) => updateField("returnDays", event.target.value)} />
-            </label>
-            <label className="field">
-              <span>Payment method</span>
-              <select value={form.paymentMethod} onChange={(event) => updateField("paymentMethod", event.target.value)}>
-                <option value="" disabled>Select one</option>
-                {paymentMethods.map((method) => <option key={method}>{method}</option>)}
-              </select>
-            </label>
-            <label className="field">
-              <span>Return reminder</span>
-              <select value={form.returnReminderPreference} onChange={(event) => updateField("returnReminderPreference", event.target.value)}>
-                <option>Text message</option>
-                <option>Phone call</option>
-                <option>Both</option>
-              </select>
-            </label>
-            <label className="field">
-              <span>Late fee per week (if overdue)</span>
-              <input
-                inputMode="decimal"
-                value={form.lateFeeWeekly}
-                onChange={(event) => updateField("lateFeeWeekly", event.target.value)}
-                placeholder="0.00"
-              />
-              {(Number.parseFloat(form.lateFeeWeekly) || 0) > 0 ? (
-                <small className="muted">{formatMoney((Number.parseFloat(form.lateFeeWeekly) || 0) / 7)}/day after the return date</small>
-              ) : null}
-            </label>
-            <label className="field">
-              <span>Served by</span>
-              <input value={activeEmployee} disabled readOnly />
-            </label>
-          </div>
-
-          {requiresCardCharge ? (
-            <div className="payment-panel payment-panel-stack">
-              <div>
-                <p className="eyebrow">Card payment (Verifone P200)</p>
-                <h3>Charge {formatMoney(batchTotal)} on the terminal</h3>
-                {batchCount > 1 ? (
-                  <p className="muted">One charge for all {batchCount} rentals.</p>
-                ) : null}
-              </div>
-              <div className="card-reader-row">
-                <span className={`reader-dot ${card.status === "paid" ? "connected" : ""}`} aria-hidden="true" />
-                <span className="muted">Sola BBPOS · local terminal</span>
-              </div>
-              <button
-                className="secondary-button"
-                type="button"
-                onClick={chargeRentalCard}
-                disabled={!batchTotal || card.status === "charging" || card.status === "paid"}
-              >
-                {card.status === "paid" ? "Card charged ✓" : card.status === "charging" ? "Charging…" : `Charge ${formatMoney(batchTotal)}`}
-              </button>
-              <p className={card.status === "error" ? "summary-error" : "muted"}>{card.message}</p>
-            </div>
-          ) : null}
-
-          <label className="field full">
-            <span>Notes</span>
-            <textarea value={form.notes} onChange={(event) => updateField("notes", event.target.value)} rows="4" />
-          </label>
-
-          <div className="form-actions">
-            {isRcukRental ? (
-              <>
-                <button className="primary-button" type="button" onClick={submitRentalToRcuk} disabled={!canSubmitRental || submitState.status === "submitting"}>
-                  Submit rental
-                </button>
-                <button className="secondary-button" type="button" onClick={getRentalNumbers} disabled={!submitState.rentalId || submitState.status === "getting-numbers"}>
-                  Get numbers
-                </button>
-              </>
-            ) : null}
-            <button
-              className="secondary-button"
-              type="button"
-              onClick={addAnotherRental}
-              disabled={!currentReady || card.status === "paid"}
-              title="File this SIM with the batch and clear the form for the next one"
-            >
-              + Another rental for this customer
-            </button>
-            <button className="primary-button" type="button" onClick={saveRentalReport} disabled={!canSave}>
-              {batchCount > 1 ? `Save ${batchCount} rental reports` : "Save rental report"}
-            </button>
-            <button className="secondary-button" type="button" onClick={clearRentalForm}>
-              Clear form
-            </button>
-          </div>
-        </div>
-
-        <aside className="rental-summary">
-          <p className="eyebrow">{queued.length ? "This rental" : "Rental total"}</p>
-          <h3>{formatMoney(totalPrice)}</h3>
-          <div className="summary-line"><span>Daily rate</span><strong>{formatMoney(dailyRate)}</strong></div>
-          <div className="summary-line"><span>Pricing</span><strong>{rentalPricing.label}</strong></div>
-          <div className="summary-line"><span>Total days</span><strong>{totalDays || 0}</strong></div>
-          {hasPriceOverride ? (
-            <div className="summary-line"><span>Calculated</span><strong>{formatMoney(calculatedPrice)}</strong></div>
-          ) : null}
-          <label className="field rental-price-override">
-            <span>Charge a different amount (optional)</span>
-            <input
-              inputMode="decimal"
-              value={form.priceOverride}
-              onChange={(event) => updateField("priceOverride", event.target.value)}
-              placeholder={calculatedPrice ? calculatedPrice.toFixed(2) : "0.00"}
-            />
-            <small className="muted">
-              {hasPriceOverride
-                ? `Charging ${formatMoney(totalPrice)} instead of the calculated ${formatMoney(calculatedPrice)}.`
-                : "Leave blank to charge the calculated price."}
-            </small>
-          </label>
-          {isRcukRental ? (
-            <div className={zoneDaysValid ? "summary-ok" : "summary-error"}>
-              UK + EU + WTS: {zoneDays || 0} / {totalDays || 0}
-            </div>
-          ) : null}
-
-          {queued.length ? (
-            <div className="rental-batch">
-              <p className="eyebrow">Renting together ({batchCount})</p>
-              {queued.map((entry, index) => (
-                <div className="rental-batch-row" key={entry.key}>
-                  <div>
-                    <strong>{index + 1}. {entry.rentalId ? `Rental ${entry.rentalId}` : "Rental"}</strong>
-                    <span className="muted">SIM …{entry.simNumber.slice(-6)}{entry.cli ? ` · ${entry.cli}` : ""}</span>
-                  </div>
-                  <span>{formatMoney(entry.price)}</span>
-                  <button
-                    className="dialog-close"
-                    type="button"
-                    aria-label={`Remove rental ${index + 1} from this batch`}
-                    title="Remove from this batch"
-                    onClick={() => removeQueuedRental(entry.key)}
-                  >
-                    &times;
-                  </button>
-                </div>
-              ))}
-              {currentReady ? (
-                <div className="rental-batch-row">
-                  <div>
-                    <strong>{queued.length + 1}. On the form now</strong>
-                    <span className="muted">SIM …{(isRcukRental ? normalizedSimNumber : form.simNumber).slice(-6)}</span>
-                  </div>
-                  <span>{formatMoney(totalPrice)}</span>
-                </div>
-              ) : null}
-              <div className="rental-batch-total">
-                <span>Batch total</span>
-                <strong>{formatMoney(batchTotal)}</strong>
-              </div>
-            </div>
-          ) : null}
-          {!minimumDaysValid && totalDays > 0 ? (
-            <div className="summary-error">Minimum rental is {getMinimumRentalDays(form.rentalRegion)} days.</div>
-          ) : null}
-          {submitBlockers.length && currentStarted ? (
-            <div className="summary-error">
-              <strong>{isRcukRental ? "Before submitting to RCUK:" : "Before saving:"}</strong>
-              <ul className="blocker-list">
-                {submitBlockers.map((blocker) => <li key={blocker}>{blocker}</li>)}
-              </ul>
-            </div>
-          ) : null}
-          {isRcukRental && !rcukActivated && !submitBlockers.length && currentStarted ? (
-            <div className="summary-error">
-              {rentalSubmitted
-                ? "Submitted — now press Get numbers. It can be saved once RCUK returns them."
-                : "Not activated on RCUK yet. Press Submit rental, then Get numbers, before saving."}
-            </div>
-          ) : null}
-          {isRcukRental && !rcukActivated && card.status === "paid" ? (
-            <div className="summary-error">
-              ⚠ The card has been charged {formatMoney(totalPrice)} but RCUK has not activated this rental. Get it
-              activated — or refund the card — before the customer leaves.
-            </div>
-          ) : null}
-          {requiresCardCharge && !cardChargeComplete ? (
-            <div className="summary-error">Charge the card on the terminal before saving a CC rental.</div>
-          ) : null}
-          {isRcukRental ? (
-            <div className="rental-result">
-              <span>Rental ID</span>
-              <input value={submitState.rentalId} readOnly />
-              <span>CLI</span>
-              <input value={submitState.cli} readOnly />
-              <span>US DDI</span>
-              <input value={submitState.usDdi} readOnly />
-              <span>Get numbers tried</span>
-              <input value={submitState.getNumbersAttempted ? "Yes" : "No"} readOnly />
-              <span>SIM check</span>
-              <input value={simCheckState.checkedSimNumber || ""} readOnly />
-              {simCheckState.message ? (
-                <p className={simCheckState.status === "error" ? "summary-error" : "muted"}>{simCheckState.message}</p>
-              ) : null}
-              <p className={submitState.status === "error" ? "summary-error" : "muted"}>{submitState.message}</p>
-              {/* RCUK's own words, so a rejection can be read (and reported) instead
-                  of just being "it didn't work". */}
-              {submitState.status === "error" && submitState.raw ? (
-                <details className="rcuk-raw">
-                  <summary>What RCUK sent back</summary>
-                  <pre>{JSON.stringify(submitState.raw, null, 2)}</pre>
-                </details>
-              ) : null}
-            </div>
-          ) : null}
-        </aside>
+        </label>
+        <label className="field">
+          <span>Served by</span>
+          <input value={activeEmployee} disabled readOnly />
+        </label>
       </div>
 
-      {addPhoneOpen ? (
+      <div className="rental-rows-wrap">
+        <table className="rental-rows">
+          <thead>
+            <tr>
+              <th className="rental-col-sim">SIM</th>
+              <th>Rental type</th>
+              <th>Months</th>
+              <th>Package</th>
+              <th>Start date</th>
+              <th>End date</th>
+              <th>Total days</th>
+              <th>Days left</th>
+              <th>UK</th>
+              <th>EU</th>
+              <th>WTS</th>
+              <th>TP</th>
+              <th>IL DDI</th>
+              <th>US DDI</th>
+              <th>SMS</th>
+              <th>Phone issued</th>
+              <th>Ref / notes</th>
+              <th>Price</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((row) => {
+              const days = rowDays(row);
+              const left = rentalDaysLeft(row.endDate);
+              const locked = Boolean(row.rentalId);
+              const zoneOff = isRcukRental && days > 0 && rowZoneDays(row) !== days;
+              return (
+                <tr
+                  key={row.id}
+                  className={locked ? "rental-row-active" : row.status === "error" ? "rental-row-error" : ""}
+                >
+                  <td className="rental-col-sim">
+                    <input
+                      value={row.simNumber}
+                      onChange={(event) => editRow(row.id, { simNumber: event.target.value })}
+                      placeholder="Scan SIM"
+                      inputMode="numeric"
+                      autoComplete="off"
+                      spellCheck={false}
+                      readOnly={locked}
+                    />
+                    {row.rentalId ? (
+                      <span className="rental-row-id">
+                        Rental {row.rentalId}
+                        {row.cli ? ` · ${row.cli}` : ""}
+                        {row.usDdiNumber ? ` · US ${row.usDdiNumber}` : ""}
+                      </span>
+                    ) : null}
+                    {row.message ? (
+                      <span className={row.status === "error" ? "rental-row-msg error" : "rental-row-msg"}>{row.message}</span>
+                    ) : null}
+                  </td>
+                  <td>
+                    <select value={row.rentalType} onChange={(event) => editRow(row.id, { rentalType: event.target.value })} disabled={locked}>
+                      <option>Daily</option>
+                      <option>Monthly</option>
+                    </select>
+                  </td>
+                  <td>
+                    <input
+                      className="rental-cell-num"
+                      inputMode="numeric"
+                      value={row.months}
+                      onChange={(event) => editRow(row.id, { months: event.target.value })}
+                      disabled={locked || row.rentalType !== "Monthly"}
+                    />
+                  </td>
+                  <td>
+                    <select value={row.package} onChange={(event) => editRow(row.id, { package: event.target.value })} disabled={locked}>
+                      {RENTAL_PACKAGES.map((entry) => <option key={entry.value}>{entry.value}</option>)}
+                    </select>
+                  </td>
+                  <td>
+                    <input type="date" value={row.startDate} onChange={(event) => editRow(row.id, { startDate: event.target.value })} readOnly={locked} />
+                  </td>
+                  <td>
+                    <input type="date" value={row.endDate} onChange={(event) => editRow(row.id, { endDate: event.target.value })} readOnly={locked} />
+                  </td>
+                  <td className="rental-cell-computed">{days || "-"}</td>
+                  <td className="rental-cell-computed">{left === "" ? "-" : left}</td>
+                  {zoneFields.map((zone) => (
+                    <td key={zone}>
+                      <input
+                        className={`rental-cell-num ${zoneOff ? "input-invalid" : ""}`}
+                        inputMode="numeric"
+                        value={row[zone]}
+                        onChange={(event) => editRow(row.id, { [zone]: event.target.value })}
+                        disabled={locked || !isRcukRental}
+                      />
+                    </td>
+                  ))}
+                  {flagFields.map(([flag, label]) => (
+                    <td key={flag} className="rental-cell-check">
+                      <input
+                        type="checkbox"
+                        checked={row[flag]}
+                        onChange={(event) => editRow(row.id, { [flag]: event.target.checked })}
+                        disabled={locked || !isRcukRental}
+                        aria-label={label}
+                      />
+                    </td>
+                  ))}
+                  <td>
+                    <select
+                      value={row.rentalPhoneId}
+                      onChange={(event) => {
+                        const value = event.target.value;
+                        if (value === "__add__") { setAddPhoneRow(row.id); return; }
+                        selectFleetPhone(row.id, value);
+                      }}
+                      disabled={locked}
+                    >
+                      <option value="">SIM only</option>
+                      {availableFleetPhones.map((phone) => (
+                        <option key={phone.id} value={phone.id}>{phone.name} · {phone.imei}</option>
+                      ))}
+                      <option value="__add__">+ Add a phone…</option>
+                    </select>
+                  </td>
+                  <td>
+                    <input value={row.ref} onChange={(event) => editRow(row.id, { ref: event.target.value })} readOnly={locked} />
+                  </td>
+                  <td className="rental-cell-computed">{formatMoney(rowPricing(row).totalPrice)}</td>
+                  <td className="rental-cell-actions">
+                    <button type="button" className="ghost-button compact-button" onClick={() => duplicateRow(row.id)} title="Duplicate this row">
+                      Copy
+                    </button>
+                    <button type="button" className="dialog-close" onClick={() => removeRow(row.id)} aria-label="Remove this row" title="Remove this row">
+                      &times;
+                    </button>
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+
+      <div className="rental-row-actions">
+        <button type="button" className="ghost-button" onClick={() => addRow(1)} disabled={busy}>+ Add row</button>
+        <button
+          type="button"
+          className="ghost-button"
+          disabled={busy}
+          onClick={() => {
+            const answer = window.prompt("How many more rows?", "3");
+            const count = Math.min(20, Math.max(0, Number.parseInt(answer || "", 10) || 0));
+            if (count) addRow(count);
+          }}
+        >
+          + Add multiple rows
+        </button>
+      </div>
+
+      <label className="field full">
+        <span>Notes (all of these rentals)</span>
+        <textarea value={shared.notes} onChange={(event) => updateShared("notes", event.target.value)} rows="3" />
+      </label>
+
+      <div className="rental-run">
+        <div className="rental-run-total">
+          <span>{filledRows.length} rental{filledRows.length === 1 ? "" : "s"}</span>
+          <strong>{formatMoney(batchTotal)}</strong>
+        </div>
+
+        {sharedProblems.length || rowProblemList.length ? (
+          <div className="summary-error">
+            <strong>Before activating:</strong>
+            <ul className="blocker-list">
+              {sharedProblems.map((problem) => <li key={problem}>{problem}</li>)}
+              {rowProblemList.map(({ row, problems }) => (
+                <li key={row.id}>
+                  SIM {digitsOnly(row.simNumber).slice(-6) || "(blank)"} needs {problems.join(", ")}.
+                </li>
+              ))}
+            </ul>
+          </div>
+        ) : null}
+
+        {card.message ? <p className={card.status === "error" ? "summary-error" : "muted"}>{card.message}</p> : null}
+        {run.message ? <p className={run.status === "error" ? "summary-error" : "muted"}>{run.message}</p> : null}
+
+        <button className="primary-button rental-run-button" type="button" onClick={activateAndFile} disabled={!readyToRun}>
+          {busy
+            ? (card.status === "charging" ? "Follow the terminal…" : "Working…")
+            : requiresCardCharge && card.status !== "paid"
+              ? `Charge ${formatMoney(batchTotal)} · activate & save`
+              : `Activate & save ${filledRows.length} rental${filledRows.length === 1 ? "" : "s"}`}
+        </button>
+        <p className="muted">
+          {isRcukRental
+            ? `Every SIM is checked with RCUK first${requiresCardCharge ? ", then the card is charged once for the lot" : ""}, then each row is activated, stamped with its rental ID and filed as its own report.`
+            : "Each row is filed as its own rental report."}
+        </p>
+      </div>
+
+      {addPhoneRow ? (
         <AddRentalPhoneDialog
           existingPhones={rentalPhones}
-          onClose={() => setAddPhoneOpen(false)}
+          onClose={() => setAddPhoneRow("")}
           onAdd={(phone) => {
             const saved = onSaveRentalPhone?.(phone);
-            if (saved) selectFleetPhone(saved.id);
-            setAddPhoneOpen(false);
+            if (saved) selectFleetPhone(addPhoneRow, saved.id);
+            setAddPhoneRow("");
           }}
         />
       ) : null}

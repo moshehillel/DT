@@ -4358,3 +4358,150 @@ tr:last-child td {
   border-top: 1px solid #bfe3d2;
   color: #14603f;
 }
+
+/* ---- Rental rows: one line per SIM ----------------------------------------
+   The rental screen mirrors RCUK's own multi-rental table, so a family taking
+   four SIMs is four lines rather than four trips through a form. It is wide by
+   nature, so it scrolls inside its own frame and never pushes the page sideways. */
+.rental-rows-wrap {
+  margin-top: 16px;
+  overflow-x: auto;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+}
+
+.rental-rows {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+.rental-rows th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  padding: 10px 8px;
+  background: var(--brand-dark, #2b2058);
+  color: #fff;
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  text-align: left;
+  white-space: nowrap;
+}
+
+.rental-rows td {
+  padding: 8px;
+  border-top: 1px solid var(--line);
+  vertical-align: top;
+}
+
+.rental-rows input,
+.rental-rows select {
+  min-height: 36px;
+  padding: 6px 8px;
+  font-size: 13px;
+}
+
+/* The SIM is the row's identity — give it room, and hang the rental id and any
+   message from RCUK underneath it. */
+.rental-col-sim {
+  min-width: 230px;
+}
+
+.rental-row-id {
+  display: block;
+  margin-top: 4px;
+  font-size: 12px;
+  font-weight: 800;
+  color: #14603f;
+}
+
+.rental-row-msg {
+  display: block;
+  margin-top: 3px;
+  font-size: 11px;
+  line-height: 1.35;
+  color: var(--muted);
+}
+
+.rental-row-msg.error {
+  color: #b3261e;
+}
+
+.rental-cell-num input,
+input.rental-cell-num {
+  width: 62px;
+  text-align: center;
+}
+
+.rental-cell-check {
+  text-align: center;
+}
+
+.rental-cell-check input {
+  min-height: auto;
+  width: 18px;
+  height: 18px;
+}
+
+.rental-cell-computed {
+  padding-top: 15px;
+  font-weight: 800;
+  white-space: nowrap;
+}
+
+.rental-cell-actions {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  white-space: nowrap;
+}
+
+/* Live on RCUK: locked, because the screen must not say something different
+   from what RCUK actually activated. */
+.rental-row-active td {
+  background: #f1fbf6;
+}
+
+.rental-row-error td {
+  background: #fff5f4;
+}
+
+.rental-row-actions {
+  display: flex;
+  gap: 12px;
+  margin: 10px 0 16px;
+}
+
+/* The one button that checks, charges, activates and files. */
+.rental-run {
+  display: grid;
+  gap: 12px;
+  margin-top: 16px;
+  padding: 16px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+}
+
+.rental-run-total {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 15px;
+}
+
+.rental-run-total strong {
+  font-size: 28px;
+  letter-spacing: -0.5px;
+  color: var(--brand-dark);
+}
+
+.rental-run-button {
+  min-height: 52px;
+  font-size: 16px;
+}
