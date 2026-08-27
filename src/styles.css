@@ -4307,3 +4307,22 @@ tr:last-child td {
   white-space: pre-wrap;
   word-break: break-word;
 }
+
+/* The rental length is worked out from the dates, so it reads as a note under
+   them instead of a box nobody can type in. */
+.rental-day-note {
+  margin: -6px 0 0;
+}
+
+/* Confirms the rental that was just filed, and that the form is now waiting for
+   the next SIM rather than sitting there half-cleared for no reason. */
+.rental-saved-notice {
+  margin: 10px 0 0;
+  padding: 10px 12px;
+  border: 1px solid #bfe3d2;
+  border-radius: 8px;
+  background: #f1fbf6;
+  color: #14603f;
+  font-weight: 650;
+  line-height: 1.4;
+}

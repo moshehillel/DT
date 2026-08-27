@@ -2312,6 +2312,9 @@ function RentalReportForm({
   });
   const solaTokenRef = useRef("");
   const [addPhoneOpen, setAddPhoneOpen] = useState(false);
+  // What the last save did, so activating a second rental doesn't look like
+  // nothing happened when the RCUK panel clears itself.
+  const [savedNotice, setSavedNotice] = useState("");
   // Card-present terminal state (Verifone P200 / Sola BBPOS), same as the POS.
   // Rentals are always charged card-present — no keyed-in entry option here.
   const [card, setCard] = useState({ status: "idle", message: "", refNum: "", cardType: "", maskedCardNumber: "" });
@@ -2323,6 +2326,27 @@ function RentalReportForm({
 
   const totalDays = calculateInclusiveDays(form.startDate, form.endDate);
   const zoneDays = numberValue(form.ukDays) + numberValue(form.euDays) + numberValue(form.wtsDays);
+
+  // A zone box left blank is zero days there. Once the boxes that ARE filled in
+  // account for every day of the rental (6 days, UK 3, EU 3), put the 0 into the
+  // empty ones so the form says what it means and RCUK gets an explicit zero.
+  // setForm directly, not updateField: this is bookkeeping, and it must not
+  // invalidate a card charge the way a real zone-day edit does.
+  useEffect(() => {
+    if (!isRcukRental || totalDays <= 0) return;
+    const zones = ["ukDays", "euDays", "wtsDays"];
+    const blanks = zones.filter((key) => String(form[key] ?? "").trim() === "");
+    if (!blanks.length) return;
+    const filled = zones
+      .filter((key) => !blanks.includes(key))
+      .reduce((sum, key) => sum + numberValue(form[key]), 0);
+    if (filled !== totalDays) return;
+    setForm((current) => {
+      const next = { ...current };
+      blanks.forEach((key) => { next[key] = "0"; });
+      return next;
+    });
+  }, [isRcukRental, totalDays, form.ukDays, form.euDays, form.wtsDays]);
   const rentalPricing = calculateRentalPrice(form, totalDays);
   const dailyRate = rentalPricing.dailyRate;
   // The formula gives the standard price; an employee can charge something else
@@ -2425,6 +2449,7 @@ function RentalReportForm({
 
   function updateField(name, value) {
     setForm((current) => ({ ...current, [name]: value }));
+    setSavedNotice("");
     // A change that moves the price or the payment method invalidates any card
     // charge already taken — force it to be run again for the new amount.
     if (["paymentMethod", "priceOverride", "customerPhone", "startDate", "endDate", "serviceType", "addSms", "rentalRegion", "ukDays", "euDays", "wtsDays"].includes(name)) {
@@ -2822,6 +2847,74 @@ function RentalReportForm({
       onIssueRentalPhone(form.rentalPhoneId, { reportId: report.id, customerPhone: form.customerPhone });
     }
     printRentalReceipt(report);
+    startNextRental(report);
+  }
+
+  // Clear everything that belongs to the rental just saved so the next SIM can
+  // be activated straight away. Without this the form kept the finished rental's
+  // RCUK id, CLI and SIM check, and a second activation either re-sent the same
+  // SIM or filed the new rental under the old rental's numbers.
+  // What the next rental almost always shares — the customer, the dates, the
+  // zone split, how they're paying — stays put; a different customer just gets
+  // typed over, or use "Clear form" for a blank one.
+  function startNextRental(saved) {
+    setForm((current) => ({
+      ...current,
+      simNumber: "",
+      model: "",
+      imei: "",
+      rentalPhoneId: "",
+      priceOverride: "",
+      notes: "",
+    }));
+    setSubmitState({
+      status: "idle",
+      message: "",
+      rentalId: "",
+      cli: "",
+      usDdi: "",
+      getNumbersAttempted: false,
+      raw: null,
+    });
+    setSimCheckState({ status: "idle", message: "", checkedSimNumber: "", raw: null });
+    setCard({ status: "idle", message: "", refNum: "", cardType: "", maskedCardNumber: "" });
+    autoCheckedSimRef.current = "";
+    const label = saved.details.rentalId ? `Rental ${saved.details.rentalId}` : "Rental";
+    setSavedNotice(
+      `${label} saved for ${saved.customerPhone}. Scan the next SIM to activate another rental for this customer, `
+      + "or change the customer phone for someone else.",
+    );
+  }
+
+  function clearRentalForm() {
+    setForm({
+      rentalRegion: "RCUK",
+      serviceType: "Voice",
+      startDate: "",
+      endDate: "",
+      ukDays: "",
+      euDays: "",
+      wtsDays: "",
+      addSms: false,
+      usaNumber: false,
+      deviceKind: "SIM only",
+      model: "",
+      imei: "",
+      rentalPhoneId: "",
+      simNumber: "",
+      returnDays: "",
+      paymentMethod: "",
+      priceOverride: "",
+      returnReminderPreference: "Text message",
+      lateFeeWeekly: "",
+      customerPhone: "",
+      notes: "",
+    });
+    setSubmitState({ status: "idle", message: "", rentalId: "", cli: "", usDdi: "", getNumbersAttempted: false, raw: null });
+    setSimCheckState({ status: "idle", message: "", checkedSimNumber: "", raw: null });
+    setCard({ status: "idle", message: "", refNum: "", cardType: "", maskedCardNumber: "" });
+    autoCheckedSimRef.current = "";
+    setSavedNotice("");
   }
 
   return (
@@ -2862,11 +2955,13 @@ function RentalReportForm({
               <span>End date</span>
               <input type="date" value={form.endDate} onChange={(event) => updateField("endDate", event.target.value)} />
             </label>
-            <label className="field">
-              <span>Total days</span>
-              <input value={totalDays || ""} readOnly disabled />
-            </label>
           </div>
+
+          <p className="field-hint rental-day-note">
+            {totalDays > 0
+              ? `${totalDays} rental day${totalDays === 1 ? "" : "s"} — set by the start and end dates.`
+              : "Pick a start and end date to set the rental length."}
+          </p>
 
           {isRcukRental ? (
             <>
@@ -3095,7 +3190,11 @@ function RentalReportForm({
             <button className="primary-button" type="button" onClick={saveRentalReport} disabled={!canSave}>
               Save rental report
             </button>
+            <button className="secondary-button" type="button" onClick={clearRentalForm}>
+              Clear form
+            </button>
           </div>
+          {savedNotice ? <p className="rental-saved-notice">✓ {savedNotice}</p> : null}
         </div>
 
         <aside className="rental-summary">
