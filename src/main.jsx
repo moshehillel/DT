@@ -2354,9 +2354,47 @@ function RentalReportForm({
     && normalizedSimNumber
     && simUsable
     && isRcukRental;
-  const canSave = isSimpleRental
-    ? isRentalFormComplete(form) && minimumDaysValid && totalPrice > 0 && cardChargeComplete
-    : rentalSubmitted && submitState.getNumbersAttempted && cardChargeComplete;
+  // Exactly what is standing between this rental and RCUK. The sidebar used to
+  // say "complete all rental fields" without saying which one, which is no help
+  // to whoever is holding the customer's card.
+  const missingFields = [
+    [form.rentalRegion, "region"],
+    [form.serviceType, "service type"],
+    [form.startDate, "start date"],
+    [form.endDate, "end date"],
+    [form.deviceKind, "device kind"],
+    [form.simNumber, "SIM number"],
+    [form.customerPhone, "customer phone"],
+    [form.returnDays, "return days"],
+    [form.paymentMethod, "payment method"],
+    ...(isRcukRental ? [[form.ukDays, "UK days"], [form.euDays, "EU days"], [form.wtsDays, "WTS days"]] : []),
+    ...(form.deviceKind !== "SIM only" ? [[form.model, "phone model"], [form.imei, "IMEI"]] : []),
+  ]
+    .filter(([value]) => String(value ?? "").trim() === "")
+    .map(([, label]) => label);
+
+  const submitBlockers = [
+    ...(missingFields.length ? [`Fill in: ${missingFields.join(", ")}.`] : []),
+    ...(totalDays > 0 ? [] : ["Pick a start and end date."]),
+    ...(isRcukRental && totalDays > 0 && !zoneDaysValid ? ["UK + EU + WTS days must add up to the total days."] : []),
+    ...(!minimumDaysValid && totalDays > 0 ? [`Minimum rental for ${form.rentalRegion} is ${getMinimumRentalDays(form.rentalRegion)} days.`] : []),
+    ...(totalPrice > 0 ? [] : ["The rental price is 0 — set a price to charge."]),
+    ...(isRcukRental && !normalizedSimNumber ? ["Enter the SIM number."] : []),
+    ...(isRcukRental && normalizedSimNumber && !simUsable
+      ? [simRejected ? "RCUK turned this SIM down — use another SIM." : "Check the SIM with RCUK first."]
+      : []),
+  ];
+
+  // The RCUK round trip is the happy path, but it must never be able to strand a
+  // rental the customer has already paid for. Once the rental itself is complete
+  // and any card has gone through, the report can always be saved — flagged as
+  // not activated, with RCUK's own reason on it, so it can be finished by hand.
+  const rentalBasicsReady = isRentalFormComplete(form)
+    && minimumDaysValid
+    && totalPrice > 0
+    && cardChargeComplete;
+  const rcukActivated = rentalSubmitted && submitState.getNumbersAttempted;
+  const canSave = rentalBasicsReady;
 
   // Only a real handset needs a fleet phone; a SIM-only rental doesn't.
   const needsHandset = form.deviceKind !== "SIM only";
@@ -2715,6 +2753,17 @@ function RentalReportForm({
 
   function saveRentalReport() {
     if (!canSave) return;
+    // Saving a RCUK rental that never came back with an ID is allowed (the card
+    // may already be charged) but it is never silent: it needs a yes, and the
+    // report carries the reason so someone can finish it on RCUK's own site.
+    if (isRcukRental && !rcukActivated) {
+      const confirmed = window.confirm(
+        "This rental was not activated on RCUK — no rental ID came back."
+        + (card.status === "paid" ? " The card has already been charged." : "")
+        + "\n\nSave it anyway? It will be filed as NOT ACTIVATED so it can be finished on RCUK.",
+      );
+      if (!confirmed) return;
+    }
 
     const report = {
       id: crypto.randomUUID(),
@@ -2750,6 +2799,10 @@ function RentalReportForm({
         usaNumber: form.usaNumber ? "Yes" : "No",
         cli: submitState.cli,
         usDdi: submitState.usDdi,
+        // Whether RCUK actually activated this SIM. "No" means the rental exists
+        // here (and may be paid) but still has to be created on RCUK.
+        rcukActivated: isRcukRental ? (rcukActivated ? "Yes" : "No") : "",
+        rcukError: isRcukRental && !rcukActivated ? submitState.message || "Not submitted to RCUK." : "",
         dailyRate,
         // What was actually charged, plus what the formula said, so a discount
         // stays visible on the report instead of vanishing into the total.
@@ -3030,8 +3083,13 @@ function RentalReportForm({
                 </button>
               </>
             ) : null}
-            <button className="primary-button" type="button" onClick={saveRentalReport} disabled={!canSave}>
-              Save rental report
+            <button
+              className={isRcukRental && !rcukActivated ? "secondary-button" : "primary-button"}
+              type="button"
+              onClick={saveRentalReport}
+              disabled={!canSave}
+            >
+              {isRcukRental && !rcukActivated ? "Save without RCUK activation" : "Save rental report"}
             </button>
           </div>
         </div>
@@ -3067,8 +3125,19 @@ function RentalReportForm({
           {!minimumDaysValid && totalDays > 0 ? (
             <div className="summary-error">Minimum rental is {getMinimumRentalDays(form.rentalRegion)} days.</div>
           ) : null}
-          {(isRcukRental ? !canSubmitRental : !canSave) ? (
-            <div className="summary-error">{isRcukRental ? "Complete all rental fields before submitting." : "Complete all rental fields before saving."}</div>
+          {submitBlockers.length ? (
+            <div className="summary-error">
+              <strong>{isRcukRental ? "Before submitting to RCUK:" : "Before saving:"}</strong>
+              <ul className="blocker-list">
+                {submitBlockers.map((blocker) => <li key={blocker}>{blocker}</li>)}
+              </ul>
+            </div>
+          ) : null}
+          {isRcukRental && !rcukActivated && canSave ? (
+            <div className="summary-error">
+              Not activated on RCUK yet. Submit it and get the numbers, or save it as not activated — the rental
+              is recorded either way and can be finished on RCUK afterwards.
+            </div>
           ) : null}
           {requiresCardCharge && !cardChargeComplete ? (
             <div className="summary-error">Charge the card on the terminal before saving a CC rental.</div>
@@ -3089,6 +3158,14 @@ function RentalReportForm({
                 <p className={simCheckState.status === "error" ? "summary-error" : "muted"}>{simCheckState.message}</p>
               ) : null}
               <p className={submitState.status === "error" ? "summary-error" : "muted"}>{submitState.message}</p>
+              {/* RCUK's own words, so a rejection can be read (and reported) instead
+                  of just being "it didn't work". */}
+              {submitState.status === "error" && submitState.raw ? (
+                <details className="rcuk-raw">
+                  <summary>What RCUK sent back</summary>
+                  <pre>{JSON.stringify(submitState.raw, null, 2)}</pre>
+                </details>
+              ) : null}
             </div>
           ) : null}
         </aside>

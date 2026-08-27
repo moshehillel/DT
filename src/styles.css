@@ -4272,3 +4272,38 @@ tr:last-child td {
   color: var(--ink);
   border-color: #b9c2cc;
 }
+
+/* The rental sidebar lists what is still blocking a submit, instead of one
+   vague "complete all fields" line. */
+.blocker-list {
+  margin: 6px 0 0;
+  padding-left: 18px;
+  display: grid;
+  gap: 4px;
+}
+
+.blocker-list li {
+  line-height: 1.35;
+}
+
+/* The raw RCUK rejection, folded away until someone needs to read it. */
+.rcuk-raw summary {
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--muted);
+}
+
+.rcuk-raw pre {
+  max-height: 220px;
+  overflow: auto;
+  margin: 6px 0 0;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fbfcfd;
+  font-size: 11px;
+  line-height: 1.4;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
