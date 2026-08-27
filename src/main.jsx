@@ -72,6 +72,7 @@ import {
   getMinimumRentalDays,
   isSolaPaidStatus,
   normalizeRcukSimNumber,
+  rcukSimEntry,
   numberValue,
   parsePriceAdjust,
   playScanBeep,
@@ -2277,6 +2278,10 @@ function emptyRentalRow(defaults = {}) {
     usDdi: false,
     sms: false,
     ref: "",
+    // What RCUK said about this SIM, kept apart from the activation state so a
+    // check result survives until the number itself is edited.
+    simStatus: "idle", // idle | checking | ok | error
+    simMessage: "",
     // The handset, if one goes out with this SIM.
     rentalPhoneId: "",
     model: "",
@@ -2351,7 +2356,15 @@ function RentalReportForm({
   // covers it and has to be run again. Rows that are live on RCUK are read-only:
   // the screen must not say something different from what RCUK activated.
   function editRow(id, patch) {
-    updateRow(id, { ...patch, status: "idle", message: "" });
+    const simEdited = Object.prototype.hasOwnProperty.call(patch, "simNumber");
+    updateRow(id, {
+      ...patch,
+      status: "idle",
+      message: "",
+      // A different number is a different SIM: whatever RCUK said about the old
+      // one means nothing now.
+      ...(simEdited ? { simStatus: "idle", simMessage: "" } : {}),
+    });
     if (card.status === "paid") {
       setCard({
         status: "idle",
@@ -2453,7 +2466,22 @@ function RentalReportForm({
   function rowProblems(row) {
     const days = rowDays(row);
     const problems = [];
-    if (!digitsOnly(row.simNumber)) problems.push("a SIM number");
+    const sim = rcukSimEntry(row.simNumber);
+    if (!digitsOnly(row.simNumber)) {
+      problems.push("a SIM number");
+    } else if (row.simStatus === "error") {
+      problems.push("a SIM RCUK will accept");
+    } else if (isRcukRental && sim.recognized && !sim.complete) {
+      // A stock we know the length of, half typed. An unfamiliar prefix is left
+      // to RCUK to judge — our table is not the authority on what exists.
+      problems.push(`the rest of the SIM number (${sim.fullLength - sim.normalized.length} more digits)`);
+    } else if (isRcukRental && sim.tooLong) {
+      problems.push(`a ${sim.carrier} SIM of ${sim.fullLength} digits`);
+    }
+    if (digitsOnly(row.simNumber) && rows.some((other) => other.id !== row.id
+      && digitsOnly(other.simNumber) === digitsOnly(row.simNumber))) {
+      problems.push("a SIM that isn't already on another line");
+    }
     if (!row.startDate || !row.endDate) problems.push("start and end dates");
     else if (days <= 0) problems.push("an end date on or after the start date");
     if (isRcukRental) {
@@ -2499,6 +2527,42 @@ function RentalReportForm({
     return { ok: response.ok && data.ok, data };
   }
 
+  // Ask RCUK whether this SIM can be rented. Returns true/false so the run can
+  // stop before any money moves.
+  async function checkRowSim(row) {
+    const normalized = normalizeRcukSimNumber(row.simNumber);
+    if (!normalized) return false;
+    updateRow(row.id, { simStatus: "checking", simMessage: "Checking with RCUK…" });
+    try {
+      const { ok, data } = await postFunction("/rcukCheckSim", { sim_number: normalized });
+      updateRow(row.id, {
+        simStatus: ok ? "ok" : "error",
+        simMessage: data.message || (ok ? "SIM is free." : "RCUK turned this SIM down."),
+      });
+      return ok;
+    } catch (error) {
+      updateRow(row.id, { simStatus: "error", simMessage: error.message || "Could not reach RCUK." });
+      return false;
+    }
+  }
+
+  // Check a SIM the moment the last digit lands — they are typed in far more
+  // often than scanned, and nobody should have to remember a button. Keyed on
+  // the finished number so re-renders don't re-fire it and a corrected digit
+  // gets a fresh answer.
+  const autoCheckedRef = useRef({});
+  useEffect(() => {
+    if (!isRcukRental) return;
+    rows.forEach((row) => {
+      if (row.rentalId) return;
+      const entry = rcukSimEntry(row.simNumber);
+      if (!entry.complete) return;
+      if (autoCheckedRef.current[row.id] === entry.normalized) return;
+      autoCheckedRef.current[row.id] = entry.normalized;
+      checkRowSim(row);
+    });
+  }, [isRcukRental, rows]);
+
   function rcukPayloadFor(row) {
     return {
       sim_number: normalizeRcukSimNumber(row.simNumber),
@@ -2539,14 +2603,9 @@ function RentalReportForm({
     if (isRcukRental) {
       let simsOk = true;
       for (const row of pending) {
-        updateRow(row.id, { status: "checking", message: "Checking with RCUK..." });
-        const { ok, data } = await postFunction("/rcukCheckSim", { sim_number: row.simNumber });
-        if (ok) {
-          updateRow(row.id, { status: "idle", message: data.message || "SIM is free." });
-        } else {
-          simsOk = false;
-          updateRow(row.id, { status: "error", message: data.message || "RCUK turned this SIM down." });
-        }
+        // eslint-disable-next-line no-await-in-loop
+        const ok = await checkRowSim(row);
+        if (!ok) simsOk = false;
       }
       if (!simsOk) {
         setRun({
@@ -2803,6 +2862,7 @@ function RentalReportForm({
               const days = rowDays(row);
               const left = rentalDaysLeft(row.endDate);
               const locked = Boolean(row.rentalId);
+              const sim = rcukSimEntry(row.simNumber);
               const zoneOff = isRcukRental && days > 0 && rowZoneDays(row) !== days;
               return (
                 <tr
@@ -2810,21 +2870,57 @@ function RentalReportForm({
                   className={locked ? "rental-row-active" : row.status === "error" ? "rental-row-error" : ""}
                 >
                   <td className="rental-col-sim">
-                    <input
-                      value={row.simNumber}
-                      onChange={(event) => editRow(row.id, { simNumber: event.target.value })}
-                      placeholder="Scan SIM"
-                      inputMode="numeric"
-                      autoComplete="off"
-                      spellCheck={false}
-                      readOnly={locked}
-                    />
+                    <div className="rental-sim-entry">
+                      <input
+                        // Typed far more often than scanned, so the box shows the
+                        // finished ICCID as they go: keying the 00030… printed on a
+                        // Vodafone SIM fills in the 89441 in front of it.
+                        value={isRcukRental ? sim.normalized : row.simNumber}
+                        onChange={(event) => editRow(row.id, { simNumber: event.target.value })}
+                        className={isRcukRental && (sim.tooLong || row.simStatus === "error") ? "input-invalid" : ""}
+                        placeholder="Type or scan the SIM"
+                        inputMode="numeric"
+                        autoComplete="off"
+                        spellCheck={false}
+                        readOnly={locked}
+                      />
+                      {isRcukRental && !locked ? (
+                        <button
+                          type="button"
+                          className="sim-check-btn"
+                          onClick={() => checkRowSim(row)}
+                          disabled={!sim.normalized || row.simStatus === "checking"}
+                        >
+                          {row.simStatus === "checking" ? "…" : "Check"}
+                        </button>
+                      ) : null}
+                    </div>
                     {row.rentalId ? (
                       <span className="rental-row-id">
                         Rental {row.rentalId}
                         {row.cli ? ` · ${row.cli}` : ""}
                         {row.usDdiNumber ? ` · US ${row.usDdiNumber}` : ""}
                       </span>
+                    ) : null}
+                    {!locked && isRcukRental && sim.normalized ? (
+                      sim.tooLong ? (
+                        <span className="rental-row-msg error">
+                          That's {sim.normalized.length} digits — a {sim.carrier} SIM is {sim.fullLength}.
+                        </span>
+                      ) : row.simStatus === "error" ? (
+                        <span className="rental-row-msg error">{row.simMessage}</span>
+                      ) : row.simStatus === "checking" ? (
+                        <span className="rental-row-msg">Checking this SIM with RCUK…</span>
+                      ) : row.simStatus === "ok" ? (
+                        <span className="rental-row-msg ok">SIM is free — {row.simMessage}</span>
+                      ) : sim.recognized && !sim.complete ? (
+                        <span className="rental-row-msg">
+                          {sim.carrier} SIM — {sim.fullLength - sim.normalized.length} more digit
+                          {sim.fullLength - sim.normalized.length === 1 ? "" : "s"} to go.
+                        </span>
+                      ) : !sim.recognized ? (
+                        <span className="rental-row-msg">Unfamiliar SIM stock — press Check and let RCUK decide.</span>
+                      ) : null
                     ) : null}
                     {row.message ? (
                       <span className={row.status === "error" ? "rental-row-msg error" : "rental-row-msg"}>{row.message}</span>

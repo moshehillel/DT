@@ -4505,3 +4505,24 @@ input.rental-cell-num {
   min-height: 52px;
   font-size: 16px;
 }
+
+/* The SIM cell: the number, a Check button, and whatever RCUK said about it. */
+.rental-sim-entry {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.rental-sim-entry input {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.rental-sim-entry .sim-check-btn {
+  flex: none;
+}
+
+.rental-row-msg.ok {
+  color: #14603f;
+  font-weight: 650;
+}
