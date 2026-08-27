@@ -2339,7 +2339,16 @@ function RentalReportForm({
   // A SIM that RCUK turned down must not be rentable, and a half-typed one isn't
   // ready to submit either.
   const simRejected = simCheckState.status === "error";
-  const simUsable = !isRcukRental || (simEntry.complete && simCheckState.status === "checked");
+  // RCUK is the authority on whether a SIM can be rented — not our local prefix
+  // table. That table (RCUK_SIM_CARRIERS) exists so the check can fire by itself
+  // the moment a familiar number is finished; requiring `simEntry.complete` on
+  // top of RCUK's own verdict meant a SIM from any stock we don't list could be
+  // checked, come back "SIM is free", and still leave Submit rental disabled
+  // with nothing on screen saying why. The check has to be for the number that
+  // is in the box right now, so correcting a digit can't ride on a stale pass.
+  const simChecked = simCheckState.status === "checked"
+    && digitsOnly(simCheckState.checkedSimNumber) === digitsOnly(normalizedSimNumber);
+  const simUsable = !isRcukRental || simChecked;
   const zoneDaysValid = totalDays > 0 && zoneDays === totalDays;
   const needsUsNumber = form.usaNumber;
   const rentalSubmitted = submitState.status === "submitted" || submitState.status === "numbers-ready";
@@ -2974,6 +2983,16 @@ function RentalReportForm({
                 className={isRcukRental && (simRejected || simEntry.tooLong) ? "input-invalid" : ""}
                 value={isRcukRental ? normalizedSimNumber : form.simNumber}
                 onChange={(event) => updateField("simNumber", event.target.value)}
+                // An unfamiliar SIM stock never trips the auto-check (we don't know
+                // how long it is), so run it when they leave the field rather than
+                // relying on anyone noticing the button.
+                onBlur={() => {
+                  if (!isRcukRental || simEntry.recognized) return;
+                  if (normalizedSimNumber.length < 15) return;
+                  if (autoCheckedSimRef.current === normalizedSimNumber) return;
+                  autoCheckedSimRef.current = normalizedSimNumber;
+                  checkSimWithRcuk();
+                }}
               />
               {isRcukRental && normalizedSimNumber ? (
                 simEntry.tooLong ? (
@@ -2990,6 +3009,10 @@ function RentalReportForm({
                   <small className="field-hint">
                     {simEntry.carrier} SIM — {simEntry.fullLength - simEntry.normalized.length} more digit
                     {simEntry.fullLength - simEntry.normalized.length === 1 ? "" : "s"} to go.
+                  </small>
+                ) : !simEntry.recognized ? (
+                  <small className="field-hint">
+                    This isn't one of the SIM stocks the app recognises. Press Check SIM — RCUK has the final say.
                   </small>
                 ) : null
               ) : null}
