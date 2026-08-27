@@ -1419,7 +1419,7 @@ function Workspace({ currentUser, isAdmin }) {
         ) : activeView === "reports" ? (
           activeType === "rental" ? (
             <RentalReportForm
-              key={`${activeType}-${formNonce}`}
+              key="rental-form"
               activeEmployee={activeEmployee}
               activeLocation={activeLocation}
               activeStoreInfo={activeStoreInfo}
@@ -1429,6 +1429,7 @@ function Workspace({ currentUser, isAdmin }) {
               onSaveRentalPhone={saveRentalPhone}
               onIssueRentalPhone={issueRentalPhone}
               onSave={saveReport}
+              onUpdateReport={updateRepair}
             />
           ) : activeType === "phoneOrder" ? (
             <PhoneOrderPage
@@ -2315,6 +2316,7 @@ function RentalReportForm({
   onSaveRentalPhone,
   onIssueRentalPhone,
   onSave,
+  onUpdateReport,
 }) {
   const [now, setNow] = useState(new Date());
   // Everything every rental in this batch shares.
@@ -2331,6 +2333,10 @@ function RentalReportForm({
   const [card, setCard] = useState({ status: "idle", message: "", refNum: "", cardType: "", maskedCardNumber: "" });
   const [run, setRun] = useState({ status: "idle", message: "" });
   const [addPhoneRow, setAddPhoneRow] = useState("");
+  // The rentals this screen has just filed. RCUK rarely has the numbers ready
+  // the second a SIM is activated, so they stay on screen with a way to ask
+  // again — the report is updated in place when they come back.
+  const [filed, setFiled] = useState([]);
 
   useEffect(() => {
     const timer = window.setInterval(() => setNow(new Date()), 30000);
@@ -2692,6 +2698,7 @@ function RentalReportForm({
     if (!entries.length) return;
     const batchId = crypto.randomUUID();
     const createdAt = new Date().toISOString();
+    const justFiled = [];
 
     entries.forEach((row) => {
       const days = rowDays(row);
@@ -2758,7 +2765,56 @@ function RentalReportForm({
         onIssueRentalPhone(row.rentalPhoneId, { reportId: report.id, customerPhone: shared.customerPhone });
       }
       printRentalReceipt(report);
+      justFiled.push({
+        reportId: report.id,
+        rentalId: row.rentalId,
+        simNumber: report.details.simNumber,
+        cli: row.cli,
+        usDdi: row.usDdiNumber,
+        customerPhone: shared.customerPhone.trim(),
+        price: pricing.totalPrice,
+        status: "",
+      });
     });
+
+    setFiled(justFiled);
+    // Ready for the next customer. The panel above keeps the rentals that were
+    // just filed, so the numbers can still be chased from here.
+    setRows([emptyRentalRow()]);
+    setShared((current) => ({
+      ...current,
+      customerPhone: "",
+      notes: "",
+    }));
+    setCard({ status: "idle", message: "", refNum: "", cardType: "", maskedCardNumber: "" });
+    setRun({ status: "idle", message: "" });
+    autoCheckedRef.current = {};
+  }
+
+  // Ask RCUK again for one filed rental's numbers, and write them onto the saved
+  // report. The same button lives on the rental in the reports log.
+  async function fetchNumbersFor(entry) {
+    if (!FUNCTIONS_BASE_URL || !entry.rentalId) return;
+    setFiled((current) => current.map((item) => (
+      item.reportId === entry.reportId ? { ...item, status: "Asking RCUK…" } : item
+    )));
+    const { ok, data } = await postFunction("/rcukGetRental", { rental_id: entry.rentalId });
+    if (!ok || !data.cli) {
+      setFiled((current) => current.map((item) => (
+        item.reportId === entry.reportId
+          ? { ...item, status: data.message || "Not ready yet — try again shortly." }
+          : item
+      )));
+      return;
+    }
+    onUpdateReport?.(entry.reportId, {
+      details: { cli: data.cli, usDdi: data.usDdi || "", rcukStatus: data.status || "" },
+    });
+    setFiled((current) => current.map((item) => (
+      item.reportId === entry.reportId
+        ? { ...item, cli: data.cli, usDdi: data.usDdi || "", status: "Numbers saved to the report." }
+        : item
+    )));
   }
 
   const zoneFields = ["ukDays", "euDays", "wtsDays"];
@@ -2835,6 +2891,51 @@ function RentalReportForm({
           <input value={activeEmployee} disabled readOnly />
         </label>
       </div>
+
+      {filed.length ? (
+        <div className="rental-filed">
+          <div className="rental-filed-head">
+            <div>
+              <p className="eyebrow">Just filed</p>
+              <h3>{filed.length} rental{filed.length === 1 ? "" : "s"} activated and saved</h3>
+            </div>
+            <button className="ghost-button compact-button" type="button" onClick={() => setFiled([])}>
+              Dismiss
+            </button>
+          </div>
+          {filed.map((entry) => (
+            <div className="rental-filed-row" key={entry.reportId}>
+              <div>
+                <strong>Rental {entry.rentalId || "—"}</strong>
+                <span className="muted">SIM …{entry.simNumber.slice(-6)} · {formatMoney(entry.price)}</span>
+                {entry.cli ? (
+                  <span className="rental-filed-numbers">
+                    {entry.cli}{entry.usDdi ? ` · US ${entry.usDdi}` : ""}
+                  </span>
+                ) : (
+                  <span className="muted">Numbers not back from RCUK yet.</span>
+                )}
+                {entry.status ? <span className="muted">{entry.status}</span> : null}
+              </div>
+              {entry.cli ? (
+                <span className="status-pill returned">Numbers in</span>
+              ) : (
+                <button
+                  className="secondary-button compact-button"
+                  type="button"
+                  onClick={() => fetchNumbersFor(entry)}
+                  disabled={!entry.rentalId}
+                >
+                  Get numbers
+                </button>
+              )}
+            </div>
+          ))}
+          <p className="muted">
+            The numbers can also be fetched later from the rental in the reports log — open it and press Get numbers there.
+          </p>
+        </div>
+      ) : null}
 
       <div className="rental-rows-wrap">
         <table className="rental-rows">

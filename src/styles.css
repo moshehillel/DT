@@ -4526,3 +4526,50 @@ input.rental-cell-num {
   color: #14603f;
   font-weight: 650;
 }
+
+/* What the last run activated and filed. RCUK rarely has the numbers ready the
+   instant a SIM goes live, so they stay here with a way to ask again without
+   going hunting in the reports log. */
+.rental-filed {
+  display: grid;
+  gap: 10px;
+  margin-top: 16px;
+  padding: 14px 16px;
+  border: 1px solid #bfe3d2;
+  border-radius: 8px;
+  background: #f1fbf6;
+}
+
+.rental-filed-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.rental-filed-head h3 {
+  margin: 0;
+}
+
+.rental-filed-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 10px;
+  border: 1px solid #bfe3d2;
+  border-radius: 8px;
+  background: #fff;
+}
+
+.rental-filed-row > div {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+  font-size: 13px;
+}
+
+.rental-filed-numbers {
+  font-weight: 800;
+  color: #14603f;
+}
