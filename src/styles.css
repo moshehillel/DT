@@ -1066,6 +1066,39 @@ button:active {
   gap: 7px;
 }
 
+/* The rental screen's shared fields describe one trip, not six things worth a
+   quarter of the screen each — they sit on one line above the table of SIMs,
+   which is where the work actually happens. */
+.rental-shared-grid {
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 10px;
+  align-items: start;
+}
+
+.rental-shared-grid .field {
+  gap: 4px;
+  min-width: 0;
+}
+
+.rental-shared-grid .field span {
+  font-size: 11px;
+  letter-spacing: 0.02em;
+}
+
+.rental-shared-grid input,
+.rental-shared-grid select {
+  min-height: 34px;
+  padding: 5px 8px;
+  font-size: 13px;
+}
+
+/* Six across stops being readable well before the screen gets narrow. */
+@media (max-width: 1180px) {
+  .rental-shared-grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+
 .field.full {
   width: 100%;
   grid-column: 1 / -1;
@@ -4406,9 +4439,19 @@ tr:last-child td {
 }
 
 /* The SIM is the row's identity — give it room, and hang the rental id and any
-   message from RCUK underneath it. */
+   message from RCUK underneath it. A full ICCID is 20 digits and the Check
+   button sits beside it, so anything narrower hid the last digit typed. */
 .rental-col-sim {
-  min-width: 230px;
+  min-width: 300px;
+}
+
+/* "V&D" was clipped by the dropdown arrow. */
+.rental-col-package {
+  min-width: 120px;
+}
+
+.rental-col-package select {
+  width: 100%;
 }
 
 .rental-row-id {
@@ -4515,7 +4558,9 @@ input.rental-cell-num {
 
 .rental-sim-entry input {
   flex: 1 1 auto;
-  min-width: 0;
+  /* Wide enough for all 20 digits. The table scrolls sideways, so holding this
+     width is better than squeezing the number out of sight. */
+  min-width: 200px;
 }
 
 .rental-sim-entry .sim-check-btn {

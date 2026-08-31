@@ -71,8 +71,76 @@ function buildRcukRentalPayload(payload) {
   return rcukPayload;
 }
 
+function extractRentalId(data) {
+  return data.rental_id
+    || data.rentalId
+    || data.reactivated_rental_id
+    || data.id
+    || data.ID
+    || data.data?.rental_id
+    || data.data?.rentalId
+    || data.data?.ID
+    || data.rental_data?.rental_id
+    || data.rental_data?.id
+    || data.rental_data?.ID
+    || "";
+}
+
+// RCUK's get-rental answers with a LIST, not an object:
+//
+//   { "code": 200, "rentals": [ { "ID": 47089, "CLI": "07384236628", ... } ] }
+//
+// Reading only `rental_data`/`data` fell through to the top-level body, which
+// has no CLI on it, so every lookup came back "pending" with the number sitting
+// right there in the response. That is why rental 47089 was chased three times
+// and given up on while RCUK had had its number from the first second.
+function rentalLookupRow(data) {
+  if (!data || typeof data !== "object") return {};
+  for (const candidate of [data.rentals, data.rental_data, data.data]) {
+    if (Array.isArray(candidate)) {
+      if (candidate.length) return candidate[0] || {};
+      continue;
+    }
+    if (candidate && typeof candidate === "object") return candidate;
+  }
+  return data;
+}
+
+// RCUK writes "No" — or "0" — into the field for an add-on the customer did not
+// buy, so those are absences, not numbers.
+function pickRentalNumber(...values) {
+  for (const value of values) {
+    const text = String(value ?? "").trim();
+    if (!text) continue;
+    if (["no", "none", "0"].includes(text.toLowerCase())) continue;
+    return text;
+  }
+  return "";
+}
+
+function normalizeRentalLookup(data) {
+  const row = rentalLookupRow(data);
+  const cli = pickRentalNumber(row.cli, row.CLI, row.phone_number);
+  const usDdi = pickRentalNumber(row.us_ddi, row.usDDI, row.usa_number, row.us_number);
+  const ilDdi = pickRentalNumber(row.il_ddi, row.ilDDI, row.israel_number);
+
+  return {
+    rentalId: String(extractRentalId(data) || extractRentalId(row) || ""),
+    cli,
+    usDdi,
+    ilDdi,
+    status: row.status || row.Status || "",
+    pending: !cli && !usDdi,
+    raw: data,
+  };
+}
+
 module.exports = {
   buildRcukRentalPayload,
+  extractRentalId,
+  normalizeRentalLookup,
+  pickRentalNumber,
+  rentalLookupRow,
   digitsOnly,
   isRcukFailureBody,
   mapRentalPackage,

@@ -5,13 +5,24 @@ const { onSchedule } = require("firebase-functions/v2/scheduler");
 const logger = require("firebase-functions/logger");
 const admin = require("firebase-admin");
 const twilio = require("twilio");
+const nodemailer = require("nodemailer");
 const {
   buildRcukRentalPayload,
   digitsOnly,
+  extractRentalId,
   isRcukFailureBody,
   normalizeRcukSimNumber,
+  normalizeRentalLookup,
 } = require("./rcuk");
 const { buildRepairMessage, buildRepairReceivedMessage, findRepairByLookup } = require("./repairs");
+const {
+  RENTAL_NUMBER_MAX_ATTEMPTS,
+  buildRentalNumbersMessage,
+  buildRentalNumbersVoiceMessage,
+  planRentalNumberChase,
+  rentalNeedsNumbers,
+  retryAt,
+} = require("./rentalNumbers");
 const {
   buildTelebroadPendingReport,
   buildTelebroadSmsRequest,
@@ -52,6 +63,11 @@ const SOLA_CREATE_CHARGE_PATH = process.env.SOLA_CREATE_CHARGE_PATH || "/gateway
 // CloudIM cloud endpoint for card-present terminal payments (PAX A80, etc.).
 const SOLA_DEVICE_API_BASE_URL = process.env.SOLA_DEVICE_API_BASE_URL || "https://device.cardknox.com/v2";
 const RENTAL_REMINDER_TIME_ZONE = process.env.RENTAL_REMINDER_TIME_ZONE || "America/New_York";
+const SMTP_HOST = process.env.SMTP_HOST || "smtp.gmail.com";
+const SMTP_PORT = Number(process.env.SMTP_PORT || 465);
+const SMTP_USER = process.env.SMTP_USER || "";
+const SMTP_PASSWORD = process.env.SMTP_PASSWORD || "";
+const SMTP_FROM_NAME = process.env.SMTP_FROM_NAME || "Diamant Telecom";
 const MAPS_API_KEY = process.env.MAPS_API_KEY || "";
 
 function getPayload(req) {
@@ -498,16 +514,27 @@ function getTwilioClient() {
 }
 
 // Outgoing voice calls (e.g. rental return reminders) stay on Twilio.
-async function sendVoiceCall({ to, body }) {
+//
+// `repeat` says the whole thing more than once with a pause between, which is
+// what makes a phone number usable: nobody writes down eleven digits first time.
+async function sendVoiceCall({ to, body, repeat = 1, pauseSeconds = 2 }) {
   const client = getTwilioClient();
   if (!client) {
     return { status: "Queued", detail: "Twilio credentials are not configured" };
   }
 
+  const times = Math.min(5, Math.max(1, Number(repeat) || 1));
+  const spoken = escapeXml(body);
+  const blocks = [];
+  for (let index = 0; index < times; index += 1) {
+    if (index) blocks.push(`<Pause length="${pauseSeconds}"/>`);
+    blocks.push(`<Say>${spoken}</Say>`);
+  }
+
   const call = await client.calls.create({
     to,
     from: TWILIO_FROM_NUMBER,
-    twiml: `<Response><Say>${escapeXml(body)}</Say></Response>`,
+    twiml: `<Response>${blocks.join("")}</Response>`,
   });
   return { status: "Sent", detail: `Call ${call.sid}` };
 }
@@ -574,11 +601,17 @@ async function sendSms({ to, body }) {
   return { status: "Sent", detail: `Telebroad SMS ${data.result ?? ""}`.trim() };
 }
 
-async function sendCustomerNotification({ to, method, body }) {
+// `voiceBody`/`voiceRepeat` let a caller say something different down the phone
+// from what it puts in the text — a spoken phone number needs its digits spaced
+// out and said again, while the text wants the number in one piece so it can be
+// copied. Callers that don't care pass neither and both channels read the same.
+async function sendCustomerNotification({ to, method, body, voiceBody = "", voiceRepeat = 1 }) {
+  const spoken = voiceBody || body;
+
   if (method === "Both") {
     const [sms, call] = await Promise.all([
       sendSms({ to, body }),
-      sendVoiceCall({ to, body }),
+      sendVoiceCall({ to, body: spoken, repeat: voiceRepeat }),
     ]);
     const status = sms.status === "Sent" || call.status === "Sent" ? "Sent" : "Failed";
     return {
@@ -587,7 +620,7 @@ async function sendCustomerNotification({ to, method, body }) {
     };
   }
   if (method === "Phone call") {
-    return sendVoiceCall({ to, body });
+    return sendVoiceCall({ to, body: spoken, repeat: voiceRepeat });
   }
   return sendSms({ to, body });
 }
@@ -604,6 +637,58 @@ exports.sendSaleReceiptSms = onCall({ region: REGION }, async (request) => {
   if (body.length > 1600) throw new HttpsError("invalid-argument", "The receipt text is too long to send.");
 
   const result = await sendSms({ to, body });
+  return { sent: result.status === "Sent", status: result.status, detail: result.detail || "" };
+});
+
+// Outgoing email goes out over Gmail's SMTP with an app password. The transport
+// is built per call rather than held open: these functions are cold most of the
+// time, and a socket kept across invocations is a socket that has already been
+// closed by the time the next receipt needs it.
+function getMailTransport() {
+  if (!SMTP_USER || !SMTP_PASSWORD) return null;
+  return nodemailer.createTransport({
+    host: SMTP_HOST,
+    port: SMTP_PORT,
+    // 465 is implicit TLS; anything else (587) starts plain and upgrades.
+    secure: SMTP_PORT === 465,
+    auth: { user: SMTP_USER, pass: SMTP_PASSWORD },
+  });
+}
+
+async function sendEmail({ to, subject, body }) {
+  const transport = getMailTransport();
+  if (!transport) {
+    return { status: "Queued", detail: "SMTP credentials are not configured" };
+  }
+
+  try {
+    const info = await transport.sendMail({
+      from: `"${SMTP_FROM_NAME}" <${SMTP_USER}>`,
+      to,
+      subject,
+      text: body,
+    });
+    return { status: "Sent", detail: `Email ${info.messageId || ""}`.trim() };
+  } catch (error) {
+    return { status: "Failed", detail: `Email: ${error.message || "send failed"}` };
+  }
+}
+
+// Emails a sale receipt. Same shape and same guards as sendSaleReceiptSms: signed
+// in, a real recipient, plain text only, and a length that is actually a receipt.
+exports.sendSaleReceiptEmail = onCall({ region: REGION }, async (request) => {
+  if (!request.auth) throw new HttpsError("unauthenticated", "Sign in required.");
+  const to = String(request.data?.to || "").trim();
+  const body = String(request.data?.body || "").trim();
+  const subject = String(request.data?.subject || "").trim() || "Your Diamant Telecom receipt";
+  if (!to || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(to)) {
+    throw new HttpsError("invalid-argument", "A valid email address is required.");
+  }
+  if (!body) throw new HttpsError("invalid-argument", "The receipt text is empty.");
+  if (body.length > 20000) throw new HttpsError("invalid-argument", "The receipt text is too long to send.");
+  if (subject.length > 200) throw new HttpsError("invalid-argument", "The subject is too long.");
+
+  const result = await sendEmail({ to, subject, body });
   return { sent: result.status === "Sent", status: result.status, detail: result.detail || "" };
 });
 
@@ -885,39 +970,6 @@ exports.telebroadCallWebhook = onRequest(HTTP_OPTIONS, async (req, res) => {
     sendJson(res, 500, { error: "Telebroad call import failed" });
   }
 });
-
-function extractRentalId(data) {
-  return data.rental_id
-    || data.rentalId
-    || data.reactivated_rental_id
-    || data.id
-    || data.ID
-    || data.data?.rental_id
-    || data.data?.rentalId
-    || data.data?.ID
-    || data.rental_data?.rental_id
-    || data.rental_data?.id
-    || data.rental_data?.ID
-    || "";
-}
-
-function normalizeRentalLookup(data) {
-  const rentalData = data.rental_data || data.data || data;
-  const cli = rentalData.cli || rentalData.CLI || rentalData.phone_number || "";
-  const usDdi = rentalData.us_ddi || rentalData.usDDI || rentalData.usa_number || rentalData.us_number || "";
-  const ilDdi = rentalData.il_ddi || rentalData.ilDDI || rentalData.israel_number || "";
-  const status = rentalData.status || rentalData.Status || "";
-
-  return {
-    rentalId: extractRentalId(data),
-    cli,
-    usDdi,
-    ilDdi,
-    status,
-    pending: !cli && !usDdi,
-    raw: data,
-  };
-}
 
 exports.rcukAddRental = onRequest(HTTP_OPTIONS, async (req, res) => {
   if (handleCors(req, res)) return;
@@ -1655,6 +1707,363 @@ exports.sendSimExpiryReminders = onSchedule(
         .map((doc) =>
           sendSimReminder(doc, `sim-monthly-reminder-${doc.id}-${stamp}`, "sim-monthly-reminder")),
     ]);
+  },
+);
+
+// ---- RCUK number chase -----------------------------------------------------
+//
+// RCUK allocates a rental's CLI on its own schedule: about five days before the
+// start date, and within a couple of minutes for a trip starting right away. The
+// register cannot sit and wait for either, so every rental filed without numbers
+// leaves a job behind and the server does the chasing — the clerk can close the
+// till, the customer still gets their number.
+const RENTAL_NUMBER_JOBS = "rentalNumberJobs";
+
+// Ask RCUK once for one job, and act on the answer: numbers go onto the report
+// and out to the customer; nothing yet means another try in a minute, until the
+// tries run out and a human is told.
+async function runRentalNumberJob(jobDoc) {
+  const job = jobDoc.data() || {};
+  const reportRef = db.collection("reports").doc(job.reportId);
+  const reportSnap = await reportRef.get();
+  const report = reportSnap.exists ? reportSnap.data() : null;
+
+  // The rental was cancelled, returned, or the report is gone: there is nothing
+  // left to tell anybody.
+  if (!report || ["Returned", "Cancelled"].includes(report.details?.rentalStatus || "")) {
+    await jobDoc.ref.set({ status: "closed", closedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
+    return;
+  }
+
+  const attempt = Number(job.attempt || 0) + 1;
+
+  // Somebody may have pressed "Get numbers" on the report before this ran. That
+  // still counts as the numbers arriving — the customer has not been told yet.
+  let cli = report.details?.cli || "";
+  let usDdi = report.details?.usDdi || "";
+  let ilDdi = report.details?.ilDdi || "";
+  let rcukStatus = report.details?.rcukStatus || "";
+
+  if (!cli) {
+    try {
+      const result = await callRcuk(RCUK_GET_RENTAL_PATH, { rental_id: job.rentalId }, "GET");
+      if (result.ok) {
+        const lookup = normalizeRentalLookup(result.data);
+        cli = lookup.cli || "";
+        usDdi = lookup.usDdi || "";
+        ilDdi = lookup.ilDdi || "";
+        rcukStatus = lookup.status || rcukStatus;
+      }
+    } catch (error) {
+      // A network blip is just an attempt that found nothing.
+      logger.error("runRentalNumberJob lookup failed", error);
+    }
+  }
+
+  const method = job.method || report.details?.returnReminderPreference || "Text message";
+
+  if (!cli) {
+    if (attempt < RENTAL_NUMBER_MAX_ATTEMPTS) {
+      await jobDoc.ref.set({
+        attempt,
+        nextAttemptAt: admin.firestore.Timestamp.fromDate(retryAt()),
+      }, { merge: true });
+      return;
+    }
+
+    // Out of tries. The rental is live and the customer has no number, so this
+    // has to end up in front of staff rather than in a log nobody opens.
+    await reportRef.set({ details: { numbersStatus: "failed" } }, { merge: true });
+    await writeNotificationLog(
+      `rental-numbers-failed-${job.reportId}`,
+      job.reportId,
+      report,
+      method,
+      "Failed",
+      `RCUK gave no number for rental ${job.rentalId} after ${attempt} tries. Fetch it by hand and tell the customer.`,
+      "rental-numbers",
+    );
+    await jobDoc.ref.set({ status: "failed", attempt, failedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
+    // This line is done for, but the others on the same card may be holding
+    // their message until it stopped being chased.
+    await deliverRentalNumbers(job.reportId, { ...report, details: { ...report.details, numbersStatus: "failed" } });
+    return;
+  }
+
+  // Numbers onto the report first, message second: if the send fails, the
+  // numbers are still saved and a human can read them out.
+  const numbers = {
+    cli,
+    usDdi,
+    ilDdi,
+    rcukStatus,
+    numbersStatus: "delivered",
+    numbersDeliveredAt: new Date().toISOString(),
+  };
+  await reportRef.set({ details: numbers }, { merge: true });
+  await jobDoc.ref.set({
+    status: "done",
+    attempt,
+    cli,
+    usDdi,
+    completedAt: admin.firestore.FieldValue.serverTimestamp(),
+  }, { merge: true });
+
+  await deliverRentalNumbers(job.reportId, { ...report, details: { ...report.details, ...numbers } });
+}
+
+// One card, one customer, one message. Four SIMs rented together are four
+// reports sharing a rentalBatchId and RCUK allocates their numbers seconds
+// apart — telling the customer as each one lands would be four texts, or four
+// phone calls. So a line whose numbers are in waits for the rest of its wave,
+// and whichever job finishes last sends the lot as one message.
+//
+// Only the current wave is waited for: rows in a batch can carry different
+// start dates, so a sibling whose numbers are weeks off must not hold this
+// message up. That one sends its own when its turn comes round.
+const RENTAL_NUMBER_WAVE_MS = 5 * 60 * 1000;
+
+function rentalNumberLine(report) {
+  const details = report?.details || {};
+  return {
+    simNumber: details.simNumber || "",
+    cli: details.cli || "",
+    usDdi: details.usDdi || "",
+    ilDdi: details.ilDdi || "",
+  };
+}
+
+async function deliverRentalNumbers(reportId, report) {
+  const batchId = report.details?.rentalBatchId || "";
+  const method = report.details?.returnReminderPreference || "Text message";
+  const to = report.customerPhone || "";
+  const logId = `rental-numbers-${reportId}`;
+
+  let candidates = [];
+
+  if (!batchId) {
+    candidates = [db.collection("reports").doc(reportId)];
+  } else {
+    const jobs = await db.collection(RENTAL_NUMBER_JOBS).where("batchId", "==", batchId).get();
+    const cutoff = Date.now() + RENTAL_NUMBER_WAVE_MS;
+    const stillChasing = jobs.docs.some((doc) => {
+      const sibling = doc.data() || {};
+      if (doc.id === reportId || sibling.status !== "pending") return false;
+      const due = typeof sibling.nextAttemptAt?.toMillis === "function" ? sibling.nextAttemptAt.toMillis() : 0;
+      return due <= cutoff;
+    });
+    if (stillChasing) return;
+
+    const siblings = await db.collection("reports").where("details.rentalBatchId", "==", batchId).get();
+    candidates = siblings.docs.map((doc) => doc.ref);
+  }
+  if (!candidates.length) return;
+
+  // Claim the send before making it, in one transaction. Three things can reach
+  // a rental at the same moment — the minute sweep, the register's own chase,
+  // and somebody pressing Get numbers — and the customer must not be told twice.
+  // Whoever wins the claim sends; the others find the stamp and go quiet.
+  const notifiedAt = new Date().toISOString();
+  const claimed = await db.runTransaction(async (tx) => {
+    const snaps = await Promise.all(candidates.map((ref) => tx.get(ref)));
+    const fresh = [];
+    snaps.forEach((snap, index) => {
+      const details = snap.exists ? (snap.data().details || {}) : {};
+      if (!details.cli || details.numbersNotifiedAt) return;
+      fresh.push({ ref: candidates[index], line: rentalNumberLine(snap.data()) });
+    });
+    // Stamped before the message goes out, not after: a send that throws must
+    // not be quietly repeated, and the log below records what happened.
+    fresh.forEach((entry) => tx.set(entry.ref, { details: { numbersNotifiedAt: notifiedAt } }, { merge: true }));
+    return fresh;
+  });
+
+  if (!claimed.length) return;
+  const lines = claimed.map((entry) => entry.line);
+
+  if (!to) {
+    await writeNotificationLog(logId, reportId, report, method, "Skipped", "No customer phone number", "rental-numbers");
+  } else {
+    try {
+      const result = await sendCustomerNotification({
+        to,
+        method,
+        body: buildRentalNumbersMessage(lines),
+        voiceBody: buildRentalNumbersVoiceMessage(lines),
+        voiceRepeat: 3,
+      });
+      const detail = lines.length > 1
+        ? `${result.detail || result.status} (${lines.length} lines in one message)`
+        : result.detail;
+      await writeNotificationLog(logId, reportId, report, method, result.status, detail, "rental-numbers");
+    } catch (error) {
+      logger.error("deliverRentalNumbers failed", error);
+      await writeNotificationLog(logId, reportId, report, method, "Failed", error.message, "rental-numbers");
+    }
+  }
+}
+
+// The "Get numbers" button. It used to only fetch and save, which left the
+// customer un-told whenever the automatic chase had already given up — exactly
+// the case the button exists for. So it now does the same three things the
+// chase does, in the same code: ask RCUK, save what comes back, tell the
+// customer. Pressing it twice cannot send twice; the claim above sees to that.
+exports.rcukDeliverNumbers = onRequest(HTTP_OPTIONS, async (req, res) => {
+  if (handleCors(req, res)) return;
+  if (req.method !== "POST") {
+    sendJson(res, 405, { error: "POST required" });
+    return;
+  }
+
+  try {
+    const payload = getPayload(req);
+    const reportId = String(payload.report_id || payload.reportId || "").trim();
+    if (!reportId) {
+      sendJson(res, 400, { ok: false, message: "report_id is required." });
+      return;
+    }
+
+    const reportRef = db.collection("reports").doc(reportId);
+    const snap = await reportRef.get();
+    if (!snap.exists) {
+      sendJson(res, 404, { ok: false, message: "That rental report no longer exists." });
+      return;
+    }
+
+    const report = snap.data() || {};
+    const rentalId = report.details?.rentalId;
+    if (!rentalId) {
+      sendJson(res, 400, { ok: false, message: "This rental has no RCUK rental ID." });
+      return;
+    }
+
+    const alreadyNotified = Boolean(report.details?.numbersNotifiedAt);
+    let numbers = {
+      cli: report.details?.cli || "",
+      usDdi: report.details?.usDdi || "",
+      ilDdi: report.details?.ilDdi || "",
+      rcukStatus: report.details?.rcukStatus || "",
+    };
+
+    if (!numbers.cli) {
+      const result = await callRcuk(RCUK_GET_RENTAL_PATH, { rental_id: rentalId }, "GET");
+      const lookup = normalizeRentalLookup(result.data);
+      if (!result.ok || !lookup.cli) {
+        sendJson(res, 200, {
+          ok: false,
+          pending: true,
+          message: result.data?.message || "RCUK has not allocated the numbers yet. Try again shortly.",
+        });
+        return;
+      }
+      numbers = { cli: lookup.cli, usDdi: lookup.usDdi, ilDdi: lookup.ilDdi, rcukStatus: lookup.status };
+    }
+
+    const details = {
+      ...numbers,
+      numbersStatus: "delivered",
+      numbersDeliveredAt: report.details?.numbersDeliveredAt || new Date().toISOString(),
+    };
+    await reportRef.set({ details }, { merge: true });
+
+    // Whatever the chase was going to do, it is done now.
+    await db.collection(RENTAL_NUMBER_JOBS).doc(reportId).set({
+      status: "done",
+      cli: numbers.cli,
+      usDdi: numbers.usDdi,
+      completedAt: admin.firestore.FieldValue.serverTimestamp(),
+    }, { merge: true });
+
+    await deliverRentalNumbers(reportId, { ...report, details: { ...report.details, ...details } });
+
+    const after = await reportRef.get();
+    const notified = Boolean(after.data()?.details?.numbersNotifiedAt);
+    sendJson(res, 200, {
+      ok: true,
+      rentalId: String(rentalId),
+      cli: numbers.cli,
+      usDdi: numbers.usDdi,
+      ilDdi: numbers.ilDdi,
+      status: numbers.rcukStatus,
+      notified,
+      message: alreadyNotified
+        ? "Numbers saved. The customer had already been told."
+        : notified
+          ? "Numbers saved and sent to the customer."
+          : "Numbers saved. The customer is told once the rest of this batch is in.",
+    });
+  } catch (error) {
+    logger.error("rcukDeliverNumbers failed", error);
+    sendJson(res, 500, { ok: false, message: error.message || "Could not deliver the rental numbers." });
+  }
+});
+
+// Filing a rental that is live on RCUK but has no numbers starts the chase. The
+// job is keyed by report id, so a replayed offline write cannot start two.
+exports.scheduleRentalNumberChase = onDocumentCreated(
+  {
+    region: REGION,
+    document: "reports/{reportId}",
+  },
+  async (event) => {
+    const report = event.data?.data();
+    if (!report || !rentalNeedsNumbers(report)) return;
+
+    const plan = planRentalNumberChase({
+      startDate: report.details?.startDate,
+      timeZone: RENTAL_REMINDER_TIME_ZONE,
+    });
+
+    await db.collection(RENTAL_NUMBER_JOBS).doc(event.params.reportId).set({
+      reportId: event.params.reportId,
+      rentalId: report.details.rentalId,
+      batchId: report.details.rentalBatchId || "",
+      customerPhone: report.customerPhone || "",
+      method: report.details?.returnReminderPreference || "Text message",
+      mode: plan.mode,
+      status: "pending",
+      attempt: 0,
+      nextAttemptAt: admin.firestore.Timestamp.fromDate(plan.firstAttemptAt),
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    }, { merge: true });
+
+    // Which of the two waits this is, so the screen and the receipt can say
+    // "not allocated yet" instead of making a trip next month look late.
+    await event.data.ref.set({
+      details: {
+        numbersStatus: plan.mode === "scheduled" ? "scheduled" : "pending",
+        numbersDueDate: plan.windowDate || "",
+      },
+    }, { merge: true });
+  },
+);
+
+// The chase itself. A minute is the finest schedule Cloud Scheduler offers, so
+// the 30s/60s/60s ladder is "as soon after that as the sweep comes round" — the
+// job's own nextAttemptAt is what decides, not the sweep's cadence.
+exports.chaseRentalNumbers = onSchedule(
+  {
+    region: REGION,
+    schedule: "every 1 minutes",
+  },
+  async () => {
+    const snapshot = await db
+      .collection(RENTAL_NUMBER_JOBS)
+      .where("status", "==", "pending")
+      .where("nextAttemptAt", "<=", admin.firestore.Timestamp.now())
+      .orderBy("nextAttemptAt")
+      .limit(50)
+      .get();
+
+    // One at a time: RCUK is slow and rate-limited, and a batch of rentals filed
+    // together would otherwise all hit it in the same instant.
+    for (const doc of snapshot.docs) {
+      try {
+        await runRentalNumberJob(doc);
+      } catch (error) {
+        logger.error("chaseRentalNumbers job failed", { reportId: doc.id, error });
+      }
+    }
   },
 );
 

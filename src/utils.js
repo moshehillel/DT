@@ -620,30 +620,75 @@ export function calculateRentalLateFee(report, asOf = new Date()) {
   };
 }
 
+// RCUK allocates a rental's numbers about this many days before the trip starts,
+// so there is nothing to fetch — and nothing wrong — before then.
+export const RENTAL_NUMBER_LEAD_DAYS = 5;
+
+// The day RCUK is expected to have numbers for a rental starting `startDate`.
+export function rentalNumbersDueDate(startDate) {
+  if (!startDate) return "";
+  const date = new Date(`${startDate}T00:00:00`);
+  if (Number.isNaN(date.getTime())) return "";
+  date.setDate(date.getDate() - RENTAL_NUMBER_LEAD_DAYS);
+  return [
+    date.getFullYear(),
+    String(date.getMonth() + 1).padStart(2, "0"),
+    String(date.getDate()).padStart(2, "0"),
+  ].join("-");
+}
+
+// True when the trip is far enough out that RCUK has not allocated anything yet.
+// Asking now would only ever come back empty, so the screen says when to expect
+// them instead of making a rental booked a month ahead look like it failed.
+export function rentalNumbersDeferred(startDate, asOf = new Date()) {
+  const dueDate = rentalNumbersDueDate(startDate);
+  if (!dueDate) return false;
+  return startOfDay(new Date(`${dueDate}T00:00:00`)) > startOfDay(asOf);
+}
+
 export function buildAppNotifications(reports) {
   const today = startOfDay(new Date());
 
   return reports
     .filter((report) => report.type === "rental")
-    .map((report) => {
+    .flatMap((report) => {
       // Returned or cancelled: nothing to chase, so no notice.
-      if (isRentalClosed(report)) return null;
+      if (isRentalClosed(report)) return [];
 
-      const { dueDate, daysLate, weeklyFee, amount } = calculateRentalLateFee(report, today);
-      if (!dueDate) return null;
-      if (startOfDay(new Date(`${dueDate}T00:00:00`)) >= today) return null;
+      const notices = [];
 
-      const device = report.details?.model || report.details?.rentalType || "rental";
-      const lateFeePart = amount > 0
-        ? ` Late fee so far: ${formatMoney(amount)} (${daysLate} day${daysLate === 1 ? "" : "s"} × ${formatMoney(weeklyFee / 7)}/day).`
-        : "";
+      // The server asked RCUK three times and got nothing. The rental is live
+      // and the customer is holding a SIM with no number, so somebody has to
+      // fetch it by hand — that cannot sit in a delivery log nobody opens.
+      if (report.details?.numbersStatus === "failed") {
+        notices.push({
+          id: `rental-numbers-failed-${report.id}`,
+          severity: "urgent",
+          title: "Rental numbers not received",
+          message: `RCUK gave no number for rental ${report.details.rentalId || report.id}. Open it, press Get numbers, and tell ${report.customerPhone || "the customer"}.`,
+        });
+      }
 
-      return {
-        id: `rental-overdue-${report.id}`,
-        severity: "urgent",
-        title: "Rental past due",
-        message: `${report.customerPhone || "Customer"} should have returned ${device} by ${dueDate}.${lateFeePart}`,
-      };
-    })
-    .filter(Boolean);
+      const overdue = buildRentalOverdueNotice(report, today);
+      if (overdue) notices.push(overdue);
+      return notices;
+    });
+}
+
+function buildRentalOverdueNotice(report, today) {
+  const { dueDate, daysLate, weeklyFee, amount } = calculateRentalLateFee(report, today);
+  if (!dueDate) return null;
+  if (startOfDay(new Date(`${dueDate}T00:00:00`)) >= today) return null;
+
+  const device = report.details?.model || report.details?.rentalType || "rental";
+  const lateFeePart = amount > 0
+    ? ` Late fee so far: ${formatMoney(amount)} (${daysLate} day${daysLate === 1 ? "" : "s"} × ${formatMoney(weeklyFee / 7)}/day).`
+    : "";
+
+  return {
+    id: `rental-overdue-${report.id}`,
+    severity: "urgent",
+    title: "Rental past due",
+    message: `${report.customerPhone || "Customer"} should have returned ${device} by ${dueDate}.${lateFeePart}`,
+  };
 }

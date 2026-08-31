@@ -78,6 +78,8 @@ import {
   playScanBeep,
   playScanError,
   readJson,
+  rentalNumbersDeferred,
+  rentalNumbersDueDate,
   customerMatchesDigits,
   staffInitials,
   startOfDay,
@@ -2297,15 +2299,6 @@ function emptyRentalRow(defaults = {}) {
   };
 }
 
-// Days between today and the end of the rental — "Days left" in RCUK's table.
-function rentalDaysLeft(endDate) {
-  if (!endDate) return "";
-  const end = new Date(`${endDate}T00:00:00`);
-  const today = new Date();
-  today.setHours(0, 0, 0, 0);
-  return Math.round((end - today) / 86400000);
-}
-
 function RentalReportForm({
   activeEmployee,
   activeLocation,
@@ -2663,13 +2656,21 @@ function RentalReportForm({
           continue;
         }
 
-        const numbers = await postFunction("/rcukGetRental", { rental_id: data.rentalId });
+        // RCUK has nothing to give the second a SIM goes live. A trip more
+        // than five days out has no numbers allocated at all; one starting
+        // sooner takes a couple of minutes. So nobody asks here — the chase
+        // below does it while this screen is open, and the server does it
+        // regardless of whether anyone is still standing at the register.
+        const deferred = rentalNumbersDeferred(row.startDate);
         const patch = {
           rentalId: data.rentalId,
-          cli: numbers.ok ? numbers.data.cli || "" : "",
-          usDdiNumber: numbers.ok ? numbers.data.usDdi || "" : "",
+          cli: "",
+          usDdiNumber: "",
+          numbersDeferred: deferred,
           status: "active",
-          message: numbers.ok && numbers.data.cli ? "Active." : "Active — numbers still pending.",
+          message: deferred
+            ? `Active — numbers allocated ${rentalNumbersDueDate(row.startDate)}.`
+            : "Active — waiting on numbers from RCUK.",
         };
         updateRow(row.id, patch);
         activated.push({ ...row, ...patch });
@@ -2738,6 +2739,11 @@ function RentalReportForm({
           usaNumber: row.usDdi ? "Yes" : "No",
           cli: row.cli,
           usDdi: row.usDdiNumber,
+          // Which wait this rental is in, so the screen, the receipt and the
+          // notices can tell "RCUK hasn't allocated yet" from "this is late".
+          // The server overwrites it as the chase gets an answer.
+          numbersStatus: !row.rentalId ? "" : (row.cli ? "delivered" : (rentalNumbersDeferred(row.startDate) ? "scheduled" : "pending")),
+          numbersDueDate: !row.rentalId || row.cli ? "" : rentalNumbersDueDate(row.startDate),
           rcukActivated: isRcukRental ? (row.rentalId ? "Yes" : "No") : "",
           // Several SIMs rented together: the batch ties the reports (and the
           // single card charge) back to each other.
@@ -2773,11 +2779,14 @@ function RentalReportForm({
         usDdi: row.usDdiNumber,
         customerPhone: shared.customerPhone.trim(),
         price: pricing.totalPrice,
+        numbersDeferred: Boolean(row.rentalId) && !row.cli && rentalNumbersDeferred(row.startDate),
+        numbersDueDate: rentalNumbersDueDate(row.startDate),
         status: "",
       });
     });
 
     setFiled(justFiled);
+    startNumberChase();
     // Ready for the next customer. The panel above keeps the rentals that were
     // just filed, so the numbers can still be chased from here.
     setRows([emptyRentalRow()]);
@@ -2792,29 +2801,52 @@ function RentalReportForm({
   }
 
   // Ask RCUK again for one filed rental's numbers, and write them onto the saved
-  // report. The same button lives on the rental in the reports log.
-  async function fetchNumbersFor(entry) {
+  // report. The same button lives on the rental in the reports log. `auto` is
+  // the chase below asking on its own — it says so rather than telling somebody
+  // to press a button they didn't press.
+  async function fetchNumbersFor(entry, { auto = false } = {}) {
     if (!FUNCTIONS_BASE_URL || !entry.rentalId) return;
     setFiled((current) => current.map((item) => (
       item.reportId === entry.reportId ? { ...item, status: "Asking RCUK…" } : item
     )));
-    const { ok, data } = await postFunction("/rcukGetRental", { rental_id: entry.rentalId });
+    // One call does the lot: RCUK lookup, save onto the report, and tell the
+    // customer. The saving is deliberately left to the server — writing the
+    // report from here would push this register's copy back over the top of the
+    // "already told" stamp and could send the customer a second message.
+    const { ok, data } = await postFunction("/rcukDeliverNumbers", { report_id: entry.reportId });
     if (!ok || !data.cli) {
+      const waiting = auto
+        ? "Not allocated yet — asking again shortly."
+        : (data.message || "Not ready yet — try again shortly.");
       setFiled((current) => current.map((item) => (
-        item.reportId === entry.reportId
-          ? { ...item, status: data.message || "Not ready yet — try again shortly." }
-          : item
+        item.reportId === entry.reportId ? { ...item, status: waiting } : item
       )));
       return;
     }
-    onUpdateReport?.(entry.reportId, {
-      details: { cli: data.cli, usDdi: data.usDdi || "", rcukStatus: data.status || "" },
-    });
     setFiled((current) => current.map((item) => (
       item.reportId === entry.reportId
-        ? { ...item, cli: data.cli, usDdi: data.usDdi || "", status: "Numbers saved to the report." }
+        ? { ...item, cli: data.cli, usDdi: data.usDdi || "", status: data.message || "Numbers saved." }
         : item
     )));
+  }
+
+  // While the register is still on this screen, ask on the same ladder the
+  // server runs — 30 seconds after activating, then a minute later, then a
+  // minute after that — so the clerk can read the number off the screen while
+  // the customer is still standing there. Telling the customer is the server's
+  // job either way; this only fills in the panel.
+  const filedRef = useRef([]);
+  const chaseTimersRef = useRef([]);
+  useEffect(() => { filedRef.current = filed; }, [filed]);
+  useEffect(() => () => chaseTimersRef.current.forEach((timer) => window.clearTimeout(timer)), []);
+
+  function startNumberChase() {
+    chaseTimersRef.current.forEach((timer) => window.clearTimeout(timer));
+    chaseTimersRef.current = [30000, 90000, 150000].map((delay) => window.setTimeout(() => {
+      filedRef.current
+        .filter((entry) => entry.rentalId && !entry.cli && !entry.numbersDeferred)
+        .forEach((entry) => fetchNumbersFor(entry, { auto: true }));
+    }, delay));
   }
 
   const zoneFields = ["ukDays", "euDays", "wtsDays"];
@@ -2830,7 +2862,7 @@ function RentalReportForm({
         <div className="clock-pill">{formatDateTime(now)}</div>
       </div>
 
-      <div className="form-grid">
+      <div className="form-grid rental-shared-grid">
         <label className="field">
           <span>Rental region</span>
           <select
@@ -2875,7 +2907,7 @@ function RentalReportForm({
           </select>
         </label>
         <label className="field">
-          <span>Late fee per week (if overdue)</span>
+          <span>Late fee / week</span>
           <input
             inputMode="decimal"
             value={shared.lateFeeWeekly}
@@ -2885,10 +2917,6 @@ function RentalReportForm({
           {(Number.parseFloat(shared.lateFeeWeekly) || 0) > 0 ? (
             <small className="muted">{formatMoney((Number.parseFloat(shared.lateFeeWeekly) || 0) / 7)}/day after the return date</small>
           ) : null}
-        </label>
-        <label className="field">
-          <span>Served by</span>
-          <input value={activeEmployee} disabled readOnly />
         </label>
       </div>
 
@@ -2912,9 +2940,13 @@ function RentalReportForm({
                   <span className="rental-filed-numbers">
                     {entry.cli}{entry.usDdi ? ` · US ${entry.usDdi}` : ""}
                   </span>
-                ) : (
-                  <span className="muted">Numbers not back from RCUK yet.</span>
-                )}
+                ) : entry.numbersDeferred ? (
+                  <span className="muted">
+                    RCUK allocates the number on {entry.numbersDueDate} (5 days before the trip). The customer is told then.
+                  </span>
+                ) : entry.rentalId ? (
+                  <span className="muted">Waiting on RCUK. The customer is told the moment it lands.</span>
+                ) : null}
                 {entry.status ? <span className="muted">{entry.status}</span> : null}
               </div>
               {entry.cli ? (
@@ -2932,7 +2964,9 @@ function RentalReportForm({
             </div>
           ))}
           <p className="muted">
-            The numbers can also be fetched later from the rental in the reports log — open it and press Get numbers there.
+            Nobody has to wait here: the numbers are chased in the background and texted or read to the customer on the
+            reminder setting above, whether or not this screen is open. They can also be fetched by hand from the rental
+            in the reports log — open it and press Get numbers there.
           </p>
         </div>
       ) : null}
@@ -2942,11 +2976,10 @@ function RentalReportForm({
           <thead>
             <tr>
               <th className="rental-col-sim">SIM</th>
-              <th>Package</th>
+              <th className="rental-col-package">Package</th>
               <th>Start date</th>
               <th>End date</th>
               <th>Total days</th>
-              <th>Days left</th>
               <th>UK</th>
               <th>EU</th>
               <th>WTS</th>
@@ -2961,7 +2994,6 @@ function RentalReportForm({
           <tbody>
             {rows.map((row) => {
               const days = rowDays(row);
-              const left = rentalDaysLeft(row.endDate);
               const locked = Boolean(row.rentalId);
               const sim = rcukSimEntry(row.simNumber);
               const zoneOff = isRcukRental && days > 0 && rowZoneDays(row) !== days;
@@ -3027,7 +3059,7 @@ function RentalReportForm({
                       <span className={row.status === "error" ? "rental-row-msg error" : "rental-row-msg"}>{row.message}</span>
                     ) : null}
                   </td>
-                  <td>
+                  <td className="rental-col-package">
                     <select value={row.package} onChange={(event) => editRow(row.id, { package: event.target.value })} disabled={locked}>
                       {RENTAL_PACKAGES.map((entry) => <option key={entry.value}>{entry.value}</option>)}
                     </select>
@@ -3039,7 +3071,6 @@ function RentalReportForm({
                     <input type="date" value={row.endDate} onChange={(event) => editRow(row.id, { endDate: event.target.value })} readOnly={locked} />
                   </td>
                   <td className="rental-cell-computed">{days || "-"}</td>
-                  <td className="rental-cell-computed">{left === "" ? "-" : left}</td>
                   {zoneFields.map((zone) => (
                     <td key={zone}>
                       <input
@@ -7172,7 +7203,10 @@ function printRentalReceipt(report) {
     ["Model", details.model],
     ["IMEI", details.imei],
     ["SIM", details.simNumber],
-    ["Phone number", details.cli],
+    ["Phone number", details.cli
+      || (["scheduled", "pending"].includes(details.numbersStatus)
+        ? (details.numbersDueDate ? `Sent to you on ${details.numbersDueDate}` : "Sent to you shortly")
+        : "")],
     ["US number", details.usDdi && String(details.usDdi).toLowerCase() !== "no" ? details.usDdi : ""],
     ["Start", details.startDate],
     ["End", details.endDate],
@@ -7212,6 +7246,17 @@ function printRentalReceipt(report) {
 }
 
 // Texts a receipt through Telebroad (same SMS line the repair notifications use).
+// Emails a receipt from the shop's own mailbox over SMTP. This used to open
+// Gmail's web compose and rely on the cashier pressing Send there, which meant a
+// receipt was only sent if somebody remembered to finish the job.
+async function sendReceiptEmail(to, subject, body) {
+  const result = await callFunction("sendSaleReceiptEmail", { to, subject, body });
+  if (!result?.sent) {
+    throw new Error(result?.detail || "The email could not be sent.");
+  }
+  return result;
+}
+
 async function sendReceiptSms(to, body) {
   const result = await callFunction("sendSaleReceiptSms", { to, body });
   if (!result?.sent) throw new Error(result?.detail || "The text could not be sent.");
@@ -7238,36 +7283,28 @@ function SaleReceiptDialog({ sale, onClose, reprint = false }) {
     setStatus("Sent to the printer.");
   }
 
-  // Opens Gmail's web compose in a new tab, pre-addressed and pre-filled, and
-  // the cashier presses Send. A mailto: link was silently doing nothing on the
-  // kiosk, which has no mail app for Windows to hand the link to.
-  function emailReceipt() {
+  // Sends the receipt from the shop's mailbox. Nothing opens, nothing to press
+  // afterwards: pressing Send here is the whole job. If the send fails the
+  // receipt goes on the clipboard instead — it is the only copy of a sale that
+  // just took money, so it must never simply vanish.
+  async function emailReceipt() {
     const to = emailTo.trim();
     if (!to.includes("@")) {
       setStatus("Enter the customer's email address.");
       return;
     }
     const subject = `Diamant Telecom receipt ${sale.receiptCode || ""}`.trim();
-    const body = buildReceiptText(sale);
-    const compose = `https://mail.google.com/mail/?view=cm&fs=1&to=${encodeURIComponent(to)}&su=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
-    // Passing "noopener" in the feature string makes window.open return null even
-    // on success, so the old check always took the failure branch and then threw
-    // the register at a mailto: the kiosk can't handle — navigating the POS away
-    // mid-sale. Open plainly (null now really does mean blocked) and sever the
-    // opener reference by hand.
-    const tab = window.open(compose, "_blank");
-    if (tab) {
-      try {
-        tab.opener = null;
-      } catch {
-        /* cross-origin once Gmail loads; the reference is harmless either way */
-      }
-      setStatus(`Gmail opened for ${to} — press Send there.`);
-      return;
+    setSending(true);
+    setStatus("Sending...");
+    try {
+      await sendReceiptEmail(to, subject, buildReceiptText(sale));
+      setStatus(`Receipt emailed to ${to}.`);
+    } catch (error) {
+      setStatus(error.message || "The email could not be sent.");
+      copyReceipt("The email didn't go through, so the receipt is copied — paste it into an email.");
+    } finally {
+      setSending(false);
     }
-    // Genuinely blocked. Never navigate this tab: the receipt is the only copy of
-    // a sale that just took money. Put it on the clipboard instead.
-    copyReceipt("Pop-up blocked, so the receipt is copied — paste it into an email.");
   }
 
   // Backstop for when Gmail is unreachable: the whole receipt on the clipboard.
@@ -7374,7 +7411,9 @@ function SaleReceiptDialog({ sale, onClose, reprint = false }) {
                 placeholder="customer@example.com"
                 onChange={(event) => setEmailTo(event.target.value)}
               />
-              <button className="secondary-button" type="button" onClick={emailReceipt}>Open Gmail</button>
+              <button className="secondary-button" type="button" disabled={sending} onClick={emailReceipt}>
+                {sending ? "Sending…" : "Send email"}
+              </button>
               <button className="secondary-button" type="button" onClick={() => copyReceipt()}>Copy receipt</button>
             </div>
           ) : null}
@@ -8872,18 +8911,23 @@ function RentalReportActions({ report, onUpdate, activeEmployee }) {
     setBusy("numbers");
     setMessage("Fetching numbers from RCUK…");
     try {
-      const response = await fetch(`${FUNCTIONS_BASE_URL}/rcukGetRental`, {
+      const response = await fetch(`${FUNCTIONS_BASE_URL}/rcukDeliverNumbers`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ rental_id: rentalId }),
+        body: JSON.stringify({ report_id: report.id }),
       });
-      const data = await response.json();
+      const data = await response.json().catch(() => null);
+      if (!data) {
+        setMessage("The server didn't answer properly. Try again, and tell someone if it keeps happening.");
+        return;
+      }
       if (!response.ok || !data.ok || !data.cli) {
         setMessage(data.message || "Numbers are not ready yet. Try again shortly.");
         return;
       }
-      onUpdate(report.id, { details: { cli: data.cli, usDdi: data.usDdi || "", rcukStatus: data.status || "" } });
-      setMessage(`Numbers updated: ${data.cli}`);
+      // The server saved them and told the customer; the live listener brings
+      // the report up to date, so nothing is written from here.
+      setMessage(`${data.cli}${data.usDdi ? ` · US ${data.usDdi}` : ""} — ${data.message}`);
     } catch (error) {
       setMessage(error.message || "Could not reach RCUK.");
     } finally {
@@ -8912,7 +8956,11 @@ function RentalReportActions({ report, onUpdate, activeEmployee }) {
           wts_days: details.wtsDays || 0,
         }),
       });
-      const data = await response.json();
+      const data = await response.json().catch(() => null);
+      if (!data) {
+        setMessage("The server didn't answer properly, so nothing was cancelled. Try again, and tell someone if it keeps happening.");
+        return;
+      }
       if (!response.ok || !data.ok) {
         setMessage(data.message || "RCUK could not cancel the rental.");
         return;
@@ -8941,9 +8989,20 @@ function RentalReportActions({ report, onUpdate, activeEmployee }) {
       ) : (
         <>
           {!hasNumbers ? (
-            <button className="secondary-button compact-button" type="button" disabled={busy === "numbers"} onClick={getNumbers}>
-              {busy === "numbers" ? "Getting numbers…" : "Get numbers"}
-            </button>
+            <>
+              <button className="secondary-button compact-button" type="button" disabled={busy === "numbers"} onClick={getNumbers}>
+                {busy === "numbers" ? "Getting numbers…" : "Get numbers & tell customer"}
+              </button>
+              {/* The chase runs on the server, so this button is an override,
+                  not the only way the numbers ever arrive. Say which. */}
+              <span className={details.numbersStatus === "failed" ? "summary-error" : "muted"}>
+                {details.numbersStatus === "failed"
+                  ? "RCUK gave no number after three tries. Press this to fetch it and text or call the customer."
+                  : details.numbersStatus === "scheduled"
+                    ? `RCUK allocates on ${details.numbersDueDate || "5 days before the start"}. The customer is told automatically.`
+                    : "Being chased automatically. The customer is told the moment it lands."}
+              </span>
+            </>
           ) : null}
           <button className="primary-button compact-button" type="button" onClick={markReturned}>
             Mark returned
@@ -9205,6 +9264,11 @@ function ReportDetails({ report, compact }) {
         ? `${formatMoney(Number(details.lateFeeAtReturn))} (${details.lateFeeDaysAtReturn} day${Number(details.lateFeeDaysAtReturn) === 1 ? "" : "s"} late)`
         : ""],
       ["Reminder", details.returnReminderPreference],
+      ["Numbers", {
+        scheduled: `Allocated ${details.numbersDueDate || "5 days before the start"}`,
+        pending: "Waiting on RCUK",
+        failed: "RCUK gave none — fetch by hand",
+      }[details.numbersStatus] || ""],
       ["Late fee", Number(details.lateFeeWeekly) > 0
         ? `${formatMoney(Number(details.lateFeeWeekly))}/wk (${formatMoney(Number(details.lateFeeWeekly) / 7)}/day overdue)`
         : ""],
