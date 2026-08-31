@@ -60,6 +60,7 @@ import {
   digitsOnly,
   effectiveLinePrice,
   escapeHtml,
+  findBarcodeOwner,
   generateItemBarcode,
   generateReceiptCode,
   exportCsv,
@@ -6575,7 +6576,8 @@ function PosPage({ products, reports = [], storeLocations = [], activeEmployee, 
         <RestockDialog
           product={restock}
           storeLocations={storeLocations}
-          existingBarcodes={products.map((entry) => entry.barcode)}
+          products={products}
+          onSaveBarcode={(code) => onSaveProduct({ ...restock, barcode: code })}
           onClose={() => setRestock(null)}
           onAddStock={(payload) => {
             addStock(restock, payload);
@@ -7646,7 +7648,7 @@ function ImeiLotCapture({ imeis, target, onChangeImeis, blocked = [] }) {
   );
 }
 
-function RestockDialog({ product, storeLocations, existingBarcodes = [], onClose, onAddStock }) {
+function RestockDialog({ product, storeLocations, products = [], onSaveBarcode, onClose, onAddStock }) {
   const requiresImei = Boolean(product.requiresImei);
   // A phone carries its own barcode on the box: the IMEI is scanned and is
   // unique per handset, so there is nothing to generate and nothing to stick on.
@@ -7654,7 +7656,7 @@ function RestockDialog({ product, storeLocations, existingBarcodes = [], onClose
   const [quantity, setQuantity] = useState("0");
   const [imeis, setImeis] = useState([]);
   const [location, setLocation] = useState(product.location || "");
-  const [barcode, setBarcode] = useState("");
+  const [barcode, setBarcode] = useState(product.barcode || "");
   const stores = storeLocations || [];
   const currentStock = requiresImei ? product.imeis?.length || 0 : Number(product.quantity) || 0;
 
@@ -7662,6 +7664,11 @@ function RestockDialog({ product, storeLocations, existingBarcodes = [], onClose
     event.preventDefault();
     if (needsBarcode && !barcode.trim()) {
       window.alert("Add a barcode for this item before adding stock.");
+      return;
+    }
+    const clash = findBarcodeOwner(products, barcode, { ignoreId: product.id, ignoreSku: product.sku });
+    if (clash) {
+      window.alert(`Barcode ${barcode.trim()} is already on "${clash.name}". Two items cannot share one barcode — they would ring up as each other.`);
       return;
     }
     if (!location) {
@@ -7725,14 +7732,21 @@ function RestockDialog({ product, storeLocations, existingBarcodes = [], onClose
                 <button
                   className="secondary-button compact-button"
                   type="button"
-                  onClick={() => setBarcode(generateItemBarcode(existingBarcodes))}
+                  onClick={() => {
+                    const code = generateItemBarcode(products.map((entry) => entry.barcode));
+                    setBarcode(code);
+                    // Saved onto the item now, not on submit: the labels are
+                    // printed from this dialog, and a sticker carrying a code
+                    // that was never saved scans to nothing.
+                    onSaveBarcode?.(code);
+                  }}
                 >
                   Generate
                 </button>
               </div>
               <small className="muted">
-                Scan the maker's barcode if the box has one. If it doesn't, Generate makes one for this item and you
-                stick the printed label on.
+                Scan the maker's barcode if the box has one. If it doesn't, Generate makes one and saves it to this
+                item for good — every future restock prints the same code, so the stickers always match.
               </small>
             </label>
           ) : null}
@@ -7855,6 +7869,11 @@ function InventoryPage({
     }
     if (!form.location) {
       window.alert("Pick the store this stock belongs to.");
+      return;
+    }
+    const clash = findBarcodeOwner(products, form.barcode, { ignoreId: form.id, ignoreSku: form.sku });
+    if (clash) {
+      window.alert(`Barcode ${form.barcode.trim()} is already on "${clash.name}". Two items cannot share one barcode — they would ring up as each other.`);
       return;
     }
     if (form.requiresImei) {
@@ -7991,13 +8010,16 @@ function InventoryPage({
           />
           {/* IMEI-tracked items are phones: each handset already carries a
               unique barcode, so there is nothing to make up or stick on. */}
-          {!form.requiresImei ? (
+          {/* Only when the item has none. A barcode already on an item is
+              printed on stickers out on the shelf, so replacing it would strand
+              every one of them. */}
+          {!form.requiresImei && !form.barcode.trim() ? (
             <button
               className="secondary-button compact-button"
               type="button"
               onClick={() => updateField("barcode", generateItemBarcode(products.map((entry) => entry.barcode)))}
             >
-              {form.barcode ? "Regenerate" : "Generate"}
+              Generate
             </button>
           ) : null}
         </div>
@@ -8218,7 +8240,8 @@ function InventoryPage({
         <RestockDialog
           product={restock}
           storeLocations={storeLocations}
-          existingBarcodes={products.map((entry) => entry.barcode)}
+          products={products}
+          onSaveBarcode={(code) => onSaveProduct({ ...restock, barcode: code })}
           onClose={() => setRestock(null)}
           onAddStock={(payload) => addStock(restock, payload)}
         />

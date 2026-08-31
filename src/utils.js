@@ -561,6 +561,26 @@ export function generateItemBarcode(taken = []) {
   return `DT${Date.now().toString(36).toUpperCase().slice(-8)}`;
 }
 
+// The item, if any, already using this barcode — ignoring the item being edited
+// and every other row of the same item, which legitimately share one code across
+// stores. Two different items sharing a barcode would ring up as each other at
+// the till, so this is checked on every path that can set one: typed, scanned,
+// or generated.
+export function findBarcodeOwner(products, barcode, { ignoreId = "", ignoreSku = "" } = {}) {
+  const clean = String(barcode || "").trim().toUpperCase();
+  if (!clean) return null;
+  return (products || []).find((product) => {
+    if (!product) return false;
+    if (ignoreId && product.id === ignoreId) return false;
+    // The same item stocked at two stores is two rows sharing a SKU. That is one
+    // item, so it is meant to carry one barcode.
+    if (ignoreSku && String(product.sku || "").trim().toUpperCase() === String(ignoreSku).trim().toUpperCase()) {
+      return false;
+    }
+    return String(product.barcode || "").trim().toUpperCase() === clean;
+  }) || null;
+}
+
 // Minimal Code128-B barcode renderer (no dependencies). Returns an SVG string
 // that scans with a standard 1D laser scanner.
 const CODE128_PATTERNS = [
