@@ -540,6 +540,27 @@ export function generateReceiptCode() {
   return crypto.randomUUID().replace(/-/g, "").slice(0, 8).toUpperCase();
 }
 
+// A barcode for an item that arrived without one. Deliberately short: Code128
+// grows wider with every character and the label has to fit a small sticker, so
+// ten characters is the budget. The "DT" prefix marks it as ours, so a code we
+// printed can never be mistaken for a real UPC off a manufacturer's box.
+//
+// `taken` is every barcode already in the catalog: two items sharing a code
+// would ring up as each other at the till, which is the one failure that must
+// not happen.
+export function generateItemBarcode(taken = []) {
+  const used = new Set(
+    taken.map((code) => String(code || "").trim().toUpperCase()).filter(Boolean),
+  );
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    const code = `DT${crypto.randomUUID().replace(/-/g, "").slice(0, 8).toUpperCase()}`;
+    if (!used.has(code)) return code;
+  }
+  // 50 collisions against random 8-hex is not going to happen, but a barcode
+  // must still come back rather than nothing.
+  return `DT${Date.now().toString(36).toUpperCase().slice(-8)}`;
+}
+
 // Minimal Code128-B barcode renderer (no dependencies). Returns an SVG string
 // that scans with a standard 1D laser scanner.
 const CODE128_PATTERNS = [

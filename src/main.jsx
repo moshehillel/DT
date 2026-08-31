@@ -60,6 +60,7 @@ import {
   digitsOnly,
   effectiveLinePrice,
   escapeHtml,
+  generateItemBarcode,
   generateReceiptCode,
   exportCsv,
   localPhoneDigits,
@@ -6557,6 +6558,7 @@ function PosPage({ products, reports = [], storeLocations = [], activeEmployee, 
         <RestockDialog
           product={restock}
           storeLocations={storeLocations}
+          existingBarcodes={products.map((entry) => entry.barcode)}
           onClose={() => setRestock(null)}
           onAddStock={(payload) => {
             addStock(restock, payload);
@@ -6941,6 +6943,76 @@ function openThermalReceipt(title, css, bodyHtml) {
       function closeReceipt(){ try { window.close(); } catch (e) {} }
       window.onafterprint = closeReceipt;
       window.onload = function () { window.focus(); window.print(); setTimeout(closeReceipt, 60000); };
+    <\/script>
+    </body></html>`);
+  printWindow.document.close();
+}
+
+// Shelf labels for an item, one sticker per label. Sized for the 50mm x 25mm
+// (2" x 1") stock these printers are usually loaded with: @page carries the size
+// and each label is its own page, so a label printer feeds one at a time instead
+// of trying to lay several out on a sheet.
+//
+// Nothing is chosen here — this opens the browser's print dialog, which is where
+// the sticker machine gets picked, so it works with whatever is plugged in.
+function printItemLabels({ name, price, barcode, copies = 1 }) {
+  const code = String(barcode || "").trim();
+  if (!code) return;
+  // A slip of the quantity box must not send a thousand stickers through.
+  const count = Math.max(1, Math.min(200, Number(copies) || 1));
+  const priceText = Number(price) > 0 ? formatMoney(Number(price)) : "";
+  // moduleWidth 1 keeps the SVG's own coordinates small; the CSS below scales it
+  // to the sticker, and the bar widths stay in proportion, which is all a
+  // scanner cares about.
+  const svg = code128Svg(code, { moduleWidth: 1, height: 40 });
+
+  const label = `<div class="label">
+      <div class="label-name">${escapeHtml(name || "")}</div>
+      <div class="label-code">${svg}</div>
+      <div class="label-foot"><span>${escapeHtml(code)}</span><strong>${escapeHtml(priceText)}</strong></div>
+    </div>`;
+
+  const css = `
+    @page { size: 50mm 25mm; margin: 0; }
+    html, body { margin: 0; padding: 0; background: #fff; }
+    .label {
+      box-sizing: border-box;
+      width: 50mm; height: 25mm;
+      padding: 1.5mm 2mm;
+      display: flex; flex-direction: column;
+      align-items: center; justify-content: center; gap: 0.6mm;
+      overflow: hidden;
+      font-family: Arial, Helvetica, sans-serif;
+      page-break-after: always; break-after: page;
+    }
+    .label:last-child { page-break-after: auto; break-after: auto; }
+    /* One line only: a long product name must not push the barcode off the
+       sticker, so it is clipped rather than wrapped. */
+    .label-name {
+      max-width: 100%; font-size: 7pt; font-weight: 700; text-align: center;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+    .label-code svg { display: block; width: 44mm; height: 9mm; }
+    .label-foot {
+      display: flex; justify-content: space-between; align-items: baseline;
+      width: 100%; font-size: 6.5pt; letter-spacing: 0.3px;
+    }
+    .label-foot strong { font-size: 9pt; }`;
+
+  const printWindow = window.open("", "_blank", "width=420,height=560");
+  if (!printWindow) {
+    window.alert("The label window was blocked. Allow pop-ups for this site, then press Print labels again.");
+    return;
+  }
+  printWindow.document.write(`<!doctype html><html><head><meta charset="utf-8" />
+    <title>${escapeHtml(`${count} label${count === 1 ? "" : "s"} - ${name || code}`)}</title>
+    <style>${css}</style>
+    </head>
+    <body>${Array.from({ length: count }, () => label).join("")}
+    <script>
+      function closeLabels(){ try { window.close(); } catch (e) {} }
+      window.onafterprint = closeLabels;
+      window.onload = function () { window.focus(); window.print(); setTimeout(closeLabels, 60000); };
     <\/script>
     </body></html>`);
   printWindow.document.close();
@@ -7557,9 +7629,11 @@ function ImeiLotCapture({ imeis, target, onChangeImeis, blocked = [] }) {
   );
 }
 
-function RestockDialog({ product, storeLocations, onClose, onAddStock }) {
+function RestockDialog({ product, storeLocations, existingBarcodes = [], onClose, onAddStock }) {
   const requiresImei = Boolean(product.requiresImei);
-  const needsBarcode = !product.barcode;
+  // A phone carries its own barcode on the box: the IMEI is scanned and is
+  // unique per handset, so there is nothing to generate and nothing to stick on.
+  const needsBarcode = !product.barcode && !requiresImei;
   const [quantity, setQuantity] = useState("0");
   const [imeis, setImeis] = useState([]);
   const [location, setLocation] = useState(product.location || "");
@@ -7590,6 +7664,23 @@ function RestockDialog({ product, storeLocations, onClose, onAddStock }) {
     onClose();
   }
 
+  const labelCode = (product.barcode || barcode).trim();
+  const labelCount = Math.max(0, Number(quantity) || 0);
+
+  // One sticker per unit going on the shelf — that is the whole point of
+  // printing them here rather than somewhere else.
+  function printLabels() {
+    if (!labelCode) {
+      window.alert("Generate or scan a barcode first.");
+      return;
+    }
+    if (!labelCount) {
+      window.alert("Enter how many units you are adding — that is how many labels print.");
+      return;
+    }
+    printItemLabels({ name: product.name, price: product.price, barcode: labelCode, copies: labelCount });
+  }
+
   return (
     <div className="dialog-backdrop" role="presentation">
       <div className="dialog-card dialog-card-wide" role="dialog" aria-modal="true">
@@ -7605,15 +7696,27 @@ function RestockDialog({ product, storeLocations, onClose, onAddStock }) {
           {needsBarcode ? (
             <label className="field full">
               <span>Barcode (required — this item has none)</span>
-              <input
-                value={barcode}
-                onChange={(event) => setBarcode(event.target.value)}
-                placeholder="Scan or type the item's barcode"
-                autoComplete="off"
-                spellCheck={false}
-                autoFocus
-              />
-              <small className="muted">Add a barcode so this item can be scanned at POS and on orders.</small>
+              <div className="barcode-field-row">
+                <input
+                  value={barcode}
+                  onChange={(event) => setBarcode(event.target.value)}
+                  placeholder="Scan or type the item's barcode"
+                  autoComplete="off"
+                  spellCheck={false}
+                  autoFocus
+                />
+                <button
+                  className="secondary-button compact-button"
+                  type="button"
+                  onClick={() => setBarcode(generateItemBarcode(existingBarcodes))}
+                >
+                  Generate
+                </button>
+              </div>
+              <small className="muted">
+                Scan the maker's barcode if the box has one. If it doesn't, Generate makes one for this item and you
+                stick the printed label on.
+              </small>
             </label>
           ) : null}
           <label className="field">
@@ -7652,8 +7755,19 @@ function RestockDialog({ product, storeLocations, onClose, onAddStock }) {
           ) : null}
           <div className="pos-form-actions">
             <button className="primary-button" type="submit">Add to stock</button>
+            {!requiresImei ? (
+              <button className="secondary-button" type="button" onClick={printLabels}>
+                Print {labelCount || ""} label{labelCount === 1 ? "" : "s"}
+              </button>
+            ) : null}
             <button className="secondary-button" type="button" onClick={onClose}>Cancel</button>
           </div>
+          {!requiresImei ? (
+            <p className="field-hint full">
+              Printing opens the normal print window — pick the sticker machine there. One label per unit added,
+              with the item name above the barcode and the price beside it.
+            </p>
+          ) : null}
         </form>
       </div>
     </div>
@@ -7850,13 +7964,44 @@ function InventoryPage({
       </label>
       <label className="field">
         <span>Barcode</span>
-        <input
-          value={form.barcode}
-          onChange={(event) => updateField("barcode", event.target.value)}
-          placeholder="Scan UPC / EAN (optional)"
-          autoComplete="off"
-          spellCheck={false}
-        />
+        <div className="barcode-field-row">
+          <input
+            value={form.barcode}
+            onChange={(event) => updateField("barcode", event.target.value)}
+            placeholder={form.requiresImei ? "The IMEI is the barcode" : "Scan UPC / EAN, or generate one"}
+            autoComplete="off"
+            spellCheck={false}
+          />
+          {/* IMEI-tracked items are phones: each handset already carries a
+              unique barcode, so there is nothing to make up or stick on. */}
+          {!form.requiresImei ? (
+            <button
+              className="secondary-button compact-button"
+              type="button"
+              onClick={() => updateField("barcode", generateItemBarcode(products.map((entry) => entry.barcode)))}
+            >
+              {form.barcode ? "Regenerate" : "Generate"}
+            </button>
+          ) : null}
+        </div>
+        {!form.requiresImei && form.barcode ? (
+          <button
+            className="secondary-button compact-button"
+            type="button"
+            onClick={() => {
+              const copies = window.prompt("How many labels?", "1");
+              if (copies === null) return;
+              printItemLabels({
+                name: form.name,
+                price: form.price,
+                barcode: form.barcode.trim(),
+                copies: Number(copies) || 1,
+              });
+            }}
+          >
+            Print labels
+          </button>
+        ) : null}
       </label>
       <label className="field">
         <span>Name</span>
@@ -8056,6 +8201,7 @@ function InventoryPage({
         <RestockDialog
           product={restock}
           storeLocations={storeLocations}
+          existingBarcodes={products.map((entry) => entry.barcode)}
           onClose={() => setRestock(null)}
           onAddStock={(payload) => addStock(restock, payload)}
         />
