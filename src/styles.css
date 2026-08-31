@@ -1110,6 +1110,13 @@ button:active {
   font-weight: 650;
 }
 
+.rental-filed-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: none;
+}
+
 /* A barcode box with its Generate button beside it, not under it. */
 .barcode-field-row {
   display: flex;

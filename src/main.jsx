@@ -2771,9 +2771,13 @@ function RentalReportForm({
       if (row.rentalPhoneId && onIssueRentalPhone) {
         onIssueRentalPhone(row.rentalPhoneId, { reportId: report.id, customerPhone: shared.customerPhone });
       }
-      printRentalReceipt(report);
       justFiled.push({
         reportId: report.id,
+        // Kept so the receipt can be printed from the panel below on request.
+        // Nothing prints on its own: at this moment RCUK usually has not given
+        // the numbers yet, so an automatic receipt went out with the one line
+        // the customer actually needed left blank.
+        report,
         rentalId: row.rentalId,
         simNumber: report.details.simNumber,
         cli: row.cli,
@@ -2950,18 +2954,31 @@ function RentalReportForm({
                 ) : null}
                 {entry.status ? <span className="muted">{entry.status}</span> : null}
               </div>
-              {entry.cli ? (
-                <span className="status-pill returned">Numbers in</span>
-              ) : (
+              <div className="rental-filed-actions">
+                {entry.cli ? (
+                  <span className="status-pill returned">Numbers in</span>
+                ) : (
+                  <button
+                    className="secondary-button compact-button"
+                    type="button"
+                    onClick={() => fetchNumbersFor(entry)}
+                    disabled={!entry.rentalId}
+                  >
+                    Get numbers
+                  </button>
+                )}
                 <button
                   className="secondary-button compact-button"
                   type="button"
-                  onClick={() => fetchNumbersFor(entry)}
-                  disabled={!entry.rentalId}
+                  onClick={() => printRentalReceipt({
+                    ...entry.report,
+                    // Whatever numbers are on screen now go on the paper.
+                    details: { ...entry.report.details, cli: entry.cli || "", usDdi: entry.usDdi || "" },
+                  })}
                 >
-                  Get numbers
+                  Print receipt
                 </button>
-              )}
+              </div>
             </div>
           ))}
           <p className="muted">
@@ -9124,6 +9141,11 @@ function RentalReportActions({ report, onUpdate, activeEmployee }) {
     <div className="rental-actions">
       <button className="secondary-button compact-button" type="button" onClick={() => setEditing(true)}>
         Edit rental
+      </button>
+      {/* Always available, including after the rental is back: a customer can
+          ask for the paperwork at any point. */}
+      <button className="secondary-button compact-button" type="button" onClick={() => printRentalReceipt(report)}>
+        Print receipt
       </button>
       {cancelled ? (
         <span className="status-pill returned">Cancelled</span>
