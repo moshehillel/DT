@@ -10,6 +10,7 @@ import {
   collection,
   deleteDoc,
   doc,
+  getDoc,
   getDocs,
   initializeFirestore,
   limit,
@@ -27,6 +28,9 @@ import { getFunctions, httpsCallable } from "firebase/functions";
 import { normalizeFirestoreDoc } from "./utils";
 
 let firebasePromise;
+// The resolved handles, kept so `currentAuthUid` below can answer without
+// awaiting anything. Set once, the first time the SDK finishes initialising.
+let firebaseHandles = null;
 
 function firebaseUnavailable() {
   const error = new Error(
@@ -69,6 +73,10 @@ async function getFirebase() {
           }),
           functions: getFunctions(app),
         };
+      })
+      .then((handles) => {
+        firebaseHandles = handles;
+        return handles;
       });
   }
 
@@ -198,15 +206,86 @@ export async function callFunction(name, data) {
   return result.data;
 }
 
-export async function attachAuthMetadata(data) {
+// Who is signed in, right now, without waiting for anything.
+export function currentAuthUid() {
+  return firebaseHandles?.auth?.currentUser?.uid || "";
+}
+
+// Stamp a record with who filed it — synchronously, on purpose.
+//
+// This used to await `ensureFirebaseAuth()`, which sat in front of every save in
+// the app: a repair, a sale, a return reached React state (and therefore the
+// Firestore write and the offline outbox) only after auth answered. That is up
+// to ten seconds, and if the page went away in the meantime — a reload, the
+// kiosk shortcut restarting, the tab closed after the print dialog — it never
+// happened at all. In that window the record existed nowhere: not in state, not
+// in the outbox, not in the cloud. A repair's label had already printed and gone
+// onto the customer's phone, so the shop believed it was booked in, and the
+// ticket number it carried was still free for the next customer to be given.
+//
+// The uid is a nicety. The record is the point, so the record goes first: this
+// reads the user the SDK already has, and records an empty id in the rare case
+// it has none rather than making the save wait for one.
+export function stampAuthMetadata(data) {
+  return { ...data, servedByEmployeeId: currentAuthUid() || data.servedByEmployeeId || "" };
+}
+
+// How long to wait for the server to answer a ticket claim before giving up on
+// it. Offline, Firestore holds the write and the promise simply never settles,
+// so an unbounded wait would leave every intake's claim hanging forever.
+const TICKET_CLAIM_TIMEOUT_MS = 6000;
+const CLAIM_TIMEOUT = Symbol("claim-timeout");
+
+function withClaimTimeout(work) {
+  const timeout = new Promise((resolve) => setTimeout(() => resolve(CLAIM_TIMEOUT), TICKET_CLAIM_TIMEOUT_MS));
+  // The work is still owed to the server either way; only our waiting stops.
+  work.catch(() => {});
+  return Promise.race([work, timeout]);
+}
+
+// Claim a repair ticket number for one repair. Resolves "taken" when another
+// register already owns the number, "claimed" when this one got it, and
+// "unconfirmed" when nothing could be established — offline intake still has to
+// hand the customer a numbered label, so an unanswered claim never blocks
+// anything. The caller renumbers only on "taken".
+//
+// The existing document is looked for before writing, rather than reading the
+// write's own failure, because `permission-denied` alone cannot tell "that
+// number is already someone's" from "these rules were never deployed". Guessing
+// wrong the second way would renumber every repair in the shop, so a claim that
+// cannot even be read is reported as unconfirmed and the duplicate check in the
+// app stays in charge.
+export async function claimRepairTicket(ticketNumber, reportId) {
+  const number = String(ticketNumber || "").trim();
+  if (!number) return "unconfirmed";
+
+  let ticketRef;
   try {
-    const user = await ensureFirebaseAuth();
-    return {
-      ...data,
-      servedByEmployeeId: user?.uid || data.servedByEmployeeId || "",
-    };
-  } catch {
-    return data;
+    const { db } = await getFirebase();
+    ticketRef = doc(db, "repairTickets", number);
+    const existing = await withClaimTimeout(getDoc(ticketRef));
+    if (existing === CLAIM_TIMEOUT) return "unconfirmed";
+    if (existing.exists()) return "taken";
+  } catch (error) {
+    if (error?.code !== "permission-denied") logSyncError("Firestore repair ticket read failed", error);
+    return "unconfirmed";
+  }
+
+  try {
+    const written = await withClaimTimeout(setDoc(ticketRef, {
+      reportId: String(reportId || ""),
+      claimedBy: currentAuthUid(),
+      claimedAt: new Date().toISOString(),
+    }));
+    // Offline, Firestore holds the write and answers nobody. It will land on the
+    // number this repair is already using, which is the outcome we wanted anyway.
+    return written === CLAIM_TIMEOUT ? "unconfirmed" : "claimed";
+  } catch (error) {
+    // The read above found nothing, so a refusal now is the rules refusing to let
+    // an existing document be overwritten: another register claimed it in between.
+    if (error?.code === "permission-denied") return "taken";
+    logSyncError("Firestore repair ticket claim failed", error);
+    return "unconfirmed";
   }
 }
 

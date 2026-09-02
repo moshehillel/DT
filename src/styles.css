@@ -723,6 +723,13 @@ button:active {
   line-height: 1.4;
 }
 
+/* The relabel warning carries its own way out — the button sits on the line with
+   the text rather than under it. */
+.cloud-offline-banner button {
+  margin-left: 10px;
+  vertical-align: middle;
+}
+
 /* Amber, not red: the data is safe on this machine, it just hasn't uploaded. */
 .cloud-pending-banner {
   margin-bottom: 12px;
@@ -4542,6 +4549,26 @@ input.rental-cell-num {
   margin: 10px 0 16px;
 }
 
+/* Scanning the handset is the fast way onto a line: one barcode brings the phone
+   and the SIM that lives in it, so neither number is read off a tray and typed. */
+.rental-scan {
+  display: flex;
+  align-items: flex-end;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin: 4px 0 12px;
+}
+
+.rental-scan .field {
+  flex: 1 1 320px;
+  margin: 0;
+}
+
+/* What the last scan did, on its own line under the box. */
+.rental-scan .rental-row-msg {
+  flex: 1 1 100%;
+}
+
 /* The one button that checks, charges, activates and files. */
 .rental-run {
   display: grid;
@@ -4640,4 +4667,13 @@ input.rental-cell-num {
 .rental-filed-numbers {
   font-weight: 800;
   color: #14603f;
+}
+
+/* A repair whose customer has been told nothing yet. Not an error — plenty of
+   repairs are too fresh to have anything to say — but it should catch the eye of
+   whoever is working the queue. */
+.repair-not-notified {
+  font-size: 12px;
+  font-weight: 650;
+  color: #9a5b00;
 }

@@ -704,6 +704,26 @@ async function logNotification(reportId, report, status, detail) {
   });
 }
 
+// Record on the repair itself that the customer was told something, and how it
+// went. Successful texts were deliberately left unlogged to save writes, which
+// meant the shop had no way to answer "has this customer been called yet?" — the
+// one thing the counter is asked all day. This is one merge onto the document
+// that already exists, and it re-enters `notifyRepairDelivered` harmlessly: that
+// trigger only acts on a status transition, and this changes no status.
+async function stampRepairNotice(reportRef, kind, method, status) {
+  try {
+    await reportRef.set({
+      details: {
+        notices: {
+          [kind]: { method: method || "", status, at: new Date().toISOString() },
+        },
+      },
+    }, { merge: true });
+  } catch (error) {
+    logger.error("stampRepairNotice failed", error);
+  }
+}
+
 async function writeNotificationLog(logId, reportId, report, method, status, detail, type) {
   await db.collection("notificationLogs").doc(logId).set({
     reportId,
@@ -738,12 +758,14 @@ exports.notifyRepairReceived = onDocumentCreated(
     const body = buildRepairReceivedMessage(report);
     try {
       const result = await sendSms({ to, body });
-      // Only log failures; a successful text needs no record.
+      await stampRepairNotice(event.data.ref, "received", "Text message", result.status);
+      // Only log failures; a successful text needs no record beyond the stamp.
       if (result.status !== "Sent") {
         await logNotification(event.params.reportId, report, result.status, result.detail);
       }
     } catch (error) {
       logger.error("notifyRepairReceived failed", error);
+      await stampRepairNotice(event.data.ref, "received", "Text message", "Failed");
       await logNotification(event.params.reportId, report, "Failed", error.message);
     }
   },
@@ -771,15 +793,17 @@ exports.notifyRepairDelivered = onDocumentUpdated(
       return;
     }
 
-    const sendOne = async (method, body) => {
+    const sendOne = async (kind, method, body) => {
       try {
         const result = await sendCustomerNotification({ to, method, body });
-        // Only log failures; a successful text needs no record.
+        await stampRepairNotice(event.data.after.ref, kind, method, result.status);
+        // Only log failures; a successful text needs no record beyond the stamp.
         if (result.status !== "Sent") {
           await logNotification(event.params.reportId, after, result.status, result.detail);
         }
       } catch (error) {
         logger.error("notifyRepairDelivered failed", error);
+        await stampRepairNotice(event.data.after.ref, kind, method, "Failed");
         await logNotification(event.params.reportId, after, "Failed", error.message);
       }
     };
@@ -791,13 +815,13 @@ exports.notifyRepairDelivered = onDocumentUpdated(
           ? ` Amount due: $${(Number(amountDue) || 0).toFixed(2)}.`
           : "";
       const body = `Diamant Telecom: repair ticket ${after.details?.ticketNumber || ""} for ${after.details?.model || "your phone"} is ready for pickup.${dueText}`;
-      await sendOne(after.details?.notificationPreference || "Text message", body);
+      await sendOne("ready", after.details?.notificationPreference || "Text message", body);
     }
 
     if (becamePaid) {
       const ticket = after.details?.ticketNumber ? ` ticket ${after.details.ticketNumber}` : "";
       const model = after.details?.model || "your phone";
-      await sendOne("Text message", `Diamant Telecom: payment for your ${model} repair${ticket} is marked paid. Thank you!`);
+      await sendOne("paid", "Text message", `Diamant Telecom: payment for your ${model} repair${ticket} is marked paid. Thank you!`);
     }
   },
 );

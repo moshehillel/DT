@@ -33,8 +33,8 @@ import {
 } from "./constants";
 import { useCloudCollectionState, useCloudDocumentState } from "./hooks/useCloudState";
 import {
-  attachAuthMetadata,
   callFunction,
+  claimRepairTicket,
   deleteCustomerDoc,
   ensureFirebaseAuth,
   findCustomerByPhone,
@@ -44,6 +44,7 @@ import {
   sendReset,
   signInWithEmail,
   signOutUser,
+  stampAuthMetadata,
   subscribeAuth,
   subscribeCloudStatus,
 } from "./firebaseClient";
@@ -55,6 +56,7 @@ import {
   calculateRentalLateFee,
   calculateRentalPrice,
   calculateReturnDueDate,
+  cleanRepairFixes,
   code128Svg,
   createEmptyFilters,
   digitsOnly,
@@ -82,6 +84,8 @@ import {
   readJson,
   rentalNumbersDeferred,
   rentalNumbersDueDate,
+  repairFixesTotal,
+  repairTotals,
   customerMatchesDigits,
   staffInitials,
   startOfDay,
@@ -355,6 +359,18 @@ function Workspace({ currentUser, isAdmin }) {
     const visibleReportIds = new Set(reports.map((report) => report.id));
     return notifications.filter((notice) => visibleReportIds.has(notice.reportId));
   }, [notifications, reports]);
+  // The log as it stands right now, for callbacks that fire long after the render
+  // that scheduled them — a ticket claim coming back from the server, say.
+  const reportsRef = useRef(reports);
+  useEffect(() => { reportsRef.current = reports; }, [reports]);
+
+  // Repairs whose printed label no longer matches the number they are filed
+  // under, because the number turned out to be another register's.
+  const relabelRepairs = useMemo(
+    () => reports.filter((report) => report.type === "repair" && report.details?.ticketReprintNeeded),
+    [reports],
+  );
+
   const rentalNotices = useMemo(() => buildAppNotifications(reports), [reports]);
   const appNotifications = useMemo(
     () => rentalNotices.filter((notice) => !dismissedNotices.includes(notice.id)),
@@ -613,8 +629,8 @@ function Workspace({ currentUser, isAdmin }) {
     setProducts((current) => current.filter((item) => item.id !== productId));
   }
 
-  async function savePosSale(sale) {
-    const enriched = await attachAuthMetadata(sale);
+  function savePosSale(sale) {
+    const enriched = stampAuthMetadata(sale);
     // Pass the details captured at checkout so this never files a nameless record.
     upsertCustomer({
       phone: sale.customerPhone,
@@ -644,18 +660,30 @@ function Workspace({ currentUser, isAdmin }) {
     );
   }
 
-  async function saveReport(report) {
-    const enriched = await attachAuthMetadata({
+  // Files the report and returns it. Nothing may be awaited before `setReports`:
+  // that call is what puts the report in the log, in localStorage and in the
+  // queue for Firestore, and until it runs the report exists only as an argument.
+  // Repairs printed a numbered label the moment this was called, so a save that
+  // never got that far left a ticket stuck on a customer's phone with no repair
+  // behind it — and left its number free for the next customer to be given too.
+  // Returning the report is how the caller knows there is something to print.
+  function saveReport(report) {
+    const filed = stampAuthMetadata({
       ...report,
       location: report.location || activeLocation,
     });
+    setReports((current) => [filed, ...current]);
+    setFormNonce((value) => value + 1);
+    if (filed.type === "repair" && filed.details?.ticketNumber) {
+      claimTicketFor(filed.id, filed.details.ticketNumber);
+    }
+    // The customer record is a side errand — it must not gate the report.
     upsertCustomer({
       phone: report.customerPhone,
       name: report.details?.customerName || report.details?.callerName,
       address: report.details?.address,
     });
-    setReports((current) => [enriched, ...current]);
-    setFormNonce((value) => value + 1);
+    return filed;
   }
 
   async function claimPendingReport(pendingReportId) {
@@ -696,8 +724,8 @@ function Workspace({ currentUser, isAdmin }) {
     });
   }
 
-  async function savePendingReport(pendingReportId, completedReport) {
-    const enriched = await attachAuthMetadata({
+  function savePendingReport(pendingReportId, completedReport) {
+    const enriched = stampAuthMetadata({
       ...completedReport,
       location: completedReport.location || completedReport.details?.location || activeLocation,
     });
@@ -837,12 +865,12 @@ function Workspace({ currentUser, isAdmin }) {
 
   // `payment` is what the driver collected at the door on a collect-on-delivery
   // order; prepaid orders arrive here with it already recorded by the store.
-  async function completePhoneOrder(orderId, payment = null) {
+  function completePhoneOrder(orderId, payment = null) {
     const order = phoneOrders.find((item) => item.id === orderId);
     if (!order) return;
 
     const deliveredAt = new Date().toISOString();
-    const completedReport = await attachAuthMetadata({
+    const completedReport = stampAuthMetadata({
       id: order.id,
       type: "phoneOrder",
       createdAt: deliveredAt,
@@ -936,13 +964,16 @@ function Workspace({ currentUser, isAdmin }) {
     const report = reports.find((item) => item.id === reportId);
     const oldStatus = report?.details?.status;
     const amount = String(finalPrice ?? "").trim();
+    // The final price is for the job the phone came in for. Anything else found
+    // on the bench was priced separately and is still owed with it.
+    const owed = amount ? String((Number(amount) || 0) + repairFixesTotal(report?.details?.additionalFixes)) : "";
 
     setReports((current) =>
       current.map((item) =>
         item.id === reportId
           ? {
               ...item,
-              paymentAmount: amount || item.paymentAmount,
+              paymentAmount: owed || item.paymentAmount,
               details: { ...item.details, status: "Ready", finalPrice: amount },
             }
           : item,
@@ -991,6 +1022,102 @@ function Workspace({ currentUser, isAdmin }) {
     );
   }
 
+  // --- Repair ticket numbers -------------------------------------------------
+  // The number is worked out from this register's copy of the log, so two
+  // registers filing at the same moment can both reach for it. `repairTickets`
+  // in Firestore settles that: the number is a document id, the rules allow a
+  // create and refuse an update, and the register that loses is told so.
+  //
+  // The claim runs *behind* the save, never in front of it — nothing may stand
+  // between the submit and the filed report (see `saveReport`), and intake has to
+  // work with no network at all. So the repair is filed and its label printed on
+  // this register's own reckoning, and if the server later says the number
+  // belonged to someone else, the repair moves to the next free number and the
+  // banner asks the counter to reprint that one label.
+  function claimTicketFor(reportId, ticketNumber, attempt = 0) {
+    if (!ticketNumber) return;
+    claimRepairTicket(ticketNumber, reportId).then((result) => {
+      // "unconfirmed" is the offline case: the duplicate net below is what
+      // catches those, once the registers can see each other's work again.
+      if (result !== "taken") return;
+      if (attempt >= 3) return;
+      renumberRepair(reportId, attempt + 1);
+    });
+  }
+
+  // Move a repair off a number that turned out to be someone else's. The old
+  // number stays on the record: it is printed on a label stuck to a phone, and
+  // the repair has to stay findable by it.
+  function renumberRepair(reportId, attempt = 0) {
+    const current = reportsRef.current;
+    const report = current.find((entry) => entry.id === reportId);
+    if (!report) return;
+    const from = String(report.details?.ticketNumber || "");
+    const to = generateRepairTicketNumber(current);
+    if (!to || to === from) return;
+    setReports((list) =>
+      list.map((entry) => (entry.id === reportId
+        ? {
+          ...entry,
+          ticketDigits: digitsOnly(to),
+          details: {
+            ...entry.details,
+            ticketNumber: to,
+            ticketDigits: digitsOnly(to),
+            // What is printed on the phone. A second renumber before anyone has
+            // reprinted must not overwrite the number actually stuck to it.
+            ticketNumberWas: entry.details?.ticketReprintNeeded
+              ? (entry.details?.ticketNumberWas || from)
+              : from,
+            // The label on the phone is now wrong. Say so until someone reprints.
+            ticketReprintNeeded: true,
+          },
+        }
+        : entry)),
+    );
+    claimTicketFor(reportId, to, attempt);
+  }
+
+  // The net under the claim, for everything the claim can't see: a register that
+  // was offline at intake, or two that filed before either could hear the other.
+  // One ticket number on two repairs is exactly the state that let a customer's
+  // phone go missing behind another customer's ticket, so it is never left to
+  // sit — the repair that had the number first keeps it, every later one moves.
+  // Sorting by creation makes every register agree on which is which without
+  // having to ask, so they all compute the same answer and converge.
+  useEffect(() => {
+    const byNumber = new Map();
+    reports.forEach((report) => {
+      if (report.type !== "repair") return;
+      const number = String(report.details?.ticketNumber || "").trim();
+      if (!number) return;
+      if (!byNumber.has(number)) byNumber.set(number, []);
+      byNumber.get(number).push(report);
+    });
+    for (const group of byNumber.values()) {
+      if (group.length < 2) continue;
+      const ordered = [...group].sort((left, right) =>
+        String(left.createdAt).localeCompare(String(right.createdAt))
+        || String(left.id).localeCompare(String(right.id)));
+      // One per pass: renumbering changes the log, this runs again on the next
+      // one, and it stops when no number is shared.
+      renumberRepair(ordered[ordered.length - 1].id);
+      return;
+    }
+  }, [reports]);
+
+  // The banner's way out: reprint the sticker that is now wrong, and stop asking.
+  function reprintRepairLabel(reportId) {
+    const report = reportsRef.current.find((entry) => entry.id === reportId);
+    if (!report) return;
+    printRepairPhoneLabel(report);
+    setReports((list) =>
+      list.map((entry) => (entry.id === reportId
+        ? { ...entry, details: { ...entry.details, ticketReprintNeeded: false } }
+        : entry)),
+    );
+  }
+
   // --- Rental phone fleet ----------------------------------------------------
   function saveRentalPhone(phone) {
     const imei = digitsOnly(phone?.imei);
@@ -1001,6 +1128,10 @@ function Workspace({ currentUser, isAdmin }) {
       id: phone.id || existing?.id || crypto.randomUUID(),
       name: name || existing?.name || "Phone",
       imei,
+      // The SIM that lives in this handset. Scanning the phone onto a rental
+      // fills this into the SIM box: what goes out is the number physically in
+      // the phone, so nobody reads it off the tray and types it again.
+      simNumber: normalizeRcukSimNumber(phone?.simNumber ?? existing?.simNumber ?? ""),
       status: phone.status || existing?.status || RENTAL_PHONE_IN_STORE,
       rentalReportId: phone.rentalReportId ?? existing?.rentalReportId ?? "",
       customerPhone: phone.customerPhone ?? existing?.customerPhone ?? "",
@@ -1221,7 +1352,7 @@ function Workspace({ currentUser, isAdmin }) {
     setReturnTarget(match);
   }
 
-  async function processReturn(original, selection) {
+  function processReturn(original, selection) {
     const returnLines = (selection.returnLines || []).filter((line) => Number(line.returnQty) > 0);
     if (!returnLines.length) return;
 
@@ -1240,7 +1371,7 @@ function Workspace({ currentUser, isAdmin }) {
       .join(", ");
     const imeiLine = returnLines.find((line) => line.requiresImei && line.imei);
 
-    const returnReport = await attachAuthMetadata({
+    const returnReport = stampAuthMetadata({
       id: crypto.randomUUID(),
       type: "return",
       source: "return",
@@ -1368,6 +1499,21 @@ function Workspace({ currentUser, isAdmin }) {
             automatically once the connection is back — don't wipe this browser's data. Check the internet/filter.
           </div>
         ) : null}
+        {relabelRepairs.map((repair) => (
+          <div className="cloud-offline-banner" role="alert" key={repair.id}>
+            ⚠️ Ticket <strong>{repair.details?.ticketNumberWas}</strong> was issued on two registers at once.{" "}
+            {repair.details?.customerName || repair.customerPhone || "This repair"}
+            {repair.details?.model ? ` (${repair.details.model})` : ""} is now ticket{" "}
+            <strong>{repair.details?.ticketNumber}</strong> — the label on the phone is wrong.
+            <button
+              className="secondary-button compact-button"
+              type="button"
+              onClick={() => reprintRepairLabel(repair.id)}
+            >
+              Reprint label
+            </button>
+          </div>
+        ))}
         {reportsPendingSync > 0 ? (
           <div className="cloud-pending-banner" role="status">
             ⏳ {reportsPendingSync} {reportsPendingSync === 1 ? "sale is" : "sales are"} still waiting to upload to the cloud.
@@ -1899,9 +2045,17 @@ function ReportForm({ activeType, activeEmployee, activeLocation, reports, activ
   const [resolvedCustomer, setResolvedCustomer] = useState(null);
   const [paymentAmount, setPaymentAmount] = useState("");
   const [repairPriceHint, setRepairPriceHint] = useState("");
+  // A phone often arrives with more than one thing wrong. Each extra job is
+  // priced on its own here, so the ticket the customer takes away already lists
+  // everything that was agreed at the counter instead of only the first job.
+  const [extraFixes, setExtraFixes] = useState([]);
   const repairSelectionRef = useRef({ model: "", damage: "" });
   const config = reportTypes[activeType];
   const isRepair = activeType === "repair";
+  const cleanFixes = cleanRepairFixes(extraFixes);
+  const fixesTotal = repairFixesTotal(cleanFixes);
+  // The quote is the job on the form plus every extra agreed with it.
+  const quotedTotal = (Number(paymentAmount) || 0) + fixesTotal;
   const [fieldValues, setFieldValues] = useState(() => buildInitialFieldValues(config));
 
   useEffect(() => {
@@ -1977,6 +2131,7 @@ function ReportForm({ activeType, activeEmployee, activeLocation, reports, activ
       details.hadSim = formData.get("hadSim") === "on";
       details.hadSdCard = formData.get("hadSdCard") === "on";
       details.borrowedTempPhone = formData.get("borrowedTempPhone") === "on";
+      details.additionalFixes = cleanFixes;
       details.ticketNumber = generateRepairTicketNumber(reports);
       details.ticketDigits = digitsOnly(details.ticketNumber);
       // The intake amount is the quote; the real price is set when the repair is
@@ -2021,7 +2176,11 @@ function ReportForm({ activeType, activeEmployee, activeLocation, reports, activ
       location: activeLocation || "",
       customerPhone: String(formData.get("customerPhone") || "").trim(),
       customerPhoneDigits: digitsOnly(formData.get("customerPhone")),
-      paymentAmount: String(formData.get("paymentAmount") || "").trim(),
+      // For a repair this is what the customer owes: the quoted job plus the
+      // extras agreed with it. `details.estimatedPrice` keeps the base on its own.
+      paymentAmount: isRepair && fixesTotal
+        ? String(quotedTotal)
+        : String(formData.get("paymentAmount") || "").trim(),
       paymentMethod: String(formData.get("paymentMethod") || "").trim(),
       notes: String(formData.get("notes") || "").trim(),
       details,
@@ -2031,11 +2190,15 @@ function ReportForm({ activeType, activeEmployee, activeLocation, reports, activ
       savedReport.ticketDigits = details.ticketDigits;
     }
 
-    onSave(savedReport);
+    const filed = onSave(savedReport);
     if (activeType === "repair") {
+      if (!filed) {
+        window.alert("This repair was not saved, so nothing was printed. Try again.");
+        return;
+      }
       // Small label to stick on the phone, then the full customer ticket.
-      printRepairPhoneLabel(savedReport);
-      printRepairTicket(savedReport);
+      printRepairPhoneLabel(filed);
+      printRepairTicket(filed);
     }
   }
 
@@ -2077,6 +2240,11 @@ function ReportForm({ activeType, activeEmployee, activeLocation, reports, activ
             />
             {isRepair && repairPriceHint ? (
               <small className="field-hint">{repairPriceHint}</small>
+            ) : null}
+            {isRepair && fixesTotal ? (
+              <small className="field-hint">
+                Plus {formatMoney(fixesTotal)} of extra fixes — {formatMoney(quotedTotal)} quoted in all.
+              </small>
             ) : null}
           </label>
 
@@ -2130,6 +2298,16 @@ function ReportForm({ activeType, activeEmployee, activeLocation, reports, activ
                 autoComplete="off"
               />
             </label>
+          </div>
+        ) : null}
+
+        {isRepair ? (
+          <div className="form-grid">
+            <RepairFixesEditor
+              fixes={extraFixes}
+              onChange={setExtraFixes}
+              summary={fixesTotal ? `Extras ${formatMoney(fixesTotal)} · quoted in all ${formatMoney(quotedTotal)}` : ""}
+            />
           </div>
         ) : null}
 
@@ -2327,7 +2505,12 @@ function RentalReportForm({
   const [rows, setRows] = useState(() => [emptyRentalRow()]);
   const [card, setCard] = useState({ status: "idle", message: "", refNum: "", cardType: "", maskedCardNumber: "" });
   const [run, setRun] = useState({ status: "idle", message: "" });
-  const [addPhoneRow, setAddPhoneRow] = useState("");
+  // The line an unknown scanned handset is being registered for, plus the IMEI
+  // the scanner already read so the dialog opens with it filled in.
+  const [addPhone, setAddPhone] = useState(null);
+  const [scan, setScan] = useState("");
+  const [scanNote, setScanNote] = useState({ tone: "", text: "" });
+  const scanRef = useRef(null);
   // The rentals this screen has just filed. RCUK rarely has the numbers ready
   // the second a SIM is activated, so they stay on screen with a way to ask
   // again — the report is updated in place when they come back.
@@ -2377,20 +2560,23 @@ function RentalReportForm({
     }
   }
 
-  function addRow(count = 1) {
+  // A new row inherits the trip from the one above it — people renting
+  // together are travelling together.
+  function tripDefaults() {
     const last = rows[rows.length - 1];
-    // A new row inherits the trip from the one above it — people renting
-    // together are travelling together.
-    const defaults = last
-      ? {
-        package: last.package,
-        startDate: last.startDate,
-        endDate: last.endDate,
-        ukDays: last.ukDays,
-        euDays: last.euDays,
-        wtsDays: last.wtsDays,
-      }
-      : {};
+    if (!last) return {};
+    return {
+      package: last.package,
+      startDate: last.startDate,
+      endDate: last.endDate,
+      ukDays: last.ukDays,
+      euDays: last.euDays,
+      wtsDays: last.wtsDays,
+    };
+  }
+
+  function addRow(count = 1) {
+    const defaults = tripDefaults();
     setRows((current) => [...current, ...Array.from({ length: count }, () => emptyRentalRow(defaults))]);
   }
 
@@ -2437,12 +2623,82 @@ function RentalReportForm({
     (phone) => phone.status !== RENTAL_PHONE_WITH_CUSTOMER || pickedPhoneIds.includes(phone.id),
   );
 
-  function selectFleetPhone(rowId, phoneId) {
-    const phone = rentalPhones.find((entry) => entry.id === phoneId);
+  // Putting a handset on a line brings the SIM in it along: a rental phone goes
+  // out with its own SIM, and that is the number being rented. A number already
+  // typed on the line is left alone — whoever typed it had the SIM in hand, and
+  // the fleet list can be out of date. `known` is for a phone saved a moment ago,
+  // which the fleet list held by this screen has not caught up with yet.
+  function selectFleetPhone(rowId, phoneId, known = null) {
+    const phone = known || rentalPhones.find((entry) => entry.id === phoneId);
+    const row = rows.find((entry) => entry.id === rowId);
+    const fillsSim = Boolean(phone?.simNumber) && !digitsOnly(row?.simNumber);
     editRow(rowId, {
       rentalPhoneId: phoneId,
       model: phone?.name || "",
       imei: phone?.imei || "",
+      ...(fillsSim ? { simNumber: phone.simNumber } : {}),
+    });
+    return { phone, filledSim: fillsSim };
+  }
+
+  // Where a scanned handset lands: the first line that hasn't gone to RCUK and
+  // has no phone on it, or a new line if every one is spoken for.
+  function rowForScan() {
+    const open = rows.find((row) => !row.rentalId && !row.rentalPhoneId);
+    if (open) return open.id;
+    const created = emptyRentalRow(tripDefaults());
+    setRows((current) => [...current, created]);
+    return created.id;
+  }
+
+  // The fast way to hand a phone over: scan the barcode on it — the IMEI, or the
+  // SIM number saved against it — and the handset goes on a rental line with its
+  // SIM in the SIM box, which fires the RCUK check by itself.
+  function scanRentalPhone(event) {
+    event.preventDefault();
+    const code = digitsOnly(scan);
+    if (!code) return;
+    setScan("");
+    scanRef.current?.focus();
+
+    const phone = rentalPhones.find((entry) => digitsOnly(entry.imei) === code)
+      || rentalPhones.find((entry) => entry.simNumber
+        && normalizeRcukSimNumber(entry.simNumber) === normalizeRcukSimNumber(code));
+
+    if (!phone) {
+      // Not in the fleet yet. Rather than send whoever is at the counter to
+      // another screen, it is registered here and lands on the rental anyway.
+      playScanError();
+      setScanNote({ tone: "error", text: `${code} isn't in the fleet — add it here and it goes straight on the rental.` });
+      setAddPhone({ rowId: rowForScan(), imei: code });
+      return;
+    }
+
+    const already = rows.find((row) => row.rentalPhoneId === phone.id);
+    // Scanned twice — the second beep shouldn't look like it did nothing new.
+    if (already && digitsOnly(already.simNumber)) {
+      playScanBeep();
+      setScanNote({ tone: "ok", text: `${phone.name} is already on this rental.` });
+      return;
+    }
+    if (!already && phone.status === RENTAL_PHONE_WITH_CUSTOMER) {
+      playScanError();
+      setScanNote({
+        tone: "error",
+        text: `${phone.name} is out with ${phone.customerPhone || "a customer"} — mark it back in store first.`,
+      });
+      return;
+    }
+
+    const { filledSim } = selectFleetPhone(already?.id || rowForScan(), phone.id);
+    playScanBeep();
+    setScanNote({
+      tone: "ok",
+      text: filledSim
+        ? `${phone.name} · SIM …${normalizeRcukSimNumber(phone.simNumber).slice(-6)} — both filled in.`
+        : phone.simNumber
+          ? `${phone.name} added. The SIM already on that line was left as it is.`
+          : `${phone.name} added. No SIM is saved against this phone — type the SIM number in.`,
     });
   }
 
@@ -2990,6 +3246,26 @@ function RentalReportForm({
         </div>
       ) : null}
 
+      <form className="rental-scan" onSubmit={scanRentalPhone}>
+        <label className="field">
+          <span>Scan a rental phone</span>
+          <input
+            ref={scanRef}
+            value={scan}
+            onChange={(event) => { setScan(event.target.value); setScanNote({ tone: "", text: "" }); }}
+            placeholder="Scan the phone — it fills in the handset and the SIM in it"
+            inputMode="numeric"
+            autoComplete="off"
+            spellCheck={false}
+            disabled={busy}
+          />
+        </label>
+        <button className="secondary-button" type="submit" disabled={busy || !digitsOnly(scan)}>Add to a line</button>
+        {scanNote.text ? (
+          <span className={scanNote.tone === "error" ? "rental-row-msg error" : "rental-row-msg ok"}>{scanNote.text}</span>
+        ) : null}
+      </form>
+
       <div className="rental-rows-wrap">
         <table className="rental-rows">
           <thead>
@@ -3117,7 +3393,7 @@ function RentalReportForm({
                       value={row.rentalPhoneId}
                       onChange={(event) => {
                         const value = event.target.value;
-                        if (value === "__add__") { setAddPhoneRow(row.id); return; }
+                        if (value === "__add__") { setAddPhone({ rowId: row.id, imei: "" }); return; }
                         selectFleetPhone(row.id, value);
                       }}
                       disabled={locked}
@@ -3206,14 +3482,17 @@ function RentalReportForm({
         </p>
       </div>
 
-      {addPhoneRow ? (
+      {addPhone ? (
         <AddRentalPhoneDialog
           existingPhones={rentalPhones}
-          onClose={() => setAddPhoneRow("")}
+          initialImei={addPhone.imei}
+          onClose={() => setAddPhone(null)}
           onAdd={(phone) => {
             const saved = onSaveRentalPhone?.(phone);
-            if (saved) selectFleetPhone(addPhoneRow, saved.id);
-            setAddPhoneRow("");
+            // The saved record itself, not a lookup: the fleet list this screen
+            // is holding was read before the phone existed.
+            if (saved) selectFleetPhone(addPhone.rowId, saved.id, saved);
+            setAddPhone(null);
           }}
         />
       ) : null}
@@ -3249,9 +3528,22 @@ function DialogCloseButton({ onClose, label = "Close" }) {
   );
 }
 
-function AddRentalPhoneDialog({ existingPhones = [], onAdd, onClose }) {
+// A SIM lives in one phone. Two handsets carrying the same number would each
+// claim it, and scanning either would fill a rental in with the wrong one.
+function fleetSimOwner(phones, simNumber, ignoreId = "") {
+  const clean = normalizeRcukSimNumber(simNumber);
+  if (!clean) return null;
+  return phones.find(
+    (phone) => phone.id !== ignoreId && normalizeRcukSimNumber(phone.simNumber) === clean,
+  ) || null;
+}
+
+function AddRentalPhoneDialog({ existingPhones = [], initialImei = "", onAdd, onClose }) {
   const [name, setName] = useState("");
-  const [imei, setImei] = useState("");
+  // Opened by a scan that found nothing in the fleet: the IMEI is already read,
+  // so only the name is left to fill in.
+  const [imei, setImei] = useState(initialImei);
+  const [simNumber, setSimNumber] = useState("");
   const [error, setError] = useState("");
 
   function submit(event) {
@@ -3263,7 +3555,12 @@ function AddRentalPhoneDialog({ existingPhones = [], onAdd, onClose }) {
       setError("That IMEI is already in the fleet.");
       return;
     }
-    onAdd({ name: name.trim(), imei: cleanImei });
+    const simClash = fleetSimOwner(existingPhones, simNumber);
+    if (simClash) {
+      setError(`That SIM is already saved against ${simClash.name}. Take it off that phone first.`);
+      return;
+    }
+    onAdd({ name: name.trim(), imei: cleanImei, simNumber });
   }
 
   return createPortal(
@@ -3276,7 +3573,7 @@ function AddRentalPhoneDialog({ existingPhones = [], onAdd, onClose }) {
           </div>
           <DialogCloseButton onClose={onClose} label="Close add a phone" />
         </div>
-        <form className="form-grid dialog-form" onSubmit={submit}>
+        <form className="form-grid dialog-form" onSubmit={submit} onKeyDown={preventEnterSubmit}>
           <label className="field full">
             <span>IMEI</span>
             <input
@@ -3286,7 +3583,7 @@ function AddRentalPhoneDialog({ existingPhones = [], onAdd, onClose }) {
               autoComplete="off"
               spellCheck={false}
               placeholder="Scan the IMEI"
-              autoFocus
+              autoFocus={!initialImei}
             />
           </label>
           <label className="field full">
@@ -3295,6 +3592,18 @@ function AddRentalPhoneDialog({ existingPhones = [], onAdd, onClose }) {
               value={name}
               onChange={(event) => { setName(event.target.value); setError(""); }}
               placeholder="e.g. Nokia 105 — blue"
+              autoFocus={Boolean(initialImei)}
+            />
+          </label>
+          <label className="field full">
+            <span>SIM in this phone (optional)</span>
+            <input
+              value={simNumber}
+              onChange={(event) => { setSimNumber(event.target.value); setError(""); }}
+              inputMode="numeric"
+              autoComplete="off"
+              spellCheck={false}
+              placeholder="Scan the SIM — scanning this phone later fills it in for you"
             />
           </label>
           {error ? <p className="summary-error full">{error}</p> : null}
@@ -3614,6 +3923,8 @@ function OpenRepairsPage({ reports, employees = [], storeTax = [], activeTaxRate
     ? allOpenRepairs.filter((repair) => {
         const haystack = [
           repair.details?.ticketNumber,
+          // A renumbered repair still has its first number stuck to the phone.
+          repair.details?.ticketNumberWas,
           repair.details?.customerName,
           repair.customerPhone,
           repair.location,
@@ -3753,6 +4064,7 @@ function OpenRepairsPage({ reports, employees = [], storeTax = [], activeTaxRate
               <th>Technician</th>
               <th>Served by</th>
               <th>Status</th>
+              <th>Notify</th>
               <th></th>
             </tr>
           </thead>
@@ -3761,6 +4073,8 @@ function OpenRepairsPage({ reports, employees = [], storeTax = [], activeTaxRate
               openRepairs.map((repair) => {
                 const isPaid = repair.details?.paymentStatus === "Paid";
                 const isCharging = paying.id === repair.id && paying.status === "charging";
+                const totals = repairTotals(repair);
+                const notified = describeRepairNotices(repair.details);
                 return (
                   <tr key={repair.id}>
                     <td>
@@ -3776,15 +4090,31 @@ function OpenRepairsPage({ reports, employees = [], storeTax = [], activeTaxRate
                       {repair.details?.customerName && repair.customerPhone ? (
                         <div className="muted">{repair.customerPhone}</div>
                       ) : null}
+                      {/* The number to actually call about this phone, which is
+                          often not the one the ticket was taken on. */}
+                      {repair.details?.customerMobile ? (
+                        <div className="muted">Mobile {repair.details.customerMobile}</div>
+                      ) : null}
                     </td>
                     <td>{repair.details?.model || "-"}</td>
-                    <td>{repair.details?.damage || "-"}</td>
+                    <td>
+                      <div>{repair.details?.damage || "-"}</div>
+                      {totals.fixes.map((fix, index) => (
+                        <div className="muted" key={index}>
+                          + {fix.description || "Extra fix"}
+                          {fix.price ? ` · ${formatMoney(Number(fix.price) || 0)}` : ""}
+                        </div>
+                      ))}
+                    </td>
                     <td>
                       <div>{formatPayment(repair.paymentAmount)} · {isPaid ? "Paid" : "Not paid"}{repair.paymentMethod ? ` · ${repair.paymentMethod}` : ""}</div>
                       <div className="muted">
                         {repair.details?.finalPrice
                           ? `Final ${formatPayment(repair.details.finalPrice)}`
                           : `Est. ${formatPayment(repair.details?.estimatedPrice || repair.paymentAmount)}`}
+                        {totals.fixesTotal
+                          ? ` + extras ${formatMoney(totals.fixesTotal)} = ${formatMoney(totals.total)}`
+                          : ""}
                       </div>
                       {isPaid ? null : (
                         <div className="pos-row-actions">
@@ -3830,8 +4160,25 @@ function OpenRepairsPage({ reports, employees = [], storeTax = [], activeTaxRate
                       </select>
                     </td>
                     <td>
+                      {/* What the customer asked for at drop-off, and whether the
+                          shop has actually sent it. */}
+                      <div>{repair.details?.notificationPreference || "Text message"}</div>
+                      <div className={notified ? "muted" : "repair-not-notified"}>
+                        {notified || "Nothing sent yet"}
+                      </div>
+                    </td>
+                    <td className="pos-row-actions">
                       <button className="secondary-button compact-button" type="button" onClick={() => setEditing(repair)}>
                         Edit
+                      </button>
+                      {/* A finished repair is a sale like any other — the customer
+                          can be handed a receipt for what they paid. */}
+                      <button
+                        className="secondary-button compact-button"
+                        type="button"
+                        onClick={() => printRepairReceipt(repair)}
+                      >
+                        Receipt
                       </button>
                     </td>
                   </tr>
@@ -3839,7 +4186,7 @@ function OpenRepairsPage({ reports, employees = [], storeTax = [], activeTaxRate
               })
             ) : (
               <tr>
-                <td colSpan="11" className="empty-state">
+                <td colSpan="12" className="empty-state">
                   {query ? "No repairs match your search." : "No open repairs."}
                 </td>
               </tr>
@@ -3885,6 +4232,58 @@ function OpenRepairsPage({ reports, employees = [], storeTax = [], activeTaxRate
   );
 }
 
+// Extra jobs on the same handset, each described and priced on its own. A phone
+// arrives with two things wrong as often as one, so this sits on the intake
+// screen as well as the bench: the ticket the customer walks away with should
+// already list everything that was agreed at the counter.
+function RepairFixesEditor({ fixes, onChange, summary }) {
+  function setFix(index, patch) {
+    onChange(fixes.map((fix, position) => (position === index ? { ...fix, ...patch } : fix)));
+  }
+
+  return (
+    <div className="field full repair-fixes">
+      <span className="repair-fixes-label">Additional fixes on this phone</span>
+      {fixes.length ? (
+        fixes.map((fix, index) => (
+          <div className="repair-fix-row" key={index}>
+            <input
+              value={fix.description}
+              placeholder="What else is being fixed?"
+              onChange={(event) => setFix(index, { description: event.target.value })}
+            />
+            <input
+              value={fix.price}
+              inputMode="decimal"
+              placeholder="0.00"
+              onChange={(event) => setFix(index, { price: event.target.value })}
+            />
+            <button
+              className="secondary-button compact-button"
+              type="button"
+              onClick={() => onChange(fixes.filter((_, position) => position !== index))}
+            >
+              Remove
+            </button>
+          </div>
+        ))
+      ) : (
+        <p className="muted">No extra fixes on this ticket yet.</p>
+      )}
+      <div className="repair-fixes-footer">
+        <button
+          className="secondary-button compact-button"
+          type="button"
+          onClick={() => onChange([...fixes, { description: "", price: "" }])}
+        >
+          + Add another fix
+        </button>
+        {summary ? <span className="muted">{summary}</span> : null}
+      </div>
+    </div>
+  );
+}
+
 function EditRepairDialog({ repair, employees = [], onSave, onClose }) {
   const details = repair.details || {};
   const [form, setForm] = useState({
@@ -3912,24 +4311,21 @@ function EditRepairDialog({ repair, employees = [], onSave, onClose }) {
 
   const set = (name, value) => setForm((current) => ({ ...current, [name]: value }));
 
-  function setFix(index, patch) {
-    setExtraFixes((current) => current.map((fix, i) => (i === index ? { ...fix, ...patch } : fix)));
-  }
-
-  const cleanFixes = extraFixes
-    .map((fix) => ({ description: fix.description.trim(), price: String(fix.price ?? "").trim() }))
-    .filter((fix) => fix.description || fix.price);
+  const cleanFixes = cleanRepairFixes(extraFixes);
   // What every job on the ticket adds up to, so the tech can see the number
   // before deciding what to put in Final price.
-  const fixesTotal = cleanFixes.reduce((sum, fix) => sum + (Number(fix.price) || 0), 0);
+  const fixesTotal = repairFixesTotal(cleanFixes);
   const basePrice = Number(form.finalPrice || form.estimatedPrice) || 0;
   const combinedTotal = basePrice + fixesTotal;
 
   function submit(event) {
     event.preventDefault();
     event.stopPropagation();
-    // Final price, once set, is the amount owed — mirror it to paymentAmount.
-    const amount = String(form.finalPrice ?? "").trim() || String(form.estimatedPrice ?? "").trim();
+    // What the customer owes is every job on the ticket, not only the one the
+    // phone came in for. The extras are priced one by one and added in here, so
+    // the payment dialog and the receipt charge the number the tech is looking at
+    // rather than the base price on its own.
+    const amount = combinedTotal ? String(combinedTotal) : "";
     onSave({
       customerPhone: form.customerPhone.trim(),
       paymentMethod: form.paymentMethod,
@@ -3999,49 +4395,11 @@ function EditRepairDialog({ repair, employees = [], onSave, onClose }) {
               {["Text message", "Phone call", "Both"].map((option) => <option key={option}>{option}</option>)}
             </select>
           </label>
-          <div className="field full repair-fixes">
-            <span className="repair-fixes-label">Additional fixes on this phone</span>
-            {extraFixes.length ? (
-              extraFixes.map((fix, index) => (
-                <div className="repair-fix-row" key={index}>
-                  <input
-                    value={fix.description}
-                    placeholder="What else is being fixed?"
-                    onChange={(event) => setFix(index, { description: event.target.value })}
-                  />
-                  <input
-                    value={fix.price}
-                    inputMode="decimal"
-                    placeholder="0.00"
-                    onChange={(event) => setFix(index, { price: event.target.value })}
-                  />
-                  <button
-                    className="secondary-button compact-button"
-                    type="button"
-                    onClick={() => setExtraFixes((current) => current.filter((_, i) => i !== index))}
-                  >
-                    Remove
-                  </button>
-                </div>
-              ))
-            ) : (
-              <p className="muted">No extra fixes on this ticket yet.</p>
-            )}
-            <div className="repair-fixes-footer">
-              <button
-                className="secondary-button compact-button"
-                type="button"
-                onClick={() => setExtraFixes((current) => [...current, { description: "", price: "" }])}
-              >
-                + Add another fix
-              </button>
-              {cleanFixes.length ? (
-                <span className="muted">
-                  Extras {formatMoney(fixesTotal)} · all jobs {formatMoney(combinedTotal)}
-                </span>
-              ) : null}
-            </div>
-          </div>
+          <RepairFixesEditor
+            fixes={extraFixes}
+            onChange={setExtraFixes}
+            summary={cleanFixes.length ? `Extras ${formatMoney(fixesTotal)} · all jobs ${formatMoney(combinedTotal)}` : ""}
+          />
           <label className="field full"><span>Notes</span><textarea rows={2} value={form.notes} onChange={(event) => set("notes", event.target.value)} /></label>
           <div className="pos-form-actions form-actions-row">
             <button className="primary-button" type="submit">Save changes</button>
@@ -4052,7 +4410,15 @@ function EditRepairDialog({ repair, employees = [], onSave, onClose }) {
               type="button"
               onClick={() => printRepairPhoneLabel({
                 ...repair,
-                details: { ...details, model: form.model, imei: form.imei, damage: form.damage, devicePin: form.devicePin },
+                notes: form.notes,
+                details: {
+                  ...details,
+                  model: form.model,
+                  imei: form.imei,
+                  damage: form.damage,
+                  devicePin: form.devicePin,
+                  additionalFixes: cleanFixes,
+                },
               })}
             >
               Print phone label
@@ -4077,8 +4443,9 @@ function RepairPaymentDialog({ repair, taxRate = 0, paying, onConfirm, onClose }
     0,
   );
   const basePrice = Number(details.finalPrice || details.estimatedPrice || repair.paymentAmount) || 0;
-  const suggested = Number(repair.paymentAmount) || basePrice;
   const withFixes = basePrice + fixesTotal;
+  // Every job on the ticket, which is what the customer is actually here to pay.
+  const suggested = withFixes || Number(repair.paymentAmount) || basePrice;
 
   const [amount, setAmount] = useState(suggested ? String(suggested) : "");
   const [method, setMethod] = useState(repair.paymentMethod || "");
@@ -7201,6 +7568,8 @@ function printPhoneOrderReceipt(order) {
 function printRepairPhoneLabel(report) {
   const details = report.details || {};
   const customer = [details.customerName, report.customerPhone].filter(Boolean).join(" · ");
+  // Every job on the ticket belongs on the phone, not just the one it came in for.
+  const fixLines = cleanRepairFixes(details.additionalFixes).map((fix) => fix.description).filter(Boolean);
 
   const css = `
     .eyebrow { text-align: center; font-size: 13px; font-weight: 700; text-transform: uppercase; letter-spacing: 1px; }
@@ -7209,7 +7578,10 @@ function printRepairPhoneLabel(report) {
     .row { font-size: 15px; font-weight: 600; margin: 1mm 0; }
     .row strong { display: inline-block; min-width: 14mm; font-weight: 800; }
     .issue { font-size: 17px; font-weight: 800; margin-top: 2mm; }
-    .pin { font-size: 20px; font-weight: 800; margin-top: 2mm; letter-spacing: 1px; }`;
+    .pin { font-size: 20px; font-weight: 800; margin-top: 2mm; letter-spacing: 1px; }
+    /* Whatever was written about this phone, in full — the bench reads it off
+       the handset, not off a screen, so it must not be cut short. */
+    .label-notes { font-size: 14px; font-weight: 600; margin-top: 2mm; line-height: 1.35; white-space: pre-wrap; }`;
   const body = `
     <div class="eyebrow">Repair — stick on phone</div>
     <div class="ticket">${escapeHtml(details.ticketNumber || "")}</div>
@@ -7218,9 +7590,78 @@ function printRepairPhoneLabel(report) {
     ${details.model ? `<div class="row"><strong>Model</strong> ${escapeHtml(details.model)}</div>` : ""}
     ${details.imei ? `<div class="row"><strong>IMEI</strong> ${escapeHtml(details.imei)}</div>` : ""}
     ${details.damage ? `<div class="issue">Issue: ${escapeHtml(details.damage)}</div>` : ""}
-    ${details.devicePin ? `<div class="pin">PIN: ${escapeHtml(details.devicePin)}</div>` : ""}`;
+    ${fixLines.map((line) => `<div class="issue">Also: ${escapeHtml(line)}</div>`).join("")}
+    ${details.devicePin ? `<div class="pin">PIN: ${escapeHtml(details.devicePin)}</div>` : ""}
+    ${report.notes ? `<div class="label-notes">${escapeHtml(report.notes)}</div>` : ""}`;
 
   openThermalReceipt(`Repair label ${details.ticketNumber || ""}`, css, body);
+}
+
+// The receipt for a repair that is done: what was fixed, what each job cost, and
+// what was paid. The intake ticket above is a claim check — this is the proof of
+// purchase, and a customer who paid for a repair is owed one the same as a
+// customer who bought a charger.
+function printRepairReceipt(report) {
+  const details = report.details || {};
+  const totals = repairTotals(report);
+  const paidAt = details.paidAt || details.completedAt || report.createdAt;
+  const location = report.location || details.location || "";
+  const taxAmount = Number(details.taxAmount) || 0;
+  const grandTotal = taxAmount > 0 ? totals.total + taxAmount : totals.total;
+
+  const jobRows = [
+    [details.damage || "Repair", totals.base],
+    ...totals.fixes.map((fix) => [fix.description || "Additional fix", Number(fix.price) || 0]),
+  ]
+    .filter(([label, amount]) => label || amount)
+    .map(([label, amount]) =>
+      `<tr><td>${escapeHtml(label)}</td><td style="text-align:right">${escapeHtml(formatMoney(amount))}</td></tr>`)
+    .join("");
+
+  const infoRows = [
+    ["Ticket", details.ticketNumber],
+    ["Model", details.model],
+    ["IMEI", details.imei],
+    ["Taken in", formatShortDate(report.createdAt)],
+    ["Technician", details.technician],
+    ["Served by", staffInitials(report.servedBy)],
+  ]
+    .filter(([, value]) => value)
+    .map(([label, value]) =>
+      `<tr><td>${escapeHtml(label)}</td><td style="text-align:right">${escapeHtml(String(value))}</td></tr>`)
+    .join("");
+
+  const css = `
+    .eyebrow { text-align: center; font-size: 14px; font-weight: 700; text-transform: uppercase; letter-spacing: 1px; }
+    .ticket { text-align: center; font-size: 26px; font-weight: 800; margin: 2mm 0; letter-spacing: 1px; }
+    .section { font-size: 13px; font-weight: 700; text-transform: uppercase; margin-top: 3mm; }
+    .total-row { display: flex; justify-content: space-between; font-size: 18px; font-weight: 800; margin-top: 2mm; }
+    .paid { text-align: center; font-size: 15px; font-weight: 700; margin-top: 2mm; }
+    .notes { font-size: 14px; font-weight: 600; margin-top: 3mm; line-height: 1.35; white-space: pre-wrap; }`;
+  const body = `
+    ${receiptHeaderHtml(location, details.storeAddress)}
+    <div class="divider"></div>
+    <div class="eyebrow">Repair receipt</div>
+    <div class="ticket">${escapeHtml(details.ticketNumber || "")}</div>
+    <div class="meta">${escapeHtml((toJsDate(paidAt) || new Date()).toLocaleString())}</div>
+    ${receiptCustomerHtml(details.customerName, report.customerPhone, details.customerMobile, details.customerAddress)}
+    <div class="divider"></div>
+    <table>${infoRows}</table>
+    <div class="section">Work done</div>
+    <table>${jobRows}</table>
+    ${taxAmount > 0
+      ? `<table><tr><td>Tax${details.taxRate ? ` (${escapeHtml(String(details.taxRate))}%)` : ""}</td><td style="text-align:right">${escapeHtml(formatMoney(taxAmount))}</td></tr></table>`
+      : ""}
+    <div class="total-row"><span>Total</span><span>${escapeHtml(formatMoney(grandTotal))}</span></div>
+    <div class="paid">${details.paymentStatus === "Paid"
+      ? `Paid${report.paymentMethod ? ` by ${escapeHtml(report.paymentMethod)}` : ""}`
+      : "NOT PAID"}</div>
+    ${report.notes ? `<div class="notes">Notes: ${escapeHtml(report.notes)}</div>` : ""}
+    <div class="divider"></div>
+    <div class="thanks">Thank you from Diamant Telecom.</div>
+    ${receiptFooterHtml(details.storeHours)}`;
+
+  openThermalReceipt(`Repair receipt ${details.ticketNumber || ""}`, css, body);
 }
 
 function printRepairTicket(report) {
@@ -8256,6 +8697,7 @@ function InventoryPage({
 function RentalPhoneFleet({ phones = [], isAdmin, onSavePhone, onReleasePhone, onRemovePhone }) {
   const [imei, setImei] = useState("");
   const [name, setName] = useState("");
+  const [simNumber, setSimNumber] = useState("");
   const [search, setSearch] = useState("");
   const [message, setMessage] = useState("");
   const imeiRef = useRef(null);
@@ -8267,7 +8709,8 @@ function RentalPhoneFleet({ phones = [], isAdmin, onSavePhone, onReleasePhone, o
     const sorted = [...phones].sort((left, right) => String(left.name || "").localeCompare(String(right.name || "")));
     if (!query) return sorted;
     return sorted.filter((phone) =>
-      [phone.name, phone.imei, phone.customerPhone].filter(Boolean).join(" ").toLowerCase().includes(query));
+      [phone.name, phone.imei, phone.simNumber, phone.customerPhone]
+        .filter(Boolean).join(" ").toLowerCase().includes(query));
   }, [phones, search]);
 
   function addPhone(event) {
@@ -8279,9 +8722,15 @@ function RentalPhoneFleet({ phones = [], isAdmin, onSavePhone, onReleasePhone, o
       setMessage(`IMEI ${cleanImei} is already in the fleet.`);
       return;
     }
-    onSavePhone?.({ name: name.trim(), imei: cleanImei });
-    setMessage(`Added ${name.trim()} · ${cleanImei}.`);
+    const simClash = fleetSimOwner(phones, simNumber);
+    if (simClash) {
+      setMessage(`That SIM is already saved against ${simClash.name}. Take it off that phone first.`);
+      return;
+    }
+    onSavePhone?.({ name: name.trim(), imei: cleanImei, simNumber });
+    setMessage(`Added ${name.trim()} · ${cleanImei}${digitsOnly(simNumber) ? " · SIM saved" : ""}.`);
     setImei("");
+    setSimNumber("");
     // Keep the name so a run of identical handsets can be scanned back to back.
     imeiRef.current?.focus();
   }
@@ -8301,7 +8750,8 @@ function RentalPhoneFleet({ phones = [], isAdmin, onSavePhone, onReleasePhone, o
       </div>
       <p className="muted">
         Scan every phone you lend out so the shop always knows where each handset is. Phones added here are the ones
-        offered when a rental issues a device.
+        offered when a rental issues a device. Give a phone the SIM number that lives in it and the rental screen fills
+        both in from one scan of the handset.
       </p>
 
       <form className="form-grid inventory-form" onSubmit={addPhone} onKeyDown={preventEnterSubmit}>
@@ -8325,6 +8775,17 @@ function RentalPhoneFleet({ phones = [], isAdmin, onSavePhone, onReleasePhone, o
             placeholder="e.g. Nokia 105 — blue"
           />
         </label>
+        <label className="field">
+          <span>SIM in this phone (optional)</span>
+          <input
+            value={simNumber}
+            onChange={(event) => { setSimNumber(event.target.value); setMessage(""); }}
+            inputMode="numeric"
+            autoComplete="off"
+            spellCheck={false}
+            placeholder="Scan the SIM in the phone"
+          />
+        </label>
         <div className="pos-form-actions form-actions-row">
           <button className="primary-button" type="submit">Add phone</button>
           {message ? <span className="muted">{message}</span> : null}
@@ -8344,6 +8805,7 @@ function RentalPhoneFleet({ phones = [], isAdmin, onSavePhone, onReleasePhone, o
             <tr>
               <th>Phone</th>
               <th>IMEI</th>
+              <th>SIM</th>
               <th>Status</th>
               <th>With</th>
               <th></th>
@@ -8356,6 +8818,7 @@ function RentalPhoneFleet({ phones = [], isAdmin, onSavePhone, onReleasePhone, o
                 <tr key={phone.id}>
                   <td><strong>{phone.name}</strong></td>
                   <td>{phone.imei}</td>
+                  <td>{phone.simNumber || <span className="muted">-</span>}</td>
                   <td>
                     <span className={`status-pill ${out ? "" : "returned"}`}>
                       {out ? RENTAL_PHONE_WITH_CUSTOMER : RENTAL_PHONE_IN_STORE}
@@ -8363,6 +8826,25 @@ function RentalPhoneFleet({ phones = [], isAdmin, onSavePhone, onReleasePhone, o
                   </td>
                   <td>{out ? phone.customerPhone || "Customer" : "-"}</td>
                   <td className="pos-row-actions">
+                    <button
+                      className="secondary-button compact-button"
+                      type="button"
+                      onClick={() => {
+                        const answer = window.prompt(
+                          `SIM number in ${phone.name}. Scanning this phone on a rental fills it into the SIM box.`,
+                          phone.simNumber || "",
+                        );
+                        if (answer === null) return;
+                        const clash = fleetSimOwner(phones, answer, phone.id);
+                        if (clash) {
+                          window.alert(`That SIM is already saved against ${clash.name}. Take it off that phone first.`);
+                          return;
+                        }
+                        onSavePhone?.({ ...phone, simNumber: answer });
+                      }}
+                    >
+                      {phone.simNumber ? "Change SIM" : "Add SIM"}
+                    </button>
                     {out ? (
                       <button
                         className="secondary-button compact-button"
@@ -8388,7 +8870,7 @@ function RentalPhoneFleet({ phones = [], isAdmin, onSavePhone, onReleasePhone, o
               );
             }) : (
               <tr>
-                <td colSpan="5" className="empty-state">
+                <td colSpan="6" className="empty-state">
                   {phones.length ? "No phones match that search." : "No phones in the fleet yet — scan one above."}
                 </td>
               </tr>
@@ -8968,6 +9450,11 @@ function ReportRow({ report, onStatusChange, onUpdateReport, onDeleteReport, onR
   const saleLineItems = report.details?.lineItems || [];
   // Any sale with line items can have its receipt reprinted, emailed or texted.
   const canReprint = (report.type === "sale" || report.type === "phoneOrder") && saleLineItems.length > 0;
+  // A repair's receipt is worth printing once there is something to show for it:
+  // the work is finished, or the customer has paid.
+  const canPrintRepairReceipt = report.type === "repair"
+    && (report.details?.paymentStatus === "Paid"
+      || ["Ready", "Completed"].includes(report.details?.status));
   const returnableType = report.type === "sale" || report.type === "phoneOrder";
   const fullyReturned = report.details?.returnStatus === "Fully returned";
   const canReturn = Boolean(onReturn) && returnableType && saleLineItems.length > 0 && !fullyReturned;
@@ -8979,7 +9466,17 @@ function ReportRow({ report, onStatusChange, onUpdateReport, onDeleteReport, onR
       <tr className="report-row" onClick={() => setOpen((value) => !value)}>
         <td>{formatShortDate(report.createdAt)}</td>
         <td><span className={`badge ${report.type}`}>{reportTypes[report.type].label}</span></td>
-        <td>{report.customerPhone || "-"}</td>
+        <td>
+          {/* Staff know customers by name; a bare phone number means looking
+              every row up to find the one being asked about. */}
+          <div>{report.details?.customerName || report.customerPhone || "-"}</div>
+          {report.details?.customerName && report.customerPhone ? (
+            <div className="muted">{report.customerPhone}</div>
+          ) : null}
+          {report.details?.customerMobile ? (
+            <div className="muted">Mobile {report.details.customerMobile}</div>
+          ) : null}
+        </td>
         <td>
           <button type="button" className="row-toggle" aria-expanded={open} onClick={(event) => { stop(event); setOpen((value) => !value); }}>
             {open ? "▾" : "▸"}
@@ -9013,6 +9510,15 @@ function ReportRow({ report, onStatusChange, onUpdateReport, onDeleteReport, onR
                 className="secondary-button compact-button"
                 type="button"
                 onClick={() => setShowReceipt(true)}
+              >
+                Receipt
+              </button>
+            ) : null}
+            {canPrintRepairReceipt ? (
+              <button
+                className="secondary-button compact-button"
+                type="button"
+                onClick={() => printRepairReceipt(report)}
               >
                 Receipt
               </button>
@@ -9390,6 +9896,28 @@ function collectReportImeis(details) {
   return details.imei || "";
 }
 
+// Whether the customer has had the message they asked for. The texts go out
+// from the server on the status changes, so it is the server that records them
+// (`details.notices`); a repair with nothing recorded has had nothing sent.
+const REPAIR_NOTICE_LABELS = [
+  ["received", "booked in"],
+  ["ready", "ready for pickup"],
+  ["paid", "payment"],
+];
+
+function describeRepairNotices(details) {
+  const notices = details?.notices || {};
+  const sent = REPAIR_NOTICE_LABELS
+    .filter(([key]) => notices[key]?.at)
+    .map(([key, label]) => {
+      const notice = notices[key];
+      if (notice.status && notice.status !== "Sent") return `${label} — ${String(notice.status).toLowerCase()}`;
+      const when = formatShortDate(notice.at);
+      return `${label}${notice.method ? ` by ${String(notice.method).toLowerCase()}` : ""}${when ? ` on ${when}` : ""}`;
+    });
+  return sent.length ? sent.join(" · ") : "";
+}
+
 function ReportDetails({ report, compact }) {
   const details = report.details || {};
   const imeis = collectReportImeis(details);
@@ -9422,6 +9950,12 @@ function ReportDetails({ report, compact }) {
         .map((fix) => `${fix.description || "Fix"}${fix.price ? ` (${formatMoney(Number(fix.price) || 0)})` : ""}`)
         .join(", ")],
       ["Phone PIN", details.devicePin],
+      ["Amount owed", repairTotals(report).fixesTotal
+        ? `${formatMoney(repairTotals(report).total)} (job ${formatMoney(repairTotals(report).base)} + extras ${formatMoney(repairTotals(report).fixesTotal)})`
+        : ""],
+      ["Customer mobile", details.customerMobile],
+      ["Notify by", details.notificationPreference],
+      ["Notified", describeRepairNotices(details)],
       ["SIM in phone", details.hadSim ? "Yes" : ""],
       ["SD card in phone", details.hadSdCard ? "Yes" : ""],
       ["Loaner phone given", details.borrowedTempPhone ? "Yes" : ""],
@@ -10037,7 +10571,7 @@ function CustomersPage({ sessionRole, onSave, onRemove, onSync }) {
         <div className="table-wrap">
           <table>
             <thead>
-              <tr><th>Name</th><th>Phone</th><th>Address</th><th>Email</th><th>Notes</th><th></th></tr>
+              <tr><th>Name</th><th>Phone</th><th>Mobile</th><th>Address</th><th>Email</th><th>Notes</th><th></th></tr>
             </thead>
             <tbody>
               {rows.length ? (
@@ -10045,6 +10579,7 @@ function CustomersPage({ sessionRole, onSave, onRemove, onSync }) {
                   <tr key={customer.id}>
                     <td><strong>{customer.name || "-"}</strong></td>
                     <td>{customer.phone || "-"}</td>
+                    <td>{customer.mobile || "-"}</td>
                     <td>{customer.address || "-"}</td>
                     <td>{customer.email || "-"}</td>
                     <td className="muted">{customer.notes || ""}</td>
@@ -10055,7 +10590,7 @@ function CustomersPage({ sessionRole, onSave, onRemove, onSync }) {
                   </tr>
                 ))
               ) : (
-                <tr><td colSpan="6" className="empty-state">{loading ? "Loading…" : search ? "No matches." : "Type a phone number or name to search."}</td></tr>
+                <tr><td colSpan="7" className="empty-state">{loading ? "Loading…" : search ? "No matches." : "Type a phone number or name to search."}</td></tr>
               )}
             </tbody>
           </table>

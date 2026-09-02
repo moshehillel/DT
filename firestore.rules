@@ -71,6 +71,17 @@ service cloud.firestore {
       allow delete: if isAdmin();
     }
 
+    // One document per repair ticket number, the number itself being the id.
+    // Creating is open to staff, updating is open to nobody: the second register
+    // to reach for a number is writing over an existing document, and the server
+    // refuses it. That refusal is how a register learns it lost the race and has
+    // to take the next number — a check it ran itself could always be raced.
+    match /repairTickets/{ticketNumber} {
+      allow read, create: if signedIn();
+      allow update: if false;
+      allow delete: if isAdmin();
+    }
+
     match /notificationLogs/{logId} {
       allow read, create: if signedIn();
       allow update, delete: if isAdmin();

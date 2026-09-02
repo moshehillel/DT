@@ -733,3 +733,33 @@ function buildRentalOverdueNotice(report, today) {
     message: `${report.customerPhone || "Customer"} should have returned ${device} by ${dueDate}.${lateFeePart}`,
   };
 }
+
+// ---- repair money ---------------------------------------------------------
+// A repair is often more than one job: the phone comes in for a screen and the
+// charging port turns out to be dead too. Each extra is described and priced on
+// its own, and all of them are owed at pickup, so what the ticket adds up to is
+// worked out in one place rather than in each screen's head.
+
+// Drop the half-typed rows an editor always leaves behind.
+export function cleanRepairFixes(list) {
+  return (list || [])
+    .map((fix) => ({
+      description: String(fix?.description || "").trim(),
+      price: String(fix?.price ?? "").trim(),
+    }))
+    .filter((fix) => fix.description || fix.price);
+}
+
+export function repairFixesTotal(list) {
+  return cleanRepairFixes(list).reduce((sum, fix) => sum + (Number(fix.price) || 0), 0);
+}
+
+// `base` is the job the phone came in for — the final price once a tech has set
+// one, the estimate until then. `total` is what the customer actually owes.
+export function repairTotals(report) {
+  const details = report?.details || {};
+  const fixes = cleanRepairFixes(details.additionalFixes);
+  const fixesTotal = repairFixesTotal(fixes);
+  const base = Number(details.finalPrice || details.estimatedPrice || report?.paymentAmount) || 0;
+  return { fixes, fixesTotal, base, total: base + fixesTotal };
+}
