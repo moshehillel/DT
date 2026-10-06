@@ -14,6 +14,7 @@ import {
   manualReportTypeKeys,
   ORDER_HANDLERS_KEY,
   paymentMethods,
+  SIM_ONLY_DEPOSIT,
   PAYMENT_REMINDER_CONTACT_EMAIL,
   PAYMENT_REMINDER_ENABLED,
   PAYMENT_REMINDER_TEXT,
@@ -24,6 +25,9 @@ import {
   RENTAL_PHONE_IN_STORE,
   RENTAL_PHONE_WITH_CUSTOMER,
   RENTAL_PHONES_KEY,
+  RECEIPT_NOTES_KEY,
+  RECEIPT_NOTE_TYPES,
+  STOCK_WAITLIST_KEY,
   repairStatuses,
   reportTypes,
   RESET_REQUESTS_KEY,
@@ -34,11 +38,13 @@ import {
 import { useCloudCollectionState, useCloudDocumentState } from "./hooks/useCloudState";
 import {
   callFunction,
+  allocateRepairTicketNumber,
   claimRepairTicket,
   deleteCustomerDoc,
   ensureFirebaseAuth,
   findCustomerByPhone,
   listCustomersPage,
+  adjustCustomerBalance,
   saveCustomerDoc,
   searchCustomersByPhonePrefix,
   sendReset,
@@ -93,6 +99,11 @@ import {
   toJsDate,
   unionByName,
   uniqueValues,
+  storeStockCount,
+  storeStockEntry,
+  setStoreStock,
+  adjustStoreStock,
+  productStockMap,
 } from "./utils";
 import "./styles.css";
 
@@ -167,7 +178,9 @@ function Workspace({ currentUser, isAdmin }) {
   );
   const [products, setProducts] = useCloudCollectionState("products", PRODUCTS_KEY, []);
   const [rentalPhones, setRentalPhones] = useCloudCollectionState("rentalPhones", RENTAL_PHONES_KEY, []);
+  const [stockWaitlist, setStockWaitlist] = useCloudCollectionState("stockWaitlist", STOCK_WAITLIST_KEY, []);
   const [stores, setStores] = useCloudDocumentState("stores", STORES_KEY, []);
+  const [receiptNotes, setReceiptNotes] = useCloudDocumentState("receiptNotes", RECEIPT_NOTES_KEY, []);
   // Customers are queried on demand (see findCustomerByPhone / CustomersPage) —
   // never bulk-loaded — so a 10k+ CRM doesn't cost a read on every app load.
 
@@ -264,6 +277,17 @@ function Workspace({ currentUser, isAdmin }) {
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
   }, []);
+
+  // The receipt printers are plain module functions, so the saved instructions
+  // are handed to them rather than threaded through as props.
+  useEffect(() => { setReceiptNotesStore(receiptNotes); }, [receiptNotes]);
+
+  function saveReceiptNote(type, text) {
+    setReceiptNotes((current) => [
+      ...(current || []).filter((entry) => entry?.type !== type),
+      ...(text ? [{ type, text, updatedAt: new Date().toISOString() }] : []),
+    ]);
+  }
 
   const activeLocation = useMemo(() => {
     const match = (employeeLocations || []).find((entry) => entry?.name === activeEmployee);
@@ -578,7 +602,11 @@ function Workspace({ currentUser, isAdmin }) {
     const id = product.id || crypto.randomUUID();
     const existing = products.find((item) => item.id === id);
     const requiresImei = Boolean(product.requiresImei);
-    const imeis = requiresImei
+    // Stock kept per store arrives with its totals already worked out.
+    const perStore = Boolean(product.stock && typeof product.stock === "object");
+    const imeis = perStore
+      ? (product.imeis || [])
+      : requiresImei
       ? [
           ...new Set(
             (product.imeis || [])
@@ -587,7 +615,9 @@ function Workspace({ currentUser, isAdmin }) {
           ),
         ]
       : [];
-    const quantity = requiresImei
+    const quantity = perStore
+      ? Number(product.quantity) || 0
+      : requiresImei
       ? imeis.length
       : Number.isFinite(Number(product.quantity))
         ? Number(product.quantity)
@@ -604,7 +634,8 @@ function Workspace({ currentUser, isAdmin }) {
         : String(existing?.cost ?? "").trim(),
       category: product.category || productCategories[0],
       requiresImei,
-      location: product.location || "",
+      // Every store sells every product; only the stock is a store's.
+      location: perStore ? "" : product.location || "",
       imeis,
       quantity,
       updatedAt: new Date().toISOString(),
@@ -616,6 +647,41 @@ function Workspace({ currentUser, isAdmin }) {
       }
       return [{ ...normalized, createdAt: new Date().toISOString() }, ...current];
     });
+  }
+
+  // Take sold units off the selling store's shelf (scanned IMEIs leave stock,
+  // plain items count down). Shared by the till and phone orders.
+  function drawDownStock(lineItems, location) {
+    setProducts((current) =>
+      current.map((product) => {
+        const lines = lineItems.filter((line) => line.productId === product.id);
+        if (!lines.length) return product;
+        if (product.requiresImei) {
+          const soldImeis = lines.map((line) => line.imei).filter(Boolean);
+          if (!soldImeis.length) return product;
+          return { ...adjustStoreStock(product, location, { removeImeis: soldImeis }), updatedAt: new Date().toISOString() };
+        }
+        const soldQty = lines.reduce((total, line) => total + (Number(line.qty) || 0), 0);
+        return { ...adjustStoreStock(product, location, { removeQty: soldQty }), updatedAt: new Date().toISOString() };
+      }),
+    );
+  }
+
+  // The reverse: units coming back onto a store's shelf.
+  function putBackStock(lines, location, qtyOf) {
+    setProducts((current) =>
+      current.map((product) => {
+        const mine = lines.filter((line) => line.productId === product.id);
+        if (!mine.length) return product;
+        if (product.requiresImei) {
+          const returned = mine.map((line) => line.imei).filter(Boolean);
+          if (!returned.length) return product;
+          return { ...adjustStoreStock(product, location, { addImeis: returned }), updatedAt: new Date().toISOString() };
+        }
+        const qty = mine.reduce((total, line) => total + qtyOf(line), 0);
+        return { ...adjustStoreStock(product, location, { addQty: qty }), updatedAt: new Date().toISOString() };
+      }),
+    );
   }
 
   function removeProduct(productId) {
@@ -638,26 +704,7 @@ function Workspace({ currentUser, isAdmin }) {
       address: sale.details?.customerAddress || "",
     });
     setReports((current) => [enriched, ...current]);
-    setProducts((current) =>
-      current.map((product) => {
-        const lines = (sale.details?.lineItems || []).filter((line) => line.productId === product.id);
-        if (!lines.length) return product;
-        if (product.requiresImei) {
-          const soldImeis = new Set(lines.map((line) => line.imei).filter(Boolean));
-          if (!soldImeis.size) return product;
-          const remaining = (product.imeis || []).filter((imei) => !soldImeis.has(imei));
-          return {
-            ...product,
-            imeis: remaining,
-            quantity: remaining.length,
-            updatedAt: new Date().toISOString(),
-          };
-        }
-        const soldQty = lines.reduce((total, line) => total + (Number(line.qty) || 0), 0);
-        const nextQuantity = Math.max(0, (Number(product.quantity) || 0) - soldQty);
-        return { ...product, quantity: nextQuantity, updatedAt: new Date().toISOString() };
-      }),
-    );
+    drawDownStock(sale.details?.lineItems || [], sale.location || sale.details?.location || activeLocation);
   }
 
   // Files the report and returns it. Nothing may be awaited before `setReports`:
@@ -674,7 +721,7 @@ function Workspace({ currentUser, isAdmin }) {
     });
     setReports((current) => [filed, ...current]);
     setFormNonce((value) => value + 1);
-    if (filed.type === "repair" && filed.details?.ticketNumber) {
+    if (filed.type === "repair" && filed.details?.ticketNumber && !filed.details?.ticketPreclaimed) {
       claimTicketFor(filed.id, filed.details.ticketNumber);
     }
     // The customer record is a side errand — it must not gate the report.
@@ -779,23 +826,9 @@ function Workspace({ currentUser, isAdmin }) {
     if (!order) return;
     const lineItems = patch.lineItems || order.lineItems || [];
 
-    // Draw the sold units down from inventory exactly like a POS sale (remove
-    // the scanned IMEIs, decrement plain stock).
-    setProducts((current) =>
-      current.map((product) => {
-        const lines = lineItems.filter((line) => line.productId === product.id);
-        if (!lines.length) return product;
-        if (product.requiresImei) {
-          const soldImeis = new Set(lines.map((line) => line.imei).filter(Boolean));
-          if (!soldImeis.size) return product;
-          const remaining = (product.imeis || []).filter((imei) => !soldImeis.has(imei));
-          return { ...product, imeis: remaining, quantity: remaining.length, updatedAt: new Date().toISOString() };
-        }
-        const soldQty = lines.reduce((total, line) => total + (Number(line.qty) || 0), 0);
-        const nextQuantity = Math.max(0, (Number(product.quantity) || 0) - soldQty);
-        return { ...product, quantity: nextQuantity, updatedAt: new Date().toISOString() };
-      }),
-    );
+    // Draw the sold units down from the fulfilling store exactly like a POS
+    // sale (remove the scanned IMEIs, decrement plain stock).
+    drawDownStock(lineItems, order.location || activeLocation);
 
     const phoneLine = lineItems.find((line) => line.requiresImei && line.imei);
     setPhoneOrders((current) =>
@@ -837,28 +870,31 @@ function Workspace({ currentUser, isAdmin }) {
 
   // Cancel a phone order and drop it from the pipeline. If the store had already
   // committed stock (Ready / Out for delivery), put the units back on the shelf.
+  // Fixing what was taken down wrong on the phone: the name, the number, where
+  // it is going, who is driving it, and which stage it is at. Deliberately a
+  // plain edit — it corrects the record, it does not re-run the stage's work
+  // (no stock movement, no driver text), so the buttons on the boards stay the
+  // way an order is actually moved along.
+  function updatePhoneOrder(orderId, patch) {
+    setPhoneOrders((current) => current.map((order) => {
+      if (order.id !== orderId) return order;
+      const next = { ...order, ...patch, updatedAt: new Date().toISOString(), updatedBy: activeEmployee };
+      // Dropped back to an earlier stage: the delivery stamp is no longer true.
+      if (next.status !== "Delivered") {
+        next.deliveredAt = "";
+      } else if (!next.deliveredAt) {
+        next.deliveredAt = new Date().toISOString();
+      }
+      return next;
+    }));
+  }
+
   function cancelPhoneOrder(orderId) {
     const order = phoneOrders.find((item) => item.id === orderId);
     if (!order) return;
     const committed = order.status === "Ready" || order.status === "Out for delivery";
     if (committed) {
-      setProducts((current) =>
-        current.map((product) => {
-          const lines = (order.lineItems || []).filter((line) => line.productId === product.id);
-          if (!lines.length) return product;
-          if (product.requiresImei) {
-            const returned = lines
-              .map((line) => line.imei)
-              .filter(Boolean)
-              .filter((imei) => !(product.imeis || []).includes(imei));
-            if (!returned.length) return product;
-            const imeis = [...(product.imeis || []), ...returned];
-            return { ...product, imeis, quantity: imeis.length, updatedAt: new Date().toISOString() };
-          }
-          const qty = lines.reduce((total, line) => total + (Number(line.qty) || 0), 0);
-          return { ...product, quantity: (Number(product.quantity) || 0) + qty, updatedAt: new Date().toISOString() };
-        }),
-      );
+      putBackStock(order.lineItems || [], order.location || activeLocation, (line) => Number(line.qty) || 0);
     }
     setPhoneOrders((current) => current.filter((item) => item.id !== orderId));
   }
@@ -1060,6 +1096,14 @@ function Workspace({ currentUser, isAdmin }) {
         ? {
           ...entry,
           ticketDigits: digitsOnly(to),
+          // Every number this repair has ever carried, so the one printed on the
+          // customer's label still finds it — including from the phone system,
+          // which can only match what it can query.
+          ticketDigitsAll: [...new Set([
+            ...(entry.ticketDigitsAll || []),
+            digitsOnly(from),
+            digitsOnly(to),
+          ].filter(Boolean))],
           details: {
             ...entry.details,
             ticketNumber: to,
@@ -1106,6 +1150,17 @@ function Workspace({ currentUser, isAdmin }) {
     }
   }, [reports]);
 
+  // The customer has already left with the label. There is nothing to reprint,
+  // and the old number still finds the repair, so let staff put the notice away
+  // without pretending a sticker was replaced.
+  function acknowledgeRelabel(reportId) {
+    setReports((list) =>
+      list.map((entry) => (entry.id === reportId
+        ? { ...entry, details: { ...entry.details, ticketReprintNeeded: false } }
+        : entry)),
+    );
+  }
+
   // The banner's way out: reprint the sticker that is now wrong, and stop asking.
   function reprintRepairLabel(reportId) {
     const report = reportsRef.current.find((entry) => entry.id === reportId);
@@ -1118,6 +1173,19 @@ function Workspace({ currentUser, isAdmin }) {
     );
   }
 
+  // --- Waiting for stock -----------------------------------------------------
+  function saveWaitlistEntry(entry) {
+    if (!entry?.id) return;
+    setStockWaitlist((current) => [
+      ...current.filter((item) => item.id !== entry.id),
+      { ...entry, updatedAt: new Date().toISOString() },
+    ]);
+  }
+
+  function removeWaitlistEntry(entryId) {
+    setStockWaitlist((current) => current.filter((item) => item.id !== entryId));
+  }
+
   // --- Rental phone fleet ----------------------------------------------------
   function saveRentalPhone(phone) {
     const imei = digitsOnly(phone?.imei);
@@ -1128,10 +1196,15 @@ function Workspace({ currentUser, isAdmin }) {
       id: phone.id || existing?.id || crypto.randomUUID(),
       name: name || existing?.name || "Phone",
       imei,
-      // The SIM that lives in this handset. Scanning the phone onto a rental
-      // fills this into the SIM box: what goes out is the number physically in
-      // the phone, so nobody reads it off the tray and types it again.
+      // The store this handset belongs to, stamped where it was added. Each shop
+      // lends out the phones on its own shelf, not the other branch's.
+      location: phone.location ?? existing?.location ?? (activeLocation || ""),
+      // The SIMs that live in this handset. Scanning the phone onto a rental
+      // fills the one that rental travels on into the SIM box, so nobody reads
+      // it off the tray and types it again. A phone can hold an RCUK SIM for
+      // trips abroad and an Israeli SIM for Israel rentals.
       simNumber: normalizeRcukSimNumber(phone?.simNumber ?? existing?.simNumber ?? ""),
+      simNumberIl: digitsOnly(phone?.simNumberIl ?? existing?.simNumberIl ?? ""),
       status: phone.status || existing?.status || RENTAL_PHONE_IN_STORE,
       rentalReportId: phone.rentalReportId ?? existing?.rentalReportId ?? "",
       customerPhone: phone.customerPhone ?? existing?.customerPhone ?? "",
@@ -1387,6 +1460,7 @@ function Workspace({ currentUser, isAdmin }) {
         request: "Return / refund",
         originalReportId: original.id,
         refundMethod: selection.refundMethod || original.paymentMethod || "",
+        refundPayments: selection.refundPayments || [],
         refundSubtotal: refundSubtotal.toFixed(2),
         refundTax: refundTax.toFixed(2),
         taxRate: Number(selection.taxRate) || 0,
@@ -1416,34 +1490,35 @@ function Workspace({ currentUser, isAdmin }) {
         returnLines.forEach((line) => {
           returnedByIndex[line.lineIndex] = (returnedByIndex[line.lineIndex] || 0) + Number(line.returnQty);
         });
+        // Remember what has gone back — per method, so a later partial return
+        // can't hand out more on the card than the card ever took, and the tax
+        // on its own, so the rounding on two half-returns can't add up to a cent
+        // more sales tax than the sale ever collected.
+        const refundedTax = roundCents((Number(report.details?.refundedTax) || 0) + refundTax).toFixed(2);
+        const refundedByMethod = { ...(report.details?.refundedByMethod || {}) };
+        (selection.refundPayments || []).forEach((entry) => {
+          const amount = Number(entry?.amount) || 0;
+          if (!entry?.method || amount <= 0) return;
+          refundedByMethod[entry.method] = roundCents(
+            (Number(refundedByMethod[entry.method]) || 0) + amount,
+          ).toFixed(2);
+        });
         const originalLines = report.details?.lineItems || [];
         const fullyReturned = originalLines.length > 0 && originalLines.every((item, index) => {
           const soldQty = item.requiresImei ? 1 : Number(item.qty) || 1;
           return (returnedByIndex[index] || 0) >= soldQty;
         });
         const returnStatus = fullyReturned ? "Fully returned" : "Partially returned";
-        return { ...report, details: { ...report.details, returnedByIndex, returnStatus } };
+        return {
+          ...report,
+          details: { ...report.details, returnedByIndex, refundedByMethod, refundedTax, returnStatus },
+        };
       }),
     ]);
 
-    // Put the returned units back into stock (scanned IMEIs rejoin the lot).
-    setProducts((current) =>
-      current.map((product) => {
-        const lines = returnLines.filter((line) => line.productId === product.id);
-        if (!lines.length) return product;
-        if (product.requiresImei) {
-          const returnedImeis = lines.map((line) => line.imei).filter(Boolean);
-          const merged = [...new Set([...(product.imeis || []), ...returnedImeis])];
-          return { ...product, imeis: merged, quantity: merged.length, updatedAt: new Date().toISOString() };
-        }
-        const addQty = lines.reduce((sum, line) => sum + (Number(line.returnQty) || 0), 0);
-        return {
-          ...product,
-          quantity: (Number(product.quantity) || 0) + addQty,
-          updatedAt: new Date().toISOString(),
-        };
-      }),
-    );
+    // Put the returned units back on the shelf of the store taking the return
+    // (scanned IMEIs rejoin the lot).
+    putBackStock(returnLines, activeLocation || original.location || original.details?.location, (line) => Number(line.returnQty) || 0);
   }
 
   function requestPasswordReset(employeeName) {
@@ -1500,17 +1575,26 @@ function Workspace({ currentUser, isAdmin }) {
           </div>
         ) : null}
         {relabelRepairs.map((repair) => (
-          <div className="cloud-offline-banner" role="alert" key={repair.id}>
-            ⚠️ Ticket <strong>{repair.details?.ticketNumberWas}</strong> was issued on two registers at once.{" "}
-            {repair.details?.customerName || repair.customerPhone || "This repair"}
-            {repair.details?.model ? ` (${repair.details.model})` : ""} is now ticket{" "}
-            <strong>{repair.details?.ticketNumber}</strong> — the label on the phone is wrong.
+          <div className="cloud-pending-banner" role="status" key={repair.id}>
+            Ticket <strong>{repair.details?.ticketNumberWas}</strong> was issued twice, so{" "}
+            {repair.details?.customerName || repair.customerPhone || "this repair"}
+            {repair.details?.model ? ` (${repair.details.model})` : ""} moved to ticket{" "}
+            <strong>{repair.details?.ticketNumber}</strong>. Nothing is lost: searching or phoning in{" "}
+            <strong>{repair.details?.ticketNumberWas}</strong> still finds it, so the customer's label
+            is fine as it is. Reprint only if the phone is still on the bench.
             <button
               className="secondary-button compact-button"
               type="button"
               onClick={() => reprintRepairLabel(repair.id)}
             >
               Reprint label
+            </button>
+            <button
+              className="ghost-button compact-button"
+              type="button"
+              onClick={() => acknowledgeRelabel(repair.id)}
+            >
+              Got it
             </button>
           </div>
         ))}
@@ -1528,12 +1612,11 @@ function Workspace({ currentUser, isAdmin }) {
           <div className="topbar-meta">
             <span>{viewTitleFor(activeView, activeType)}</span>
           </div>
+          <NotificationBell notifications={appNotifications} onDismiss={dismissNotification} />
           <button className="secondary-button" type="button" onClick={logout}>
             Logout
           </button>
         </div>
-
-        <NotificationCenter notifications={appNotifications} onDismiss={dismissNotification} />
 
         {activeView === "pendingReports" ? (
           <PendingReportsPage
@@ -1562,6 +1645,12 @@ function Workspace({ currentUser, isAdmin }) {
         ) : activeView === "customers" ? (
           <CustomersPage
             sessionRole={sessionRole}
+            activeEmployee={activeEmployee}
+            activeLocation={activeLocation}
+            products={products}
+            waitlist={stockWaitlist}
+            onSaveWaitlistEntry={saveWaitlistEntry}
+            onRemoveWaitlistEntry={removeWaitlistEntry}
             onSave={saveCustomer}
             onRemove={removeCustomer}
             onSync={syncCustomersFromReports}
@@ -1597,6 +1686,7 @@ function Workspace({ currentUser, isAdmin }) {
               onSaveCustomer={saveCustomer}
               onCreate={createPhoneOrder}
               onMarkReady={markOrderReady}
+              onUpdateOrder={updatePhoneOrder}
               onAssignDriver={assignOrderDriver}
               onCancel={cancelPhoneOrder}
               onDelivered={completePhoneOrder}
@@ -1654,6 +1744,7 @@ function Workspace({ currentUser, isAdmin }) {
           <InventoryPage
             products={products}
             storeLocations={storeLocations}
+            activeLocation={activeLocation}
             sessionRole={sessionRole}
             onSaveProduct={saveProduct}
             onRemoveProduct={removeProduct}
@@ -1673,6 +1764,8 @@ function Workspace({ currentUser, isAdmin }) {
             employeeLocations={employeeLocations}
             storeDevices={storeDevices}
             storeTax={storeTax}
+            receiptNotes={receiptNotes}
+            onSaveReceiptNote={saveReceiptNote}
             onMarkResetHandled={markResetHandled}
             onResetPassword={requestPasswordReset}
             onAddOrderHandler={addOrderHandler}
@@ -2099,7 +2192,7 @@ function ReportForm({ activeType, activeEmployee, activeLocation, reports, activ
     (field) => !field.showIf || fieldValues[field.showIf.field] === field.showIf.equals,
   );
 
-  function handleSubmit(event) {
+  async function handleSubmit(event) {
     event.preventDefault();
     const formData = new FormData(event.currentTarget);
     const details = {};
@@ -2132,8 +2225,17 @@ function ReportForm({ activeType, activeEmployee, activeLocation, reports, activ
       details.hadSdCard = formData.get("hadSdCard") === "on";
       details.borrowedTempPhone = formData.get("borrowedTempPhone") === "on";
       details.additionalFixes = cleanFixes;
-      details.ticketNumber = generateRepairTicketNumber(reports);
+      // The number is taken from the shared list before anything is printed, so
+      // two registers cannot hand out the same one. The local guess is only the
+      // starting point, and the fallback if the server cannot be reached.
+      const localGuess = generateRepairTicketNumber(reports);
+      const allocated = await allocateRepairTicketNumber(Number(digitsOnly(localGuess)));
+      details.ticketNumber = allocated || localGuess;
       details.ticketDigits = digitsOnly(details.ticketNumber);
+      // Already ours — the save must not go and claim it a second time, which
+      // would read as "taken" and renumber a perfectly good ticket.
+      details.ticketPreclaimed = Boolean(allocated);
+      details.ticketDigitsAll = [details.ticketDigits].filter(Boolean);
       // The intake amount is the quote; the real price is set when the repair is
       // marked Ready. Record it explicitly as the estimated price.
       details.estimatedPrice = String(formData.get("paymentAmount") || "").trim();
@@ -2188,6 +2290,9 @@ function ReportForm({ activeType, activeEmployee, activeLocation, reports, activ
 
     if (activeType === "repair") {
       savedReport.ticketDigits = details.ticketDigits;
+      // Top level, because the phone system queries it there: every number this
+      // repair answers to, so a customer reading a superseded label still finds it.
+      savedReport.ticketDigitsAll = details.ticketDigitsAll || [details.ticketDigits].filter(Boolean);
     }
 
     const filed = onSave(savedReport);
@@ -2389,46 +2494,102 @@ function DynamicField({ field, onValueChange }) {
   );
 }
 
-function NotificationCenter({ notifications, onDismiss }) {
-  if (!notifications.length) return null;
+// Notifications live behind a bell in the top bar rather than a banner that
+// shoves the page down. The bell carries a count and goes red when something is
+// waiting; pressing it drops a scrollable panel underneath, and pressing it
+// again — or clicking away, or Escape — puts it back.
+function NotificationBell({ notifications, onDismiss }) {
+  const [open, setOpen] = useState(false);
+  const wrapRef = useRef(null);
+  const count = notifications.length;
+
+  useEffect(() => {
+    if (!open) return undefined;
+    // Anywhere outside the bell and its panel closes it, as does Escape.
+    function handlePointer(event) {
+      if (!wrapRef.current?.contains(event.target)) setOpen(false);
+    }
+    function handleKey(event) {
+      if (event.key === "Escape") setOpen(false);
+    }
+    document.addEventListener("mousedown", handlePointer);
+    document.addEventListener("keydown", handleKey);
+    return () => {
+      document.removeEventListener("mousedown", handlePointer);
+      document.removeEventListener("keydown", handleKey);
+    };
+  }, [open]);
 
   return (
-    <section className="notification-center">
-      <div className="notification-center-head">
-        <div>
-          <p className="eyebrow">Notifications</p>
-          <h2>Needs attention</h2>
-        </div>
-        {notifications.length > 1 ? (
-          <button
-            className="secondary-button compact-button"
-            type="button"
-            onClick={() => notifications.forEach((notification) => onDismiss(notification.id))}
-          >
-            Dismiss all
-          </button>
-        ) : null}
-      </div>
-      <div className="notification-list">
-        {notifications.map((notification) => (
-          <article className={`app-notification ${notification.severity}`} key={notification.id}>
-            <div className="app-notification-body">
-              <strong>{notification.title}</strong>
-              <p>{notification.message}</p>
+    <div className="notif" ref={wrapRef}>
+      <button
+        type="button"
+        className={`notif-bell${count ? " has-news" : ""}${open ? " is-open" : ""}`}
+        aria-label={count ? `Notifications: ${count} waiting` : "Notifications: none waiting"}
+        aria-expanded={open}
+        title={count ? `${count} notification${count === 1 ? "" : "s"}` : "Notifications"}
+        onClick={() => setOpen((current) => !current)}
+      >
+        <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+          <path
+            d="M12 3a6 6 0 0 0-6 6v3.6l-1.4 2.6A1 1 0 0 0 5.5 17h13a1 1 0 0 0 .9-1.8L18 12.6V9a6 6 0 0 0-6-6Z"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="1.8"
+            strokeLinejoin="round"
+          />
+          <path
+            d="M9.8 19.5a2.4 2.4 0 0 0 4.4 0"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="1.8"
+            strokeLinecap="round"
+          />
+        </svg>
+        {count ? <span className="notif-badge">{count > 99 ? "99+" : count}</span> : null}
+      </button>
+
+      {open ? (
+        <div className="notif-panel" role="dialog" aria-label="Notifications">
+          <div className="notif-panel-head">
+            <div>
+              <p className="eyebrow">Notifications</p>
+              <h3>{count ? `${count} need${count === 1 ? "s" : ""} attention` : "Nothing waiting"}</h3>
             </div>
-            <button
-              className="notification-dismiss"
-              type="button"
-              aria-label={`Dismiss ${notification.title}`}
-              title="Dismiss"
-              onClick={() => onDismiss(notification.id)}
-            >
-              ×
-            </button>
-          </article>
-        ))}
-      </div>
-    </section>
+            {count > 1 ? (
+              <button
+                className="secondary-button compact-button"
+                type="button"
+                onClick={() => notifications.forEach((notification) => onDismiss(notification.id))}
+              >
+                Dismiss all
+              </button>
+            ) : null}
+          </div>
+          <div className="notif-panel-list">
+            {count ? notifications.map((notification) => (
+              <article className={`app-notification ${notification.severity}`} key={notification.id}>
+                <div className="app-notification-body">
+                  <strong>{notification.title}</strong>
+                  <p>{notification.message}</p>
+                </div>
+                <button
+                  className="notification-dismiss"
+                  type="button"
+                  aria-label={`Dismiss ${notification.title}`}
+                  title="Dismiss"
+                  onClick={() => onDismiss(notification.id)}
+                >
+                  &times;
+                </button>
+              </article>
+            )) : (
+              <p className="empty-state">You are all caught up.</p>
+            )}
+          </div>
+        </div>
+      ) : null}
+    </div>
   );
 }
 
@@ -2458,9 +2619,15 @@ function emptyRentalRow(defaults = {}) {
     ukDays: "",
     euDays: "",
     wtsDays: "",
-    usDdi: false,
+    // On by default: almost every customer wants the US number, and forgetting
+    // to tick it has been sending people abroad without one. Untick it for the
+    // rare rental that genuinely does not need it.
+    usDdi: true,
     sms: false,
     ref: "",
+    // What the cashier typed over the calculated price. Blank means the
+    // calculated price stands.
+    priceOverride: "",
     // What RCUK said about this SIM, kept apart from the activation state so a
     // check result survives until the number itself is edited.
     simStatus: "idle", // idle | checking | ok | error
@@ -2619,9 +2786,23 @@ function RentalReportForm({
   // Phones on the shelf, plus any already picked on a row so they don't vanish
   // from their own dropdown.
   const pickedPhoneIds = rows.map((row) => row.rentalPhoneId).filter(Boolean);
+  // Only what is on this shop's shelf can be handed over here. Phones added
+  // before handsets were tied to a store have no location and stay on offer
+  // everywhere until somebody edits them.
+  const atThisStore = (phone) => !activeLocation || !phone.location || phone.location === activeLocation;
   const availableFleetPhones = rentalPhones.filter(
-    (phone) => phone.status !== RENTAL_PHONE_WITH_CUSTOMER || pickedPhoneIds.includes(phone.id),
+    (phone) => atThisStore(phone)
+      && (phone.status !== RENTAL_PHONE_WITH_CUSTOMER || pickedPhoneIds.includes(phone.id)),
   );
+
+  // Which of a handset's SIMs this rental goes out on: the Israeli card for an
+  // Israel rental, the RCUK one for everything else.
+  function phoneSimForRegion(phone) {
+    if (!phone) return "";
+    return shared.rentalRegion === "Israel"
+      ? (phone.simNumberIl || "")
+      : (phone.simNumber || "");
+  }
 
   // Putting a handset on a line brings the SIM in it along: a rental phone goes
   // out with its own SIM, and that is the number being rented. A number already
@@ -2631,14 +2812,15 @@ function RentalReportForm({
   function selectFleetPhone(rowId, phoneId, known = null) {
     const phone = known || rentalPhones.find((entry) => entry.id === phoneId);
     const row = rows.find((entry) => entry.id === rowId);
-    const fillsSim = Boolean(phone?.simNumber) && !digitsOnly(row?.simNumber);
+    const phoneSim = phoneSimForRegion(phone);
+    const fillsSim = Boolean(phoneSim) && !digitsOnly(row?.simNumber);
     editRow(rowId, {
       rentalPhoneId: phoneId,
       model: phone?.name || "",
       imei: phone?.imei || "",
-      ...(fillsSim ? { simNumber: phone.simNumber } : {}),
+      ...(fillsSim ? { simNumber: phoneSim } : {}),
     });
-    return { phone, filledSim: fillsSim };
+    return { phone, filledSim: fillsSim, phoneSim };
   }
 
   // Where a scanned handset lands: the first line that hasn't gone to RCUK and
@@ -2662,8 +2844,18 @@ function RentalReportForm({
     scanRef.current?.focus();
 
     const phone = rentalPhones.find((entry) => digitsOnly(entry.imei) === code)
-      || rentalPhones.find((entry) => entry.simNumber
-        && normalizeRcukSimNumber(entry.simNumber) === normalizeRcukSimNumber(code));
+      || fleetSimOwner(rentalPhones, code);
+
+    // Known handset, wrong shop. Say so rather than registering it a second time
+    // under this store and leaving two records for one phone.
+    if (phone && !atThisStore(phone)) {
+      playScanError();
+      setScanNote({
+        tone: "error",
+        text: `${phone.name} is ${phone.location}'s phone, not ${activeLocation}'s.`,
+      });
+      return;
+    }
 
     if (!phone) {
       // Not in the fleet yet. Rather than send whoever is at the counter to
@@ -2690,15 +2882,15 @@ function RentalReportForm({
       return;
     }
 
-    const { filledSim } = selectFleetPhone(already?.id || rowForScan(), phone.id);
+    const { filledSim, phoneSim } = selectFleetPhone(already?.id || rowForScan(), phone.id);
     playScanBeep();
     setScanNote({
       tone: "ok",
       text: filledSim
-        ? `${phone.name} · SIM …${normalizeRcukSimNumber(phone.simNumber).slice(-6)} — both filled in.`
-        : phone.simNumber
+        ? `${phone.name} · SIM …${digitsOnly(phoneSim).slice(-6)} — both filled in.`
+        : phoneSim
           ? `${phone.name} added. The SIM already on that line was left as it is.`
-          : `${phone.name} added. No SIM is saved against this phone — type the SIM number in.`,
+          : `${phone.name} added. No ${shared.rentalRegion === "Israel" ? "Israeli" : "RCUK"} SIM is saved against this phone — type the SIM number in.`,
     });
   }
 
@@ -2712,6 +2904,25 @@ function RentalReportForm({
       { rentalRegion: shared.rentalRegion, serviceType: packageServiceType(row.package), addSms: row.sms },
       rowDays(row),
     );
+  }
+
+  // The rental price this line is actually sold at: the cashier's figure when
+  // one is typed, otherwise the calculated one.
+  function rowRentalPrice(row) {
+    const typed = String(row.priceOverride ?? "").trim();
+    if (typed === "") return rowPricing(row).totalPrice;
+    return Number.parseFloat(typed) || 0;
+  }
+
+  // A SIM going out without a handset carries a refundable deposit. It is
+  // charged with the rental and handed back when the SIM is marked returned.
+  function rowDeposit(row) {
+    return row.rentalPhoneId ? 0 : SIM_ONLY_DEPOSIT;
+  }
+
+  // What the customer actually pays for this line: the rental plus any deposit.
+  function rowTotal(row) {
+    return rowRentalPrice(row) + rowDeposit(row);
   }
 
   function rowZoneDays(row) {
@@ -2747,12 +2958,13 @@ function RentalReportForm({
         problems.push(`at least ${getMinimumRentalDays(shared.rentalRegion)} days`);
       }
     }
-    if (rowPricing(row).totalPrice <= 0) problems.push("a price above zero");
+    if (rowRentalPrice(row) <= 0) problems.push("a price above zero");
     return problems;
   }
 
   const filledRows = rows.filter((row) => digitsOnly(row.simNumber) || row.rentalId);
-  const batchTotal = filledRows.reduce((sum, row) => sum + rowPricing(row).totalPrice, 0);
+  const batchTotal = filledRows.reduce((sum, row) => sum + rowTotal(row), 0);
+  const batchDeposit = filledRows.reduce((sum, row) => sum + rowDeposit(row), 0);
   const activeRows = rows.filter((row) => row.rentalId);
   const requiresCardCharge = isCardPayment(shared.paymentMethod);
 
@@ -2962,6 +3174,8 @@ function RentalReportForm({
     entries.forEach((row) => {
       const days = rowDays(row);
       const pricing = rowPricing(row);
+      const price = rowRentalPrice(row);
+      const priceEdited = String(row.priceOverride ?? "").trim() !== "";
       const report = {
         id: crypto.randomUUID(),
         type: "rental",
@@ -2970,19 +3184,25 @@ function RentalReportForm({
         location: activeLocation || "",
         customerPhone: shared.customerPhone.trim(),
         customerPhoneDigits: digitsOnly(shared.customerPhone),
-        paymentAmount: String(pricing.totalPrice),
+        // What the customer handed over: the rental plus the SIM-only deposit.
+        paymentAmount: String(price + rowDeposit(row)),
         paymentMethod: shared.paymentMethod,
         notes: [shared.notes.trim(), row.ref.trim()].filter(Boolean).join(" · "),
         details: {
           rentalId: row.rentalId,
           rentalRegion: shared.rentalRegion,
-          serviceType: packageServiceType(row.package),
+          // RCUK's package, zone split and extras only mean something on an RCUK
+          // rental. Stamping them on an Israel or Local one put "Service: Voice
+          // and data" and "UK/EU/WTS: 0/0/0" on paperwork they play no part in.
+          serviceType: isRcukRental ? packageServiceType(row.package) : "",
           // "Device" on the receipt: what physically went out with the SIM.
           rentalType: row.rentalPhoneId ? "Phone" : "SIM only",
           model: row.model,
           imei: row.imei,
           rentalPhoneId: row.rentalPhoneId,
-          simNumber: normalizeRcukSimNumber(row.simNumber),
+          // Only RCUK stock gets its missing prefix put back — an Israeli or
+          // local SIM is filed exactly as it was read off the card.
+          simNumber: isRcukRental ? normalizeRcukSimNumber(row.simNumber) : row.simNumber.trim(),
           startDate: row.startDate,
           endDate: row.endDate,
           returnTime: `${shared.returnDays || 0} days`,
@@ -2990,11 +3210,11 @@ function RentalReportForm({
           returnReminderPreference: shared.returnReminderPreference,
           lateFeeWeekly: Number.parseFloat(shared.lateFeeWeekly) || 0,
           totalDays: days,
-          ukDays: numberValue(row.ukDays),
-          euDays: numberValue(row.euDays),
-          wtsDays: numberValue(row.wtsDays),
-          addSms: row.sms ? "Yes" : "No",
-          usaNumber: row.usDdi ? "Yes" : "No",
+          ukDays: isRcukRental ? numberValue(row.ukDays) : "",
+          euDays: isRcukRental ? numberValue(row.euDays) : "",
+          wtsDays: isRcukRental ? numberValue(row.wtsDays) : "",
+          addSms: isRcukRental ? (row.sms ? "Yes" : "No") : "",
+          usaNumber: isRcukRental ? (row.usDdi ? "Yes" : "No") : "",
           cli: row.cli,
           usDdi: row.usDdiNumber,
           // Which wait this rental is in, so the screen, the receipt and the
@@ -3007,10 +3227,13 @@ function RentalReportForm({
           // single card charge) back to each other.
           rentalBatchId: entries.length > 1 ? batchId : "",
           rentalBatchSize: entries.length > 1 ? entries.length : "",
-          dailyRate: pricing.dailyRate,
-          totalPrice: pricing.totalPrice,
+          dailyRate: priceEdited ? (days ? price / days : 0) : pricing.dailyRate,
+          totalPrice: price,
+          // Held, not earned. "Held" flips to "Refunded" when the SIM is back.
+          securityDeposit: rowDeposit(row) ? rowDeposit(row).toFixed(2) : "",
+          depositStatus: rowDeposit(row) ? "Held" : "",
           calculatedPrice: pricing.totalPrice,
-          pricingLabel: pricing.label,
+          pricingLabel: priceEdited ? "Custom price" : pricing.label,
           location: activeLocation || "",
           storeAddress: activeStoreInfo?.address || "",
           storeHours: activeStoreInfo?.hours || "",
@@ -3039,8 +3262,11 @@ function RentalReportForm({
         simNumber: report.details.simNumber,
         cli: row.cli,
         usDdi: row.usDdiNumber,
+        // Whether a US number was bought, so the panel below knows to keep
+        // asking when the UK number lands on its own.
+        wantsUsDdi: Boolean(row.usDdi),
         customerPhone: shared.customerPhone.trim(),
-        price: pricing.totalPrice,
+        price,
         numbersDeferred: Boolean(row.rentalId) && !row.cli && rentalNumbersDeferred(row.startDate),
         numbersDueDate: rentalNumbersDueDate(row.startDate),
         status: "",
@@ -3106,11 +3332,15 @@ function RentalReportForm({
     chaseTimersRef.current.forEach((timer) => window.clearTimeout(timer));
     chaseTimersRef.current = [30000, 90000, 150000].map((delay) => window.setTimeout(() => {
       filedRef.current
-        .filter((entry) => entry.rentalId && !entry.cli && !entry.numbersDeferred)
+        .filter((entry) => entry.rentalId && !entry.numbersDeferred
+          && (!entry.cli || (entry.wantsUsDdi && !entry.usDdi)))
         .forEach((entry) => fetchNumbersFor(entry, { auto: true }));
     }, delay));
   }
 
+  // RCUK's own columns: the package it sells, the zone-day split and its
+  // extras. An Israel, Local or Canada rental has none of that, so the columns
+  // come off the table entirely instead of sitting there greyed out.
   const zoneFields = ["ukDays", "euDays", "wtsDays"];
   const flagFields = [["usDdi", "US DDI"], ["sms", "SMS"]];
 
@@ -3187,7 +3417,7 @@ function RentalReportForm({
           <div className="rental-filed-head">
             <div>
               <p className="eyebrow">Just filed</p>
-              <h3>{filed.length} rental{filed.length === 1 ? "" : "s"} activated and saved</h3>
+              <h3>{filed.length} rental{filed.length === 1 ? "" : "s"} {filed.some((entry) => entry.rentalId) ? "activated and saved" : "saved"}</h3>
             </div>
             <button className="ghost-button compact-button" type="button" onClick={() => setFiled([])}>
               Dismiss
@@ -3196,7 +3426,7 @@ function RentalReportForm({
           {filed.map((entry) => (
             <div className="rental-filed-row" key={entry.reportId}>
               <div>
-                <strong>Rental {entry.rentalId || "—"}</strong>
+                <strong>{entry.rentalId ? `Rental ${entry.rentalId}` : "Rental"}</strong>
                 <span className="muted">SIM …{entry.simNumber.slice(-6)} · {formatMoney(entry.price)}</span>
                 {entry.cli ? (
                   <span className="rental-filed-numbers">
@@ -3212,14 +3442,13 @@ function RentalReportForm({
                 {entry.status ? <span className="muted">{entry.status}</span> : null}
               </div>
               <div className="rental-filed-actions">
-                {entry.cli ? (
+                {!entry.rentalId ? null : entry.cli ? (
                   <span className="status-pill returned">Numbers in</span>
                 ) : (
                   <button
                     className="secondary-button compact-button"
                     type="button"
                     onClick={() => fetchNumbersFor(entry)}
-                    disabled={!entry.rentalId}
                   >
                     Get numbers
                   </button>
@@ -3271,15 +3500,19 @@ function RentalReportForm({
           <thead>
             <tr>
               <th className="rental-col-sim">SIM</th>
-              <th className="rental-col-package">Package</th>
+              {isRcukRental ? <th className="rental-col-package">Package</th> : null}
               <th>Start date</th>
               <th>End date</th>
               <th>Total days</th>
-              <th>UK</th>
-              <th>EU</th>
-              <th>WTS</th>
-              <th>US DDI</th>
-              <th>SMS</th>
+              {isRcukRental ? (
+                <>
+                  <th>UK</th>
+                  <th>EU</th>
+                  <th>WTS</th>
+                  <th>US DDI</th>
+                  <th>SMS</th>
+                </>
+              ) : null}
               <th>Phone issued</th>
               <th>Ref / notes</th>
               <th>Price</th>
@@ -3354,11 +3587,13 @@ function RentalReportForm({
                       <span className={row.status === "error" ? "rental-row-msg error" : "rental-row-msg"}>{row.message}</span>
                     ) : null}
                   </td>
-                  <td className="rental-col-package">
-                    <select value={row.package} onChange={(event) => editRow(row.id, { package: event.target.value })} disabled={locked}>
-                      {RENTAL_PACKAGES.map((entry) => <option key={entry.value}>{entry.value}</option>)}
-                    </select>
-                  </td>
+                  {isRcukRental ? (
+                    <td className="rental-col-package">
+                      <select value={row.package} onChange={(event) => editRow(row.id, { package: event.target.value })} disabled={locked}>
+                        {RENTAL_PACKAGES.map((entry) => <option key={entry.value}>{entry.value}</option>)}
+                      </select>
+                    </td>
+                  ) : null}
                   <td>
                     <input type="date" value={row.startDate} onChange={(event) => editRow(row.id, { startDate: event.target.value })} readOnly={locked} />
                   </td>
@@ -3366,28 +3601,32 @@ function RentalReportForm({
                     <input type="date" value={row.endDate} onChange={(event) => editRow(row.id, { endDate: event.target.value })} readOnly={locked} />
                   </td>
                   <td className="rental-cell-computed">{days || "-"}</td>
-                  {zoneFields.map((zone) => (
-                    <td key={zone}>
-                      <input
-                        className={`rental-cell-num ${zoneOff ? "input-invalid" : ""}`}
-                        inputMode="numeric"
-                        value={row[zone]}
-                        onChange={(event) => editRow(row.id, { [zone]: event.target.value })}
-                        disabled={locked || !isRcukRental}
-                      />
-                    </td>
-                  ))}
-                  {flagFields.map(([flag, label]) => (
-                    <td key={flag} className="rental-cell-check">
-                      <input
-                        type="checkbox"
-                        checked={row[flag]}
-                        onChange={(event) => editRow(row.id, { [flag]: event.target.checked })}
-                        disabled={locked || !isRcukRental}
-                        aria-label={label}
-                      />
-                    </td>
-                  ))}
+                  {isRcukRental ? (
+                    <>
+                      {zoneFields.map((zone) => (
+                        <td key={zone}>
+                          <input
+                            className={`rental-cell-num ${zoneOff ? "input-invalid" : ""}`}
+                            inputMode="numeric"
+                            value={row[zone]}
+                            onChange={(event) => editRow(row.id, { [zone]: event.target.value })}
+                            disabled={locked}
+                          />
+                        </td>
+                      ))}
+                      {flagFields.map(([flag, label]) => (
+                        <td key={flag} className="rental-cell-check">
+                          <input
+                            type="checkbox"
+                            checked={row[flag]}
+                            onChange={(event) => editRow(row.id, { [flag]: event.target.checked })}
+                            disabled={locked}
+                            aria-label={label}
+                          />
+                        </td>
+                      ))}
+                    </>
+                  ) : null}
                   <td>
                     <select
                       value={row.rentalPhoneId}
@@ -3408,7 +3647,25 @@ function RentalReportForm({
                   <td>
                     <input value={row.ref} onChange={(event) => editRow(row.id, { ref: event.target.value })} readOnly={locked} />
                   </td>
-                  <td className="rental-cell-computed">{formatMoney(rowPricing(row).totalPrice)}</td>
+                  <td className="rental-cell-price">
+                    {/* The calculated price shows as before; typing over it
+                        sets this line's price instead. */}
+                    <input
+                      className="rental-cell-num"
+                      inputMode="decimal"
+                      value={row.priceOverride}
+                      placeholder={rowPricing(row).totalPrice.toFixed(2)}
+                      onChange={(event) => editRow(row.id, { priceOverride: event.target.value })}
+                      readOnly={locked}
+                      aria-label="Rental price"
+                    />
+                    {String(row.priceOverride ?? "").trim() !== "" ? (
+                      <small className="muted">Calculated {formatMoney(rowPricing(row).totalPrice)}</small>
+                    ) : null}
+                    {rowDeposit(row) > 0 ? (
+                      <small className="muted">+ {formatMoney(rowDeposit(row))} deposit = {formatMoney(rowTotal(row))}</small>
+                    ) : null}
+                  </td>
                   <td className="rental-cell-actions">
                     <button type="button" className="ghost-button compact-button" onClick={() => duplicateRow(row.id)} title="Duplicate this row">
                       Copy
@@ -3450,6 +3707,13 @@ function RentalReportForm({
           <span>{filledRows.length} rental{filledRows.length === 1 ? "" : "s"}</span>
           <strong>{formatMoney(batchTotal)}</strong>
         </div>
+        {batchDeposit > 0 ? (
+          <p className="muted">
+            Includes {formatMoney(batchDeposit)} of refundable SIM-only deposit
+            ({formatMoney(SIM_ONLY_DEPOSIT)} per SIM going out without a handset). It goes back to the
+            customer's card automatically when the rental is marked returned.
+          </p>
+        ) : null}
 
         {sharedProblems.length || rowProblemList.length ? (
           <div className="summary-error">
@@ -3529,13 +3793,16 @@ function DialogCloseButton({ onClose, label = "Close" }) {
 }
 
 // A SIM lives in one phone. Two handsets carrying the same number would each
-// claim it, and scanning either would fill a rental in with the wrong one.
+// claim it, and scanning either would fill a rental in with the wrong one. Both
+// slots are searched, so a scanned SIM finds its phone whichever one it is in.
 function fleetSimOwner(phones, simNumber, ignoreId = "") {
-  const clean = normalizeRcukSimNumber(simNumber);
-  if (!clean) return null;
-  return phones.find(
-    (phone) => phone.id !== ignoreId && normalizeRcukSimNumber(phone.simNumber) === clean,
-  ) || null;
+  const rcuk = normalizeRcukSimNumber(simNumber);
+  const plain = digitsOnly(simNumber);
+  if (!plain) return null;
+  return phones.find((phone) => phone.id !== ignoreId && (
+    normalizeRcukSimNumber(phone.simNumber) === rcuk
+    || digitsOnly(phone.simNumberIl) === plain
+  )) || null;
 }
 
 function AddRentalPhoneDialog({ existingPhones = [], initialImei = "", onAdd, onClose }) {
@@ -3544,6 +3811,7 @@ function AddRentalPhoneDialog({ existingPhones = [], initialImei = "", onAdd, on
   // so only the name is left to fill in.
   const [imei, setImei] = useState(initialImei);
   const [simNumber, setSimNumber] = useState("");
+  const [simNumberIl, setSimNumberIl] = useState("");
   const [error, setError] = useState("");
 
   function submit(event) {
@@ -3555,12 +3823,12 @@ function AddRentalPhoneDialog({ existingPhones = [], initialImei = "", onAdd, on
       setError("That IMEI is already in the fleet.");
       return;
     }
-    const simClash = fleetSimOwner(existingPhones, simNumber);
+    const simClash = fleetSimOwner(existingPhones, simNumber) || fleetSimOwner(existingPhones, simNumberIl);
     if (simClash) {
       setError(`That SIM is already saved against ${simClash.name}. Take it off that phone first.`);
       return;
     }
-    onAdd({ name: name.trim(), imei: cleanImei, simNumber });
+    onAdd({ name: name.trim(), imei: cleanImei, simNumber, simNumberIl });
   }
 
   return createPortal(
@@ -3596,7 +3864,7 @@ function AddRentalPhoneDialog({ existingPhones = [], initialImei = "", onAdd, on
             />
           </label>
           <label className="field full">
-            <span>SIM in this phone (optional)</span>
+            <span>RCUK SIM in this phone (optional)</span>
             <input
               value={simNumber}
               onChange={(event) => { setSimNumber(event.target.value); setError(""); }}
@@ -3604,6 +3872,17 @@ function AddRentalPhoneDialog({ existingPhones = [], initialImei = "", onAdd, on
               autoComplete="off"
               spellCheck={false}
               placeholder="Scan the SIM — scanning this phone later fills it in for you"
+            />
+          </label>
+          <label className="field full">
+            <span>Israeli SIM in this phone (optional)</span>
+            <input
+              value={simNumberIl}
+              onChange={(event) => { setSimNumberIl(event.target.value); setError(""); }}
+              inputMode="numeric"
+              autoComplete="off"
+              spellCheck={false}
+              placeholder="Scan the Israeli SIM — used on an Israel rental"
             />
           </label>
           {error ? <p className="summary-error full">{error}</p> : null}
@@ -5019,7 +5298,7 @@ function PendingReportCard({ pendingReport, activeEmployee, onSaveCustomerName, 
   );
 }
 
-function PhoneOrderPage({ activeEmployee, sessionRole, activeLocation, storeLocations, phoneOrders, orderHandlers, storeTax, storeDevices, products, onSaveCustomerName, onSaveCustomer, onCreate, onMarkReady, onAssignDriver, onCancel, onDelivered }) {
+function PhoneOrderPage({ activeEmployee, sessionRole, activeLocation, storeLocations, phoneOrders, orderHandlers, storeTax, storeDevices, products, onSaveCustomerName, onSaveCustomer, onCreate, onMarkReady, onUpdateOrder, onAssignDriver, onCancel, onDelivered }) {
   const [outOfState, setOutOfState] = useState(false);
   // Customer resolved by the phone field (queried on demand), for prompts/snapshot.
   const [resolvedCustomer, setResolvedCustomer] = useState(null);
@@ -5035,6 +5314,14 @@ function PhoneOrderPage({ activeEmployee, sessionRole, activeLocation, storeLoca
     notes: "",
   });
   const [cart, setCart] = useState([]);
+  // Payment taken here and now, when the customer is on the phone with a card in
+  // their hand. Held until the order is created, then written onto it so the
+  // store isn't asked to collect money that is already in.
+  const [taken, setTaken] = useState(null);
+  const [payOpen, setPayOpen] = useState(false);
+  // The order's id exists before the order does, so a charge taken on this
+  // screen carries the same reference the saved order will.
+  const pendingOrderIdRef = useRef(crypto.randomUUID());
   const [scan, setScan] = useState("");
   const [productSearch, setProductSearch] = useState("");
   const [scanMode, setScanMode] = useState(true);
@@ -5068,11 +5355,12 @@ function PhoneOrderPage({ activeEmployee, sessionRole, activeLocation, storeLoca
     (order) => order.status === "Out for delivery" && (atMyStore(order) || order.assignedTo === activeEmployee),
   );
 
+  // Every store sells every product; what differs is how many are on its shelf.
   const availableProducts = useMemo(
     () => products
-      .filter((product) => !form.location || !product.location || product.location === form.location)
+      .slice()
       .sort((a, b) => String(a.name || "").localeCompare(String(b.name || ""))),
-    [products, form.location],
+    [products],
   );
   const productsById = useMemo(
     () => Object.fromEntries(products.map((product) => [product.id, product])),
@@ -5105,20 +5393,12 @@ function PhoneOrderPage({ activeEmployee, sessionRole, activeLocation, storeLoca
     return findProductsByTerm(productSearch).slice(0, 20);
   }, [productSearch, availableProducts]);
 
-  // Don't dump the whole catalog — only surface matches once the user has typed
-  // a couple of characters.
-  const quickAddProducts = useMemo(() => {
-    const clean = productSearch.trim().toLowerCase();
-    if (clean.length < 2) return [];
-    return findProductsByTerm(productSearch);
-  }, [productSearch, availableProducts]);
-
   function imeiLineStatus(line) {
     if (!line.requiresImei) return "ok";
     if (!line.imei) return "missing";
     const duplicate = cart.filter((other) => other.requiresImei && other.imei === line.imei).length > 1;
     if (duplicate) return "duplicate";
-    const stock = productsById[line.productId]?.imeis || [];
+    const stock = storeStockEntry(productsById[line.productId], form.location).imeis;
     if (stock.length > 0 && !stock.includes(line.imei)) return "notstock";
     return "ok";
   }
@@ -5139,7 +5419,7 @@ function PhoneOrderPage({ activeEmployee, sessionRole, activeLocation, storeLoca
   }
 
   function addProductToCart(product) {
-    const stock = product.requiresImei ? (product.imeis?.length || 0) : (Number(product.quantity) || 0);
+    const stock = storeStockCount(product, form.location);
     const inCart = cart
       .filter((line) => line.productId === product.id)
       .reduce((sum, line) => sum + (Number(line.qty) || 0), 0);
@@ -5234,6 +5514,13 @@ function PhoneOrderPage({ activeEmployee, sessionRole, activeLocation, storeLoca
     setForm((current) => ({ ...current, [name]: value }));
   }
 
+  // A payment is for a figure. Change the basket or the total after taking one
+  // and it no longer matches what was charged, so it is dropped rather than
+  // left to be filed against the wrong amount.
+  useEffect(() => {
+    setTaken((current) => (current && current.amount !== orderTotal.toFixed(2) ? null : current));
+  }, [orderTotal]);
+
   function handleCreateOrder() {
     if (!canCreate) return;
     const digits = localPhoneDigits(form.customerPhone);
@@ -5249,7 +5536,7 @@ function PhoneOrderPage({ activeEmployee, sessionRole, activeLocation, storeLoca
   function createOrder(matchedCustomer) {
     const onFileAddress = form.customerAddress.trim() || matchedCustomer?.address || form.deliveryAddress.trim();
     const order = {
-      id: crypto.randomUUID(),
+      id: pendingOrderIdRef.current,
       type: "phoneOrder",
       // Routed to a store; the store fulfills it (scan IMEI / charge) before it
       // becomes Ready and then Out for delivery.
@@ -5288,10 +5575,12 @@ function PhoneOrderPage({ activeEmployee, sessionRole, activeLocation, storeLoca
       taxAmount: taxAmount.toFixed(2),
       outOfState: outOfState ? "Yes" : "No",
       orderTotal: orderTotal.toFixed(2),
-      paymentStatus: form.paymentStatus,
-      paymentMethod: form.paymentMethod,
-      cardStatus: "",
-      solaRefNum: "",
+      // Paid on this screen, or left for the store to collect.
+      paymentStatus: taken ? "Paid" : form.paymentStatus,
+      paymentMethod: taken?.paymentMethod || form.paymentMethod,
+      cardStatus: taken?.refNum ? "paid" : "",
+      solaRefNum: taken?.refNum || "",
+      paidAt: taken ? new Date().toISOString() : "",
       storeAddress: formatStoreAddress((storeTax || []).find((entry) => entry?.name === form.location)),
       storeHours: (storeTax || []).find((entry) => entry?.name === form.location)?.hours || "",
       notes: form.notes.trim(),
@@ -5299,6 +5588,9 @@ function PhoneOrderPage({ activeEmployee, sessionRole, activeLocation, storeLoca
     onCreate(order);
     printPhoneOrderReceipt(order);
     setCart([]);
+    setTaken(null);
+    // The next order is a new order, and a new reference.
+    pendingOrderIdRef.current = crypto.randomUUID();
     setCustomerPrompt(null);
     setForm((current) => ({
       ...current,
@@ -5351,10 +5643,14 @@ function PhoneOrderPage({ activeEmployee, sessionRole, activeLocation, storeLoca
           </div>
           <div className="summary-strip">
             <span className="metric">Store <strong>{form.location || "Unassigned"}</strong></span>
+            <span className="metric">Taken by <strong>{activeEmployee}</strong></span>
             <span className="metric">Total <strong>{formatMoney(orderTotal)}</strong></span>
           </div>
         </div>
 
+        {/* Everything the call-taker asks for, in one block. It used to be three
+            stacked grids with a read-only "Created by" box in the middle, which
+            pushed the item scanner below the fold on a shop screen. */}
         <div className="form-grid">
           <label className="field">
             <span>Assign to store</span>
@@ -5364,13 +5660,6 @@ function PhoneOrderPage({ activeEmployee, sessionRole, activeLocation, storeLoca
             </select>
           </label>
           <label className="field">
-            <span>Created by</span>
-            <input value={activeEmployee} readOnly disabled />
-          </label>
-        </div>
-
-        <div className="form-grid">
-          <label className="field full">
             <span>Customer phone</span>
             <CustomerPhoneInput
               value={form.customerPhone}
@@ -5388,8 +5677,12 @@ function PhoneOrderPage({ activeEmployee, sessionRole, activeLocation, storeLoca
           </label>
           <label className="field full">
             <span>Delivery address</span>
-            <input value={form.deliveryAddress} onChange={(event) => updateField("deliveryAddress", event.target.value)} placeholder="Where to deliver this order" required />
-            <small className="muted">Defaults to the customer address — change it if delivering somewhere else.</small>
+            <input
+              value={form.deliveryAddress}
+              onChange={(event) => updateField("deliveryAddress", event.target.value)}
+              placeholder="Where to deliver — starts as the address on file, change it if it ships elsewhere"
+              required
+            />
           </label>
         </div>
 
@@ -5410,22 +5703,19 @@ function PhoneOrderPage({ activeEmployee, sessionRole, activeLocation, storeLoca
           />
           {!scanMode ? <button className="primary-button" type="submit">Add</button> : null}
         </form>
-        <label className="field full product-search-field">
-          <span>Find item by name</span>
-          <input
-            className="pos-search"
-            value={productSearch}
-            onChange={(event) => setProductSearch(event.target.value)}
-            placeholder="Search item name, SKU, or barcode"
-            autoComplete="off"
-            spellCheck={false}
-          />
-        </label>
+        <input
+          className="pos-search"
+          value={productSearch}
+          onChange={(event) => setProductSearch(event.target.value)}
+          placeholder="Or search by item name, SKU, or barcode"
+          autoComplete="off"
+          spellCheck={false}
+        />
         {productSearch.trim() ? (
           productMatches.length ? (
             <div className="product-search-results">
               {productMatches.map((product) => {
-                const stock = product.requiresImei ? product.imeis?.length || 0 : Number(product.quantity) || 0;
+                const stock = storeStockCount(product, form.location);
                 return (
                   <button
                     className="product-search-row"
@@ -5542,40 +5832,59 @@ function PhoneOrderPage({ activeEmployee, sessionRole, activeLocation, storeLoca
             </label>
           </div>
 
-          {form.paymentStatus === "Paid" && isCardPayment(form.paymentMethod) ? (
-            <p className="muted pos-warning">The store will charge the card on its terminal before marking the order ready.</p>
+          {form.paymentStatus === "Paid" ? (
+            taken ? (
+              <div className="payment-panel">
+                <p className="eyebrow">Paid</p>
+                <p>
+                  {formatMoney(Number(taken.amount) || 0)} taken by {taken.paymentMethod}
+                  {taken.refNum ? ` · ref ${taken.refNum}` : ""}. The store will not be asked to collect it again.
+                </p>
+                <button className="ghost-button compact-button" type="button" onClick={() => setTaken(null)}>
+                  Undo this payment
+                </button>
+              </div>
+            ) : (
+              <div className="payment-panel">
+                <p className="eyebrow">Payment</p>
+                <p className="muted">
+                  Take the {formatMoney(orderTotal)} now — a card runs on this store's terminal — or leave it and the
+                  store charges it before marking the order ready.
+                </p>
+                <button
+                  className="secondary-button"
+                  type="button"
+                  onClick={() => setPayOpen(true)}
+                  disabled={!cart.length || !(orderTotal > 0)}
+                >
+                  Take payment now
+                </button>
+              </div>
+            )
           ) : null}
           <p className="muted pos-checkout-hint">Use the Create order bar at the bottom of the screen.</p>
         </section>
       </div>
 
-      <section className="history">
-        <div className="history-header">
-          <div>
-            <p className="eyebrow">Quick add</p>
-            <h2>Products</h2>
-          </div>
-          <input
-            className="pos-search"
-            value={productSearch}
-            onChange={(event) => setProductSearch(event.target.value)}
-            placeholder="Search item name, SKU, or barcode"
-            autoComplete="off"
-            spellCheck={false}
-          />
-        </div>
-        <div className="pos-product-grid">
-          {quickAddProducts.length ? quickAddProducts.map((product) => (
-            <button className="pos-product" type="button" key={product.id} onClick={() => addProductFromSearch(product)}>
-              <strong>{product.name}</strong>
-              <span>{formatMoney(Number(product.price) || 0)}</span>
-              <small className="muted">{product.requiresImei ? `In stock ${product.imeis?.length || 0} - IMEI` : `Stock ${Number(product.quantity) || 0}`}</small>
-            </button>
-          )) : (
-            <p className="empty-state">{productSearch.trim().length >= 2 ? "No matching products for this store." : "Start typing to find a product."}</p>
-          )}
-        </div>
-      </section>
+      {payOpen ? (
+        <OrderPaymentDialog
+          order={{
+            id: pendingOrderIdRef.current,
+            orderTotal: orderTotal.toFixed(2),
+            paymentMethod: form.paymentMethod,
+            customerName: form.customerName,
+            customerPhone: form.customerPhone,
+            itemsText,
+          }}
+          heading="Take payment"
+          confirmLabel="Record payment"
+          onConfirm={(payment) => {
+            setTaken({ ...payment, amount: orderTotal.toFixed(2) });
+            setPayOpen(false);
+          }}
+          onClose={() => setPayOpen(false)}
+        />
+      ) : null}
 
       <div className="pos-action-spacer" />
       <div className="pos-action-bar">
@@ -5586,6 +5895,7 @@ function PhoneOrderPage({ activeEmployee, sessionRole, activeLocation, storeLoca
         <div className="pos-action-bar-cta">
           {!form.location.trim() ? <span className="pos-action-warn">Pick a store</span> : null}
           {!form.paymentStatus ? <span className="pos-action-warn">Choose payment status</span> : null}
+          {taken ? <span className="pos-action-paid">Paid · {formatMoney(Number(taken.amount) || 0)}</span> : null}
           {!form.paymentMethod ? <span className="pos-action-warn">Choose payment method</span> : null}
           <button className="primary-button pos-complete-button" type="button" disabled={!canCreate} onClick={handleCreateOrder}>
             {cart.length ? `Create order · ${formatMoney(orderTotal)}` : "Scan items to start"}
@@ -5608,6 +5918,8 @@ function PhoneOrderPage({ activeEmployee, sessionRole, activeLocation, storeLoca
         orders={fulfillmentOrders}
         products={products}
         onMarkReady={onMarkReady}
+        onUpdateOrder={onUpdateOrder}
+        orderHandlers={orderHandlers}
         onCancel={onCancel}
       />
 
@@ -5615,6 +5927,7 @@ function PhoneOrderPage({ activeEmployee, sessionRole, activeLocation, storeLoca
         orders={readyOrders}
         orderHandlers={orderHandlers}
         onAssignDriver={onAssignDriver}
+        onUpdateOrder={onUpdateOrder}
         onCancel={onCancel}
       />
 
@@ -5624,9 +5937,158 @@ function PhoneOrderPage({ activeEmployee, sessionRole, activeLocation, storeLoca
         sessionRole={sessionRole}
         activeLocation={activeLocation}
         onDelivered={onDelivered}
+        onUpdateOrder={onUpdateOrder}
+        orderHandlers={orderHandlers}
         onCancel={onCancel}
       />
     </>
+  );
+}
+
+// Correcting an order that was taken down wrong: the name misheard, the number
+// a digit out, the wrong address, the wrong driver, or a stage clicked twice.
+// It writes the record straight — it does not re-run the stage (no stock moves,
+// no driver gets texted), so the board buttons stay the only way an order is
+// actually moved along.
+const PHONE_ORDER_STATUSES = ["At store", "Ready", "Out for delivery", "Delivered", "Cancelled"];
+
+function PhoneOrderEditDialog({ order, orderHandlers = [], onSave, onClose }) {
+  const [form, setForm] = useState({
+    customerName: order.customerName || "",
+    customerPhone: order.customerPhone || "",
+    contactDetails: order.contactDetails || "",
+    address: order.address || "",
+    deliveryAddress: order.deliveryAddress || "",
+    assignedTo: order.assignedTo || "",
+    assignedPhone: order.assignedPhone || "",
+    status: order.status || "At store",
+    notes: order.notes || "",
+  });
+  const [error, setError] = useState("");
+
+  function set(name, value) {
+    setForm((current) => ({ ...current, [name]: value }));
+    setError("");
+  }
+
+  // Picking a known driver fills the phone the notification would go to; a name
+  // typed by hand is kept as typed, because drivers do get covered by someone.
+  function pickDriver(name) {
+    const handler = orderHandlers.find((entry) => entry.name === name);
+    setForm((current) => ({
+      ...current,
+      assignedTo: name,
+      assignedPhone: handler ? (handler.phone || "") : current.assignedPhone,
+    }));
+  }
+
+  function submit(event) {
+    event.preventDefault();
+    if (!form.deliveryAddress.trim()) { setError("An order still needs somewhere to go."); return; }
+    if (localPhoneDigits(form.customerPhone).length < 6) { setError("That is not enough of a phone number to reach anybody."); return; }
+    onSave({
+      customerName: titleCaseName(form.customerName.trim()),
+      customerPhone: form.customerPhone.trim(),
+      customerPhoneDigits: localPhoneDigits(form.customerPhone),
+      contactDetails: form.contactDetails.trim(),
+      address: form.address.trim(),
+      deliveryAddress: form.deliveryAddress.trim(),
+      assignedTo: form.assignedTo.trim(),
+      assignedPhone: form.assignedPhone.trim(),
+      status: form.status,
+      notes: form.notes.trim(),
+    });
+  }
+
+  const driverNames = uniqueValues([
+    ...orderHandlers.map((handler) => handler.name),
+    ...(form.assignedTo ? [form.assignedTo] : []),
+  ]);
+
+  return createPortal(
+    <div className="dialog-backdrop" role="presentation" onMouseDown={onClose}>
+      <div className="dialog-card dialog-card-wide" role="dialog" aria-modal="true" onMouseDown={(event) => event.stopPropagation()}>
+        <div className="dialog-head">
+          <div>
+            <p className="eyebrow">Phone order</p>
+            <h3>Edit this order</h3>
+            <p className="muted">{order.itemsText || order.model || "Order"} · {formatPayment(order.orderTotal)}</p>
+          </div>
+          <DialogCloseButton onClose={onClose} label="Close edit order" />
+        </div>
+        <form className="form-grid dialog-form" onSubmit={submit} onKeyDown={preventEnterSubmit}>
+          <label className="field">
+            <span>Customer name</span>
+            <input value={form.customerName} onChange={(event) => set("customerName", event.target.value)} />
+          </label>
+          <label className="field">
+            <span>Customer phone</span>
+            <input
+              value={form.customerPhone}
+              onChange={(event) => set("customerPhone", event.target.value)}
+              inputMode="tel"
+              autoComplete="off"
+            />
+          </label>
+          <label className="field full">
+            <span>Contact details</span>
+            <input
+              value={form.contactDetails}
+              onChange={(event) => set("contactDetails", event.target.value)}
+              placeholder="Email, WhatsApp, alternate phone"
+            />
+          </label>
+          <label className="field full">
+            <span>Delivery address</span>
+            <input value={form.deliveryAddress} onChange={(event) => set("deliveryAddress", event.target.value)} />
+          </label>
+          <label className="field full">
+            <span>Customer address on file</span>
+            <input
+              value={form.address}
+              onChange={(event) => set("address", event.target.value)}
+              placeholder="Where the customer lives, if the delivery goes elsewhere"
+            />
+          </label>
+          <label className="field">
+            <span>Driver</span>
+            <select value={form.assignedTo} onChange={(event) => pickDriver(event.target.value)}>
+              <option value="">Nobody yet</option>
+              {driverNames.map((name) => <option key={name}>{name}</option>)}
+            </select>
+          </label>
+          <label className="field">
+            <span>Driver phone</span>
+            <input
+              value={form.assignedPhone}
+              onChange={(event) => set("assignedPhone", event.target.value)}
+              inputMode="tel"
+              autoComplete="off"
+            />
+          </label>
+          <label className="field full">
+            <span>Delivery status</span>
+            <select value={form.status} onChange={(event) => set("status", event.target.value)}>
+              {PHONE_ORDER_STATUSES.map((status) => <option key={status}>{status}</option>)}
+            </select>
+            <small className="muted">
+              Corrects where the order sits on the boards. It does not move stock, take payment, or text the driver —
+              use the buttons on the cards for that.
+            </small>
+          </label>
+          <label className="field full">
+            <span>Notes</span>
+            <textarea rows="2" value={form.notes} onChange={(event) => set("notes", event.target.value)} />
+          </label>
+          {error ? <p className="summary-error full">{error}</p> : null}
+          <div className="pos-form-actions form-actions-row">
+            <button className="primary-button" type="submit">Save changes</button>
+            <button className="secondary-button" type="button" onClick={onClose}>Cancel</button>
+          </div>
+        </form>
+      </div>
+    </div>,
+    document.body,
   );
 }
 
@@ -5660,7 +6122,7 @@ function PhoneOrderSummary({ order }) {
 
 // Stage 2 — the store fulfills each order: scan the IMEI(s), charge the card if
 // it's a pay-now CC order, then mark it ready for a driver.
-function StoreFulfillmentBoard({ orders, products, onMarkReady, onCancel }) {
+function StoreFulfillmentBoard({ orders, products, onMarkReady, onUpdateOrder, orderHandlers, onCancel }) {
   return (
     <div className="order-board">
       <div className="history-header">
@@ -5673,7 +6135,15 @@ function StoreFulfillmentBoard({ orders, products, onMarkReady, onCancel }) {
       <div className="pending-grid">
         {orders.length ? (
           orders.map((order) => (
-            <StoreOrderCard key={order.id} order={order} products={products} onMarkReady={onMarkReady} onCancel={onCancel} />
+            <StoreOrderCard
+              key={order.id}
+              order={order}
+              products={products}
+              onMarkReady={onMarkReady}
+              onUpdateOrder={onUpdateOrder}
+              orderHandlers={orderHandlers}
+              onCancel={onCancel}
+            />
           ))
         ) : (
           <p className="empty-state">No orders waiting to be prepared.</p>
@@ -5791,7 +6261,8 @@ function OrderPaymentDialog({ order, heading, confirmLabel, onConfirm, onClose }
   );
 }
 
-function StoreOrderCard({ order, products, onMarkReady, onCancel }) {
+function StoreOrderCard({ order, products, onMarkReady, onUpdateOrder, orderHandlers, onCancel }) {
+  const [editing, setEditing] = useState(false);
   const imeiLines = (order.lineItems || []).filter((line) => line.requiresImei);
   const [imeis, setImeis] = useState(() => imeiLines.map((line) => line.imei || ""));
   const [payOpen, setPayOpen] = useState(false);
@@ -5800,13 +6271,16 @@ function StoreOrderCard({ order, products, onMarkReady, onCancel }) {
   const [payment, setPayment] = useState(null);
 
   const needsPayment = order.paymentStatus === "Paid";
-  const paid = !needsPayment || Boolean(payment);
+  // Money already taken when the order was placed counts: the store is only
+  // asked to collect what is genuinely still outstanding.
+  const paidUpFront = Boolean(order.paidAt) || order.cardStatus === "paid";
+  const paid = !needsPayment || paidUpFront || Boolean(payment);
 
   function imeiStatus(index) {
     const value = imeis[index];
     if (!value) return "missing";
     if (imeis.filter((other) => other === value).length > 1) return "duplicate";
-    const stock = products.find((product) => product.id === imeiLines[index].productId)?.imeis || [];
+    const stock = storeStockEntry(products.find((product) => product.id === imeiLines[index].productId), order.location).imeis;
     if (stock.length > 0 && !stock.includes(value)) return "notstock";
     return "ok";
   }
@@ -5824,11 +6298,12 @@ function StoreOrderCard({ order, products, onMarkReady, onCancel }) {
     });
     onMarkReady(order.id, {
       lineItems,
-      cardStatus: payment?.refNum ? "paid" : "",
-      solaRefNum: payment?.refNum || "",
+      // Never blank a charge the order already carries from when it was placed.
+      cardStatus: payment?.refNum ? "paid" : (order.cardStatus || ""),
+      solaRefNum: payment?.refNum || order.solaRefNum || "",
       paymentMethod: payment?.paymentMethod || order.paymentMethod,
-      paymentStatus: payment ? "Paid" : order.paymentStatus,
-      paidAt: payment ? new Date().toISOString() : "",
+      paymentStatus: payment || paidUpFront ? "Paid" : order.paymentStatus,
+      paidAt: payment ? new Date().toISOString() : (order.paidAt || ""),
     });
   }
 
@@ -5866,12 +6341,23 @@ function StoreOrderCard({ order, products, onMarkReady, onCancel }) {
         <div className="payment-panel payment-panel-stack">
           <div>
             <p className="eyebrow">Payment</p>
-            <h3>{payment ? `Paid · ${payment.paymentMethod}` : `${formatPayment(order.orderTotal)} due before this goes out`}</h3>
+            <h3>
+              {payment ? `Paid · ${payment.paymentMethod}`
+                : paidUpFront ? `Paid · ${order.paymentMethod || "on the order"}`
+                  : `${formatPayment(order.orderTotal)} due before this goes out`}
+            </h3>
           </div>
           {payment ? (
             <p className="muted">
               Recorded as {payment.paymentMethod}{payment.refNum ? ` · ref ${payment.refNum}` : ""}.
               <button className="ghost-button compact-button" type="button" onClick={() => setPayment(null)}>Undo</button>
+            </p>
+          ) : paidUpFront ? (
+            // Charged when the order was taken. Asking the store to collect it
+            // again is how a customer gets billed twice.
+            <p className="muted">
+              Taken when the order was placed{order.solaRefNum ? ` · ref ${order.solaRefNum}` : ""}
+              {order.paidAt ? ` · ${formatShortDate(order.paidAt)}` : ""}. Nothing to collect.
             </p>
           ) : (
             <button className="secondary-button" type="button" onClick={() => setPayOpen(true)}>
@@ -5889,10 +6375,22 @@ function StoreOrderCard({ order, products, onMarkReady, onCancel }) {
         <button className="primary-button" type="button" disabled={!canReady} onClick={markReady}>
           Mark ready
         </button>
+        <button className="secondary-button" type="button" onClick={() => setEditing(true)}>
+          Edit
+        </button>
         <button className="secondary-button" type="button" onClick={() => confirmCancelOrder(order, onCancel)}>
           Cancel order
         </button>
       </div>
+
+      {editing ? (
+        <PhoneOrderEditDialog
+          order={order}
+          orderHandlers={orderHandlers}
+          onSave={(patch) => { onUpdateOrder?.(order.id, patch); setEditing(false); }}
+          onClose={() => setEditing(false)}
+        />
+      ) : null}
 
       {payOpen ? (
         <OrderPaymentDialog
@@ -5912,7 +6410,7 @@ function StoreOrderCard({ order, products, onMarkReady, onCancel }) {
 
 // Stage 3 — the store hands a ready order to a driver, which texts the driver
 // and the customer.
-function AssignDriverBoard({ orders, orderHandlers, onAssignDriver, onCancel }) {
+function AssignDriverBoard({ orders, orderHandlers, onAssignDriver, onUpdateOrder, onCancel }) {
   return (
     <div className="order-board">
       <div className="history-header">
@@ -5925,7 +6423,14 @@ function AssignDriverBoard({ orders, orderHandlers, onAssignDriver, onCancel }) 
       <div className="pending-grid">
         {orders.length ? (
           orders.map((order) => (
-            <AssignDriverCard key={order.id} order={order} orderHandlers={orderHandlers} onAssignDriver={onAssignDriver} onCancel={onCancel} />
+            <AssignDriverCard
+              key={order.id}
+              order={order}
+              orderHandlers={orderHandlers}
+              onAssignDriver={onAssignDriver}
+              onUpdateOrder={onUpdateOrder}
+              onCancel={onCancel}
+            />
           ))
         ) : (
           <p className="empty-state">No orders ready for a driver.</p>
@@ -5935,7 +6440,8 @@ function AssignDriverBoard({ orders, orderHandlers, onAssignDriver, onCancel }) 
   );
 }
 
-function AssignDriverCard({ order, orderHandlers, onAssignDriver, onCancel }) {
+function AssignDriverCard({ order, orderHandlers, onAssignDriver, onUpdateOrder, onCancel }) {
+  const [editing, setEditing] = useState(false);
   const drivers = orderHandlers.filter((handler) => handler.location === order.location);
   const list = drivers.length ? drivers : orderHandlers;
   const [driverId, setDriverId] = useState(list[0]?.id || "");
@@ -5965,17 +6471,28 @@ function AssignDriverCard({ order, orderHandlers, onAssignDriver, onCancel }) {
         <button className="primary-button" type="button" disabled={!driver} onClick={() => driver && onAssignDriver(order.id, driver)}>
           Assign driver &amp; notify
         </button>
+        <button className="secondary-button" type="button" onClick={() => setEditing(true)}>
+          Edit
+        </button>
         <button className="secondary-button" type="button" onClick={() => confirmCancelOrder(order, onCancel)}>
           Cancel order
         </button>
       </div>
+      {editing ? (
+        <PhoneOrderEditDialog
+          order={order}
+          orderHandlers={orderHandlers}
+          onSave={(patch) => { onUpdateOrder?.(order.id, patch); setEditing(false); }}
+          onClose={() => setEditing(false)}
+        />
+      ) : null}
     </article>
   );
 }
 
 // Stage 4 — out for delivery. The assigned driver, the store, or an admin can
 // mark it delivered, which files the report and texts the customer.
-function DeliveryBoard({ orders, activeEmployee, sessionRole, activeLocation, onDelivered, onCancel }) {
+function DeliveryBoard({ orders, activeEmployee, sessionRole, activeLocation, onDelivered, onUpdateOrder, orderHandlers, onCancel }) {
   return (
     <div className="order-board">
       <div className="history-header">
@@ -5996,6 +6513,8 @@ function DeliveryBoard({ orders, activeEmployee, sessionRole, activeLocation, on
               order={order}
               canDeliver={canDeliver}
               onDelivered={onDelivered}
+              onUpdateOrder={onUpdateOrder}
+              orderHandlers={orderHandlers}
               onCancel={onCancel}
             />
           );
@@ -6010,7 +6529,8 @@ function DeliveryBoard({ orders, activeEmployee, sessionRole, activeLocation, on
 // One open delivery. A collect-on-delivery order takes its payment here — the
 // money changes hands at the door, and this is the last point where the app can
 // record what it was. Prepaid orders were already settled at the store.
-function DeliveryCard({ order, canDeliver, onDelivered, onCancel }) {
+function DeliveryCard({ order, canDeliver, onDelivered, onUpdateOrder, orderHandlers, onCancel }) {
+  const [editing, setEditing] = useState(false);
   const [payOpen, setPayOpen] = useState(false);
   const collectOnDelivery = order.paymentStatus !== "Paid";
 
@@ -6039,10 +6559,22 @@ function DeliveryCard({ order, canDeliver, onDelivered, onCancel }) {
         >
           {collectOnDelivery ? `Take payment · mark delivered` : "Mark delivered"}
         </button>
+        <button className="secondary-button" type="button" onClick={() => setEditing(true)}>
+          Edit
+        </button>
         <button className="secondary-button" type="button" disabled={!canDeliver} onClick={() => confirmCancelOrder(order, onCancel)}>
           Cancel order
         </button>
       </div>
+
+      {editing ? (
+        <PhoneOrderEditDialog
+          order={order}
+          orderHandlers={orderHandlers}
+          onSave={(patch) => { onUpdateOrder?.(order.id, patch); setEditing(false); }}
+          onClose={() => setEditing(false)}
+        />
+      ) : null}
 
       {payOpen ? (
         <OrderPaymentDialog
@@ -6069,6 +6601,11 @@ function PosPage({ products, reports = [], storeLocations = [], activeEmployee, 
   const [restock, setRestock] = useState(null);
   // Customer resolved by the phone field (queried on demand) for the receipt/CRM.
   const [resolvedCustomer, setResolvedCustomer] = useState(null);
+  // How much of this sale goes on the customer's account: their credit spent,
+  // or a tab run up to be settled later. Typed in dollars, like every other
+  // amount at this till.
+  const [accountInput, setAccountInput] = useState("");
+  const [accountState, setAccountState] = useState({ status: "idle", message: "" });
   const [productSearch, setProductSearch] = useState("");
   const [sortMode, setSortMode] = useState("used");
   const [customerPhone, setCustomerPhone] = useState("");
@@ -6090,12 +6627,14 @@ function PosPage({ products, reports = [], storeLocations = [], activeEmployee, 
     scanRef.current?.focus();
   }, []);
 
+  // Every product shows at every register — out of stock where this store has
+  // none — because the catalog is shared and only the stock is the store's.
   const availableProducts = useMemo(
     () =>
       products
-        .filter((product) => !activeLocation || !product.location || product.location === activeLocation)
+        .slice()
         .sort((a, b) => String(a.name || "").localeCompare(String(b.name || ""))),
-    [products, activeLocation],
+    [products],
   );
 
   const productsById = useMemo(
@@ -6152,7 +6691,7 @@ function PosPage({ products, reports = [], storeLocations = [], activeEmployee, 
     if (!line.imei) return "missing";
     const duplicate = cart.filter((other) => other.requiresImei && other.imei === line.imei).length > 1;
     if (duplicate) return "duplicate";
-    const stock = productsById[line.productId]?.imeis || [];
+    const stock = storeStockEntry(productsById[line.productId], activeLocation).imeis;
     if (stock.length > 0 && !stock.includes(line.imei)) return "notstock";
     return "ok";
   }
@@ -6222,8 +6761,7 @@ function PosPage({ products, reports = [], storeLocations = [], activeEmployee, 
     );
     if (!matches.length) return null;
     return (
-      matches.find((product) => product.location === activeLocation) ||
-      matches.find((product) => !product.location) ||
+      matches.find((product) => storeStockEntry(product, activeLocation).imeis.some((value) => digitsOnly(value) === clean)) ||
       matches[0]
     );
   }
@@ -6238,14 +6776,13 @@ function PosPage({ products, reports = [], storeLocations = [], activeEmployee, 
     );
     if (!matches.length) return null;
     return (
-      matches.find((product) => product.location === activeLocation) ||
-      matches.find((product) => !product.location) ||
+      matches.find((product) => storeStockCount(product, activeLocation) > 0) ||
       matches[0]
     );
   }
 
   function addProductToCart(product, imei = "") {
-    const stock = product.requiresImei ? (product.imeis?.length || 0) : (Number(product.quantity) || 0);
+    const stock = storeStockCount(product, activeLocation);
     const inCart = cart
       .filter((line) => line.productId === product.id)
       .reduce((sum, line) => sum + (Number(line.qty) || 0), 0);
@@ -6334,14 +6871,13 @@ function PosPage({ products, reports = [], storeLocations = [], activeEmployee, 
   // came in). Mirrors Inventory's restock so counts stay consistent.
   function addStock(product, { addQuantity, newImeis, location, barcode }) {
     if (!onSaveProduct || !product) return;
-    const nextLocation = location === undefined ? product.location : location;
+    const store = location || activeLocation;
     const barcodePatch = barcode && !product.barcode ? { barcode: String(barcode).trim() } : {};
-    if (product.requiresImei) {
-      onSaveProduct({ ...product, location: nextLocation, ...barcodePatch, imeis: [...(product.imeis || []), ...newImeis] });
-    } else {
-      onSaveProduct({ ...product, location: nextLocation, ...barcodePatch, quantity: (Number(product.quantity) || 0) + addQuantity });
-    }
-    setMessage(`Restocked ${product.name}.`);
+    const restocked = product.requiresImei
+      ? adjustStoreStock(product, store, { addImeis: newImeis })
+      : adjustStoreStock(product, store, { addQty: addQuantity });
+    onSaveProduct({ ...restocked, ...barcodePatch });
+    setMessage(`Restocked ${product.name} at ${store}.`);
   }
 
   const subtotal = cart.reduce((sum, line) => sum + effectiveLinePrice(line) * line.qty, 0);
@@ -6350,27 +6886,54 @@ function PosPage({ products, reports = [], storeLocations = [], activeEmployee, 
 
   const firstIsCard = isCardPayment(paymentMethod);
   const secondIsCard = isCardPayment(splitSecondMethod);
-  // Splitting a sale between cash and a card taxes the card share only: the
-  // amount typed for each side is its share of the pre-tax subtotal, and the
-  // sales tax rides on top of whichever side is the card.
-  const splitTaxOnCardOnly = splitPayment && Boolean(splitSecondMethod) && firstIsCard !== secondIsCard;
+  // Cash carries no sales tax on a split sale. The amount typed for each side is
+  // its share of the pre-tax subtotal, and the tax rides on top of the side that
+  // isn't the cash one. Split two ways that are neither of them cash — a card
+  // and a check, say — and the whole subtotal is taxed as usual.
+  const firstIsCash = paymentMethod === "Cash";
+  const secondIsCash = splitSecondMethod === "Cash";
+  const splitTaxOnOneSide = splitPayment && Boolean(splitSecondMethod) && firstIsCash !== secondIsCash;
+  const taxOnFirst = splitTaxOnOneSide && !firstIsCash;
+  const taxedSideMethod = splitTaxOnOneSide ? (taxOnFirst ? paymentMethod : splitSecondMethod) : "";
   const splitFirstEntered = splitPayment ? Math.max(0, Number(splitFirstInput) || 0) : 0;
-  // What the split is measured against: the pre-tax subtotal when only the card
-  // share is taxed, otherwise the full total the customer owes.
-  const splitBasis = splitTaxOnCardOnly ? subtotal : 0;
-  const taxBase = splitTaxOnCardOnly
-    ? Math.min(subtotal, Math.max(0, firstIsCard ? splitFirstEntered : subtotal - splitFirstEntered))
+  // What the split is measured against: the pre-tax subtotal when only one side
+  // is taxed, otherwise the full total the customer owes.
+  const splitBasis = splitTaxOnOneSide ? subtotal : 0;
+  const taxBase = splitTaxOnOneSide
+    ? Math.min(subtotal, Math.max(0, taxOnFirst ? splitFirstEntered : subtotal - splitFirstEntered))
     : subtotal;
   const taxApplies = !outOfState && taxRate > 0;
   const taxAmount = taxApplies ? taxBase * (taxRate / 100) : 0;
   const total = subtotal + taxAmount;
-  // The card side pays its share plus the tax; the cash side pays its share flat.
-  const splitFirstAmount = splitTaxOnCardOnly && firstIsCard ? splitFirstEntered + taxAmount : splitFirstEntered;
-  const splitSecondAmount = splitPayment ? Math.max(0, total - splitFirstAmount) : 0;
+
+  // The customer's account, if the phone box has found one. Credit is money the
+  // shop is holding for them; a negative balance is a tab they are already on.
+  const accountCustomer = (() => {
+    const localDigits = localPhoneDigits(customerPhone);
+    if (localDigits.length < 6) return null;
+    return customerMatchesDigits(resolvedCustomer, localDigits) ? resolvedCustomer : null;
+  })();
+  const accountBalance = roundCents(accountCustomer?.balance);
+  const accountCredit = Math.max(0, accountBalance);
+  const accountEntered = roundCents(Math.max(0, Number(accountInput) || 0));
+  // Never more than the sale: the change from an over-typed figure would have to
+  // come out of the till in cash, which is not what putting it on account means.
+  const accountApplied = accountCustomer ? Math.min(accountEntered, total) : 0;
+  // Anything past their credit is the shop lending them the difference.
+  const accountOnTab = roundCents(Math.max(0, accountApplied - accountCredit));
+
+  // The taxed side pays its share plus the tax; the cash side pays its share flat.
+  const splitFirstAmount = taxOnFirst ? splitFirstEntered + taxAmount : splitFirstEntered;
+  // Whatever the account covers is already paid for; the split is over the rest.
+  const dueAtTill = roundCents(Math.max(0, total - accountApplied));
+  const splitSecondAmount = splitPayment ? Math.max(0, dueAtTill - splitFirstAmount) : 0;
+  // Which method the sales tax actually went out on, so a refund later hands it
+  // back to that side instead of spreading it over the cash that never paid it.
+  const taxPaidBy = taxAmount > 0 ? taxedSideMethod : "";
   // Only the card's share goes to the terminal, not the whole sale.
   const cardAmount = splitPayment
     ? (firstIsCard ? splitFirstAmount : 0) + (secondIsCard ? splitSecondAmount : 0)
-    : (firstIsCard ? total : 0);
+    : (firstIsCard ? dueAtTill : 0);
   const requiresCardCharge = cardAmount > 0;
   const cardChargeComplete = !requiresCardCharge || card.status === "paid";
   const splitIssue = (() => {
@@ -6378,17 +6941,23 @@ function PosPage({ products, reports = [], storeLocations = [], activeEmployee, 
     if (!splitSecondMethod) return "Choose the second payment method.";
     if (splitSecondMethod === paymentMethod) return "Pick two different payment methods.";
     if (!(splitFirstEntered > 0)) return "Enter how much goes on the first method.";
-    if (splitFirstEntered >= (splitBasis || total)) {
-      return `The first amount has to be less than ${formatMoney(splitBasis || total)}.`;
+    // Never measured against more than is actually left to pay: money already
+    // taken off the customer's account is not the till's to divide.
+    const splitCeiling = Math.min(splitBasis || dueAtTill, dueAtTill);
+    if (splitFirstEntered >= splitCeiling) {
+      return `The first amount has to be less than ${formatMoney(splitCeiling)}.`;
     }
     return "";
   })();
-  const payments = splitPayment && !splitIssue
-    ? [
+  const payments = [
+    ...(accountApplied > 0 ? [{ method: "Account", amount: accountApplied.toFixed(2) }] : []),
+    ...(splitPayment && !splitIssue
+      ? [
         { method: paymentMethod, amount: splitFirstAmount.toFixed(2) },
         { method: splitSecondMethod, amount: splitSecondAmount.toFixed(2) },
       ]
-    : [{ method: paymentMethod, amount: total.toFixed(2) }];
+      : dueAtTill > 0 ? [{ method: paymentMethod, amount: dueAtTill.toFixed(2) }] : []),
+  ];
   const imeiIssue = (() => {
     if (cart.some((line) => imeiLineStatus(line) === "missing")) {
       return "Scan an IMEI for every phone before checkout.";
@@ -6409,13 +6978,21 @@ function PosPage({ products, reports = [], storeLocations = [], activeEmployee, 
     && !imeiIssue
     && !splitIssue
     && cardChargeComplete
-    && Boolean(paymentMethod);
+    // Paid entirely off the account: there is nothing left for a payment method
+    // to be chosen for.
+    && (dueAtTill === 0 || Boolean(paymentMethod));
 
   useEffect(() => {
     setCard((current) =>
       current.status === "idle" ? current : { status: "idle", message: "", refNum: "" },
     );
-  }, [total, paymentMethod, splitPayment, splitSecondMethod, splitFirstInput]);
+  }, [total, paymentMethod, splitPayment, splitSecondMethod, splitFirstInput, accountApplied]);
+
+  // A different customer (or none) has no business carrying the last one's tab.
+  useEffect(() => {
+    setAccountInput("");
+    setAccountState({ status: "idle", message: "" });
+  }, [accountCustomer?.id]);
 
   async function chargeCard() {
     if (!requiresCardCharge || !cardAmount) return;
@@ -6482,7 +7059,9 @@ function PosPage({ products, reports = [], storeLocations = [], activeEmployee, 
       location: activeLocation,
       customerPhone: customerPhone.trim(),
       paymentAmount: total.toFixed(2),
-      paymentMethod: payments.length > 1
+      // Read off what was actually tendered, so a sale settled entirely from the
+      // customer's account says "Account" rather than the blank payment select.
+      paymentMethod: payments.length
         ? payments.map((entry) => entry.method).join(" + ")
         : paymentMethod,
       notes: notes.trim(),
@@ -6503,6 +7082,7 @@ function PosPage({ products, reports = [], storeLocations = [], activeEmployee, 
         subtotal: subtotal.toFixed(2),
         taxRate,
         taxAmount: taxAmount.toFixed(2),
+        taxPaidBy,
         outOfState: outOfState ? "Yes" : "No",
         payments,
         storeAddress: activeStoreInfo?.address || "",
@@ -6513,8 +7093,26 @@ function PosPage({ products, reports = [], storeLocations = [], activeEmployee, 
         customerEmail: customerInfo?.email || "",
         cardStatus: requiresCardCharge ? card.status : "",
         solaRefNum: requiresCardCharge ? card.refNum : "",
+        accountApplied: accountApplied > 0 ? accountApplied.toFixed(2) : "",
+        accountOnTab: accountOnTab > 0 ? accountOnTab.toFixed(2) : "",
+        customerId: accountCustomer?.id || "",
       },
     };
+    // The account moves with the sale, not before it: a sale that never
+    // completes must not leave a customer short of credit.
+    if (accountApplied > 0 && accountCustomer?.id) {
+      adjustCustomerBalance(accountCustomer.id, {
+        amount: -accountApplied,
+        reason: `Sale ${sale.receiptCode}`,
+        by: activeEmployee,
+        kind: accountOnTab > 0 ? "Charged to the account" : "Credit used",
+      }).catch((error) => setAccountState({
+        status: "error",
+        // The sale is filed and the goods are gone; only the ledger is behind.
+        message: `The sale is saved, but the account did not move: ${error.message || "try it again from Customers"}.`,
+      }));
+    }
+
     onCompleteSale(sale);
     setCompletedSale(sale);
     setCart([]);
@@ -6524,6 +7122,7 @@ function PosPage({ products, reports = [], storeLocations = [], activeEmployee, 
     setSplitPayment(false);
     setSplitSecondMethod("");
     setSplitFirstInput("");
+    setAccountInput("");
     setOutOfState(false);
     setCard({ status: "idle", message: "", refNum: "" });
     setMessage("");
@@ -6740,7 +7339,7 @@ function PosPage({ products, reports = [], storeLocations = [], activeEmployee, 
           <div className="pos-product-grid">
             {quickAddProducts.length ? (
               quickAddProducts.map((product) => {
-                const stock = product.requiresImei ? product.imeis?.length || 0 : Number(product.quantity) || 0;
+                const stock = storeStockCount(product, activeLocation);
                 // Colour-code the count so a cashier sees at a glance what is
                 // running out, instead of reading a bare number.
                 const level = stock <= 0 ? "out" : stock <= 3 ? "low" : "ok";
@@ -6793,7 +7392,7 @@ function PosPage({ products, reports = [], storeLocations = [], activeEmployee, 
             </div>
           </div>
           <div className="pos-checkout-scroll">
-          <div className="form-grid">
+          <div className="form-grid pos-checkout-fields">
             <label className="field">
               <span>Customer phone</span>
               <CustomerPhoneInput
@@ -6806,9 +7405,6 @@ function PosPage({ products, reports = [], storeLocations = [], activeEmployee, 
                 placeholder="Optional — search or add customer"
               />
             </label>
-            {saleCustomer?.name ? (
-              <p className="pos-customer-name">{saleCustomer.name}</p>
-            ) : null}
             <label className="field">
               <span>Payment method</span>
               <select value={paymentMethod} onChange={(event) => setPaymentMethod(event.target.value)}>
@@ -6818,6 +7414,61 @@ function PosPage({ products, reports = [], storeLocations = [], activeEmployee, 
                 ))}
               </select>
             </label>
+            {saleCustomer?.name ? (
+              <p className="pos-customer-name full">{saleCustomer.name}</p>
+            ) : null}
+            {accountCustomer ? (
+              <div className="pos-split full">
+                <p className="pos-split-remainder">
+                  <span>{accountCustomer.name || "This customer"}&rsquo;s account</span>
+                  <strong className={balanceClass(accountBalance)}>{formatBalance(accountBalance)}</strong>
+                </p>
+                <label className="field">
+                  <span>Put on the account</span>
+                  <input
+                    inputMode="decimal"
+                    placeholder="0.00"
+                    value={accountInput}
+                    onChange={(event) => setAccountInput(event.target.value)}
+                  />
+                </label>
+                <div className="field">
+                  <span>&nbsp;</span>
+                  <div className="form-actions-row">
+                    {accountCredit > 0 ? (
+                      <button
+                        className="secondary-button compact-button"
+                        type="button"
+                        onClick={() => setAccountInput(Math.min(accountCredit, total).toFixed(2))}
+                      >
+                        Use {formatMoney(Math.min(accountCredit, total))} credit
+                      </button>
+                    ) : null}
+                    <button
+                      className="secondary-button compact-button"
+                      type="button"
+                      onClick={() => setAccountInput(total.toFixed(2))}
+                    >
+                      Whole sale
+                    </button>
+                    {accountApplied > 0 ? (
+                      <button className="ghost-button compact-button" type="button" onClick={() => setAccountInput("")}>
+                        Clear
+                      </button>
+                    ) : null}
+                  </div>
+                </div>
+                {accountOnTab > 0 ? (
+                  <p className="pos-split-note muted">
+                    {formatMoney(accountOnTab)} of this goes on their tab — more than the credit they have.
+                    They will owe {formatBalance(roundCents(accountBalance - accountApplied))}.
+                  </p>
+                ) : null}
+                {accountState.message ? (
+                  <p className="pos-split-note summary-error">{accountState.message}</p>
+                ) : null}
+              </div>
+            ) : null}
             <label className="checkbox-field full pos-split-toggle">
               <input
                 type="checkbox"
@@ -6834,7 +7485,7 @@ function PosPage({ products, reports = [], storeLocations = [], activeEmployee, 
                 <label className="field">
                   <span>
                     {paymentMethod || "First method"} amount
-                    {splitTaxOnCardOnly ? <small className="muted"> (before tax)</small> : null}
+                    {splitTaxOnOneSide ? <small className="muted"> (before tax)</small> : null}
                   </span>
                   <input
                     inputMode="decimal"
@@ -6856,10 +7507,10 @@ function PosPage({ products, reports = [], storeLocations = [], activeEmployee, 
                   <span>{splitSecondMethod || "Second method"}</span>
                   <strong>{formatMoney(splitSecondAmount)}</strong>
                 </p>
-                {splitTaxOnCardOnly && taxApplies ? (
+                {splitTaxOnOneSide && taxApplies ? (
                   <p className="pos-split-note muted">
-                    Sales tax ({taxRate}%) is charged on the {firstIsCard ? paymentMethod : splitSecondMethod} share
-                    only — {formatMoney(taxAmount)} on {formatMoney(taxBase)}.
+                    Sales tax ({taxRate}%) is charged on the {taxedSideMethod} share only — {formatMoney(taxAmount)} on{" "}
+                    {formatMoney(taxBase)}. The {taxOnFirst ? splitSecondMethod : paymentMethod} share is untaxed.
                   </p>
                 ) : null}
               </div>
@@ -6877,13 +7528,25 @@ function PosPage({ products, reports = [], storeLocations = [], activeEmployee, 
               <span>Out of state (no sales tax)</span>
             </label>
             <div className="pos-totals-row pos-totals-tax">
-              <span>Tax{taxApplies ? ` (${taxRate}%${splitTaxOnCardOnly ? " · card share" : ""})` : ""}</span>
+              <span>Tax{taxApplies ? ` (${taxRate}%${splitTaxOnOneSide ? ` · ${taxedSideMethod} share` : ""})` : ""}</span>
               <span>{formatMoney(taxAmount)}</span>
             </div>
             {!outOfState && taxRate === 0 ? (
               <p className="muted">No tax rate set for this store. Add the store address in Inventory.</p>
             ) : null}
             <div className="pos-totals-row pos-totals-grand"><span>Grand total</span><strong>{formatMoney(total)}</strong></div>
+            {accountApplied > 0 ? (
+              <>
+                <div className="pos-totals-row">
+                  <span>On the account</span>
+                  <span>-{formatMoney(accountApplied)}</span>
+                </div>
+                <div className="pos-totals-row pos-totals-grand">
+                  <span>To pay now</span>
+                  <strong>{formatMoney(dueAtTill)}</strong>
+                </div>
+              </>
+            ) : null}
           </div>
           </div>
           <div className="pos-checkout-actions">
@@ -6916,7 +7579,11 @@ function PosPage({ products, reports = [], storeLocations = [], activeEmployee, 
               <p className="pos-warning">Charge the card before completing the sale.</p>
             ) : null}
             <button className="primary-button pos-complete-button" type="button" disabled={!canCheckout} onClick={handleCheckout}>
-              {cart.length ? `Complete sale · ${formatMoney(total)}` : "Scan items to start"}
+              {cart.length
+              ? accountApplied > 0
+                ? `Complete sale · ${formatMoney(dueAtTill)} now`
+                : `Complete sale · ${formatMoney(total)}`
+              : "Scan items to start"}
             </button>
           </div>
         </section>
@@ -6943,6 +7610,7 @@ function PosPage({ products, reports = [], storeLocations = [], activeEmployee, 
         <RestockDialog
           product={restock}
           storeLocations={storeLocations}
+          activeLocation={activeLocation}
           products={products}
           onSaveBarcode={(code) => onSaveProduct({ ...restock, barcode: code })}
           onClose={() => setRestock(null)}
@@ -7232,45 +7900,50 @@ function CustomerInfoDialog({ phone, customer, onSave, onSkip, onClose, saveLabe
 const THERMAL_BASE_CSS = `
   @page { size: 80mm auto; margin: 0; }
   html, body { margin: 0; }
-  body { width: 80mm; box-sizing: border-box; padding: 4mm 2.5mm 6mm; color: #000;
+  body { width: 80mm; box-sizing: border-box; padding: 3mm 2.5mm 4mm; color: #000;
     font-family: ui-sans-serif, system-ui, "Segoe UI", Arial, sans-serif;
-    font-size: 14px; line-height: 1.65; font-weight: 400;
+    font-size: 13px; line-height: 1.35; font-weight: 400;
     -webkit-print-color-adjust: exact; print-color-adjust: exact; }
-  .receipt-logo { display: block; width: 68mm; max-width: 68mm; max-height: 52px; margin: 0 auto 4mm; object-fit: contain;
+  .receipt-logo { display: block; width: 60mm; max-width: 60mm; max-height: 34px; margin: 0 auto 2mm; object-fit: contain;
     filter: grayscale(1) brightness(0); }
-  table { width: 100%; border-collapse: collapse; font-size: 14px; }
-  td { padding: 3.5mm 0; vertical-align: top; }
-  td:first-child { width: 100%; font-weight: 400; line-height: 1.55; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  td { padding: 1.4mm 0; vertical-align: top; }
+  td:first-child { width: 100%; font-weight: 400; line-height: 1.3; }
   td:last-child { text-align: right; white-space: nowrap; font-weight: 500; padding-left: 2mm; }
-  .meta { font-size: 12px; text-align: center; font-weight: 400; margin: 2mm 0; line-height: 1.55; }
-  .divider { border-top: 1px dashed #000; margin: 5mm 0; }
-  .contact { text-align: center; font-size: 12px; font-weight: 400; line-height: 1.6; margin-bottom: 2mm; }
-  .store-name { text-align: center; font-weight: 600; font-size: 16px; margin-top: 2mm; line-height: 1.45; }
-  .store-addr { text-align: center; font-size: 12px; font-weight: 400; line-height: 1.6; margin-top: 1.5mm; }
-  .cust { text-align: left; margin-top: 4mm; line-height: 1.6; }
-  .cust-name { font-size: 15px; font-weight: 600; margin-bottom: 2.5mm; }
-  .cust-phone { font-size: 13px; font-weight: 400; margin-bottom: 2mm; }
-  .cust-addr { font-size: 12px; font-weight: 400; margin-top: 0; line-height: 1.55; }
-  .hours { text-align: center; font-size: 12px; font-weight: 400; margin-bottom: 3mm; line-height: 1.55; }
-  .thanks { text-align: center; margin-top: 4mm; font-weight: 600; font-size: 14px; line-height: 1.5; }
-  .feedback { text-align: center; font-size: 11px; font-weight: 400; margin-top: 3mm; line-height: 1.55; }
-  .powered { text-align: center; font-size: 10px; margin-top: 4mm; color: #000; font-weight: 400; line-height: 1.5; }
-  small { font-size: 11px; color: #000; font-weight: 400; line-height: 1.5; }
+  .meta { font-size: 11px; text-align: center; font-weight: 400; margin: 1mm 0; line-height: 1.3; }
+  .divider { border-top: 1px dashed #000; margin: 2.5mm 0; }
+  .contact { text-align: center; font-size: 11px; font-weight: 400; line-height: 1.35; margin-bottom: 1mm; }
+  .store-name { text-align: center; font-weight: 600; font-size: 14px; margin-top: 1mm; line-height: 1.3; }
+  .store-addr { text-align: center; font-size: 11px; font-weight: 400; line-height: 1.35; margin-top: 0.5mm; }
+  .cust { text-align: left; margin-top: 2mm; line-height: 1.35; }
+  .cust-name { font-size: 14px; font-weight: 600; margin-bottom: 0.8mm; }
+  .cust-phone { font-size: 12px; font-weight: 400; margin-bottom: 0.5mm; }
+  .cust-addr { font-size: 11px; font-weight: 400; margin-top: 0; line-height: 1.3; }
+  .hours { text-align: center; font-size: 11px; font-weight: 400; margin-bottom: 1.5mm; line-height: 1.3; }
+  .thanks { text-align: center; margin-top: 2mm; font-weight: 600; font-size: 13px; line-height: 1.3; }
+  .feedback { text-align: center; font-size: 10px; font-weight: 400; margin-top: 1.5mm; line-height: 1.3; }
+  .powered { text-align: center; font-size: 9px; margin-top: 2mm; color: #000; font-weight: 400; line-height: 1.3; }
+  /* Standing instructions and the one-off line typed at the counter. Left
+     aligned and tight — this is meant to be read, not skimmed past. */
+  .notes-block { text-align: left; font-size: 11.5px; line-height: 1.35; }
+  .notes-block div + div { margin-top: 1.5mm; }
+  .notes-title { font-weight: 600; font-size: 12px; margin-bottom: 1mm; }
+  small { font-size: 10px; color: #000; font-weight: 400; line-height: 1.3; }
 `;
 
 // Totals, payment line, and barcode — shared by sale + phone-order receipts.
 const THERMAL_CHECKOUT_CSS = `
-  .line { display: flex; justify-content: space-between; align-items: baseline; gap: 2mm; margin: 2.5mm 0; line-height: 1.55; }
-  .line-subtotal { font-size: 13px; font-weight: 400; }
-  .line-tax { font-size: 13px; font-weight: 500; }
+  .line { display: flex; justify-content: space-between; align-items: baseline; gap: 2mm; margin: 1.2mm 0; line-height: 1.3; }
+  .line-subtotal { font-size: 12px; font-weight: 400; }
+  .line-tax { font-size: 12px; font-weight: 500; }
   .line-tax span:last-child { font-weight: 600; }
-  .total { display: flex; justify-content: space-between; align-items: baseline; margin-top: 4mm; padding-top: 4mm; border-top: 1px solid #000; line-height: 1.5; }
-  .total-grand { font-size: 16px; font-weight: 600; }
-  .total-grand span:last-child { font-size: 17px; font-weight: 600; }
-  .paid { font-size: 13px; font-weight: 500; text-align: center; margin-top: 4mm; line-height: 1.55; }
-  .barcode { text-align: center; margin-top: 5mm; }
-  .barcode svg { max-width: 92%; height: 40px; }
-  .barcode-text { font-size: 11px; font-weight: 500; letter-spacing: 1.5px; margin-top: 2mm; }`;
+  .total { display: flex; justify-content: space-between; align-items: baseline; margin-top: 2mm; padding-top: 2mm; border-top: 1px solid #000; line-height: 1.3; }
+  .total-grand { font-size: 15px; font-weight: 600; }
+  .total-grand span:last-child { font-size: 16px; font-weight: 600; }
+  .paid { font-size: 12px; font-weight: 500; text-align: center; margin-top: 2mm; line-height: 1.3; }
+  .barcode { text-align: center; margin-top: 2.5mm; }
+  .barcode svg { max-width: 92%; height: 32px; }
+  .barcode-text { font-size: 10px; font-weight: 500; letter-spacing: 1.5px; margin-top: 1mm; }`;
 
 // Shared receipt header: logo, company-wide contact, and the store's name + address.
 function receiptHeaderHtml(storeName, storeAddress) {
@@ -7290,8 +7963,32 @@ function receiptFooterHtml(storeHours) {
   return `
     ${hours}
     <div class="thanks">Thank you for choosing Diamant Telecom!</div>
-    <div class="feedback">Questions or feedback? Call our direct line ${escapeHtml(COMPANY.phone)} ext 9</div>
-    <div class="powered">Powered by Advanced Automations · info@advancedautomations.net</div>`;
+    <div class="feedback">Questions? ${escapeHtml(COMPANY.phone)} ext 9 &middot; Powered by Advanced Automations</div>`;
+}
+
+// ---- Standing receipt instructions ----------------------------------------
+//
+// Kept in module scope on purpose: the receipt printers below are plain
+// functions called from a dozen screens, and threading a settings prop through
+// every one of them to reach a paragraph of boilerplate would be worse than
+// this. The Workspace pushes the saved settings in whenever they change.
+let receiptNotesStore = {};
+
+function setReceiptNotesStore(entries) {
+  receiptNotesStore = Object.fromEntries(
+    (entries || []).filter((entry) => entry?.type).map((entry) => [entry.type, entry.text || ""]),
+  );
+}
+
+// The standing text for this kind of receipt, plus anything typed for this one
+// receipt alone. Prints as its own block above the footer, or not at all.
+function receiptNotesHtml(type, extra = "") {
+  const lines = [String(receiptNotesStore[type] || "").trim(), String(extra || "").trim()].filter(Boolean);
+  if (!lines.length) return "";
+  const body = lines
+    .map((line) => `<div>${escapeHtml(line).replace(/\n/g, "<br/>")}</div>`)
+    .join("");
+  return `<div class="divider"></div><div class="notes-block">${body}</div>`;
 }
 
 // Builds the customer block for a receipt from snapshotted details.
@@ -7441,7 +8138,7 @@ function buildReceiptText(sale) {
   return out.filter((line) => line !== null).join("\n");
 }
 
-function printSaleReceipt(sale) {
+function printSaleReceipt(sale, { note = "" } = {}) {
   const details = sale.details || {};
   const lines = details.lineItems || [];
   const total = Number(sale.paymentAmount) || 0;
@@ -7497,6 +8194,7 @@ function printSaleReceipt(sale) {
     ${paidBlock}
     ${barcodeBlock}
     <div class="divider"></div>
+    ${receiptNotesHtml("sale", note)}
     ${receiptFooterHtml(details.storeHours)}`;
 
   openThermalReceipt("Receipt", css, body);
@@ -7504,7 +8202,7 @@ function printSaleReceipt(sale) {
 
 // Prints a phone-order receipt: items, totals, and a clear delivery block (the
 // delivery address, kept separate from the customer's on-file address).
-function printPhoneOrderReceipt(order) {
+function printPhoneOrderReceipt(order, { note = "" } = {}) {
   const lines = order.lineItems || [];
   const total = Number(order.orderTotal) || 0;
   const createdAt = (toJsDate(order.createdAt) || new Date()).toLocaleString();
@@ -7556,6 +8254,7 @@ function printPhoneOrderReceipt(order) {
     <div class="paid">${escapeHtml(order.paymentStatus || "")}${order.paymentMethod ? ` · ${escapeHtml(order.paymentMethod)}` : ""}</div>
     ${barcodeBlock}
     <div class="divider"></div>
+    ${receiptNotesHtml("phoneOrder", note)}
     ${receiptFooterHtml(order.storeHours)}`;
 
   openThermalReceipt(`Order ${receiptCode || ""}`, css, body);
@@ -7601,7 +8300,7 @@ function printRepairPhoneLabel(report) {
 // what was paid. The intake ticket above is a claim check — this is the proof of
 // purchase, and a customer who paid for a repair is owed one the same as a
 // customer who bought a charger.
-function printRepairReceipt(report) {
+function printRepairReceipt(report, { note = "" } = {}) {
   const details = report.details || {};
   const totals = repairTotals(report);
   const paidAt = details.paidAt || details.completedAt || report.createdAt;
@@ -7659,12 +8358,13 @@ function printRepairReceipt(report) {
     ${report.notes ? `<div class="notes">Notes: ${escapeHtml(report.notes)}</div>` : ""}
     <div class="divider"></div>
     <div class="thanks">Thank you from Diamant Telecom.</div>
+    ${receiptNotesHtml("repair", note)}
     ${receiptFooterHtml(details.storeHours)}`;
 
   openThermalReceipt(`Repair receipt ${details.ticketNumber || ""}`, css, body);
 }
 
-function printRepairTicket(report) {
+function printRepairTicket(report, { note = "" } = {}) {
   const details = report.details || {};
   const createdAt = (toJsDate(report.createdAt) || new Date()).toLocaleString();
   const location = report.location || details.location || "";
@@ -7713,6 +8413,7 @@ function printRepairTicket(report) {
     ${report.notes ? `<div class="notes">Notes: ${escapeHtml(report.notes)}</div>` : ""}
     <div class="divider"></div>
     <div class="thanks">Keep this ticket for pickup.</div>
+    ${receiptNotesHtml("repair", note)}
     ${receiptFooterHtml(details.storeHours)}`;
 
   openThermalReceipt(`Repair ticket ${details.ticketNumber || ""}`, css, body);
@@ -7720,12 +8421,16 @@ function printRepairTicket(report) {
 
 // Customer rental receipt: device + SIM, numbers, dates, total, return date and
 // the overdue late fee. Printed right after the rental is saved/paid.
-function printRentalReceipt(report) {
+function printRentalReceipt(report, { note = "" } = {}) {
   const details = report.details || {};
   const createdAt = (toJsDate(report.createdAt) || new Date()).toLocaleString();
   const location = report.location || details.location || "";
   const lateFee = Number(details.lateFeeWeekly) || 0;
-  const total = Number(details.totalPrice) || Number(report.paymentAmount) || 0;
+  const deposit = Number(details.securityDeposit) || 0;
+  // The deposit is money the customer hands over, so it belongs in the total on
+  // the paper they walk out with — flagged as refundable so nobody reads it as
+  // part of the rental price.
+  const total = (Number(details.totalPrice) || 0) + deposit || Number(report.paymentAmount) || 0;
 
   const rowsSource = [
     ["Rental ID", details.rentalId],
@@ -7745,6 +8450,7 @@ function printRentalReceipt(report) {
     ["Return by", details.returnDueDate || details.endDate],
     ["Rental days", details.totalDays],
     ["Rate", details.dailyRate ? `${formatMoney(Number(details.dailyRate))}/day` : details.pricingLabel],
+    ["SIM deposit (refundable)", deposit > 0 ? formatMoney(deposit) : ""],
     ["Late fee", lateFee > 0 ? `${formatMoney(lateFee)}/wk (${formatMoney(lateFee / 7)}/day overdue)` : ""],
     ["Served by", staffInitials(report.servedBy)],
   ];
@@ -7772,6 +8478,7 @@ function printRentalReceipt(report) {
     ${report.notes ? `<div class="notes">Notes: ${escapeHtml(report.notes)}</div>` : ""}
     <div class="divider"></div>
     <div class="thanks">Please return by ${escapeHtml(details.returnDueDate || details.endDate || "the due date")}.</div>
+    ${receiptNotesHtml("rental", note)}
     ${receiptFooterHtml(details.storeHours)}`;
 
   openThermalReceipt(`Rental ${details.rentalId || report.id}`, css, body);
@@ -7809,9 +8516,12 @@ function SaleReceiptDialog({ sale, onClose, reprint = false }) {
   const [textTo, setTextTo] = useState(sale.customerPhone || "");
   const [sending, setSending] = useState(false);
   const [status, setStatus] = useState("");
+  // One extra line on this receipt only; the shop's standing sale text prints
+  // underneath it either way.
+  const [receiptNote, setReceiptNote] = useState("");
 
   function printReceipt() {
-    printSaleReceipt(sale);
+    printSaleReceipt(sale, { note: receiptNote });
     setStatus("Sent to the printer.");
   }
 
@@ -7916,6 +8626,14 @@ function SaleReceiptDialog({ sale, onClose, reprint = false }) {
 
         <div className="receipt-delivery">
           <p className="eyebrow">Send this receipt</p>
+          <label className="field receipt-note-field">
+            <span>Note on this receipt</span>
+            <input
+              value={receiptNote}
+              onChange={(event) => setReceiptNote(event.target.value)}
+              placeholder="Just for this one — the shop's standing text prints anyway"
+            />
+          </label>
           <div className="receipt-delivery-buttons">
             <button className="secondary-button" type="button" onClick={printReceipt}>Print</button>
             <button
@@ -8089,17 +8807,18 @@ function ImeiLotCapture({ imeis, target, onChangeImeis, blocked = [] }) {
   );
 }
 
-function RestockDialog({ product, storeLocations, products = [], onSaveBarcode, onClose, onAddStock }) {
+function RestockDialog({ product, storeLocations, activeLocation = "", products = [], onSaveBarcode, onClose, onAddStock }) {
   const requiresImei = Boolean(product.requiresImei);
   // A phone carries its own barcode on the box: the IMEI is scanned and is
   // unique per handset, so there is nothing to generate and nothing to stick on.
   const needsBarcode = !product.barcode && !requiresImei;
   const [quantity, setQuantity] = useState("0");
   const [imeis, setImeis] = useState([]);
-  const [location, setLocation] = useState(product.location || "");
+  const [location, setLocation] = useState(activeLocation || "");
   const [barcode, setBarcode] = useState(product.barcode || "");
   const stores = storeLocations || [];
-  const currentStock = requiresImei ? product.imeis?.length || 0 : Number(product.quantity) || 0;
+  // What the chosen store has now — the stock being added is that store's alone.
+  const currentStock = storeStockCount(product, location);
 
   function submit(event) {
     event.preventDefault();
@@ -8153,7 +8872,9 @@ function RestockDialog({ product, storeLocations, products = [], onSaveBarcode, 
           <div>
             <p className="eyebrow">Add stock</p>
             <h3>{product.name}</h3>
-            <p className="muted">In stock now: {currentStock}{requiresImei ? " IMEIs" : ""}</p>
+            <p className="muted">
+              {location ? `In stock at ${location}: ` : "In stock: "}{currentStock}{requiresImei ? " IMEIs" : ""}
+            </p>
           </div>
           <DialogCloseButton onClose={onClose} label="Close add stock" />
         </div>
@@ -8200,12 +8921,6 @@ function RestockDialog({ product, storeLocations, products = [], onSaveBarcode, 
                 <option key={store}>{store}</option>
               ))}
             </select>
-            {!product.location ? (
-              <small className="muted">
-                This item is currently stocked for all stores. Picking a store moves its existing {currentStock}{" "}
-                unit{currentStock === 1 ? "" : "s"} to that store as well.
-              </small>
-            ) : null}
           </label>
           <label className="field">
             <span>Quantity to add</span>
@@ -8256,6 +8971,7 @@ function normalizeStoreKey(value) {
 function InventoryPage({
   products,
   storeLocations,
+  activeLocation,
   sessionRole,
   onSaveProduct,
   onRemoveProduct,
@@ -8288,18 +9004,26 @@ function InventoryPage({
   const [selectedKey, setSelectedKey] = useState("");
 
   function updateField(name, value) {
-    setForm((current) => ({ ...current, [name]: value }));
+    setForm((current) => {
+      // On an existing item the quantity box is one store's stock, so switching
+      // the store shows that store's count instead of carrying the last one over.
+      if (name === "location" && current.id) {
+        const existing = products.find((item) => item.id === current.id);
+        const entry = storeStockEntry(existing, value);
+        return { ...current, location: value, quantity: String(entry.quantity), imeis: entry.imeis };
+      }
+      return { ...current, [name]: value };
+    });
   }
 
   function addStock(product, { addQuantity, newImeis, location, barcode }) {
-    const nextLocation = location === undefined ? product.location : location;
+    const store = location || activeLocation;
     // If the item had no barcode, the restock dialog collected one — save it too.
     const barcodePatch = barcode && !product.barcode ? { barcode: String(barcode).trim() } : {};
-    if (product.requiresImei) {
-      onSaveProduct({ ...product, location: nextLocation, ...barcodePatch, imeis: [...(product.imeis || []), ...newImeis] });
-    } else {
-      onSaveProduct({ ...product, location: nextLocation, ...barcodePatch, quantity: (Number(product.quantity) || 0) + addQuantity });
-    }
+    const restocked = product.requiresImei
+      ? adjustStoreStock(product, store, { addImeis: newImeis })
+      : adjustStoreStock(product, store, { addQty: addQuantity });
+    onSaveProduct({ ...restocked, ...barcodePatch });
   }
 
   function submit(event) {
@@ -8309,7 +9033,7 @@ function InventoryPage({
       return;
     }
     if (!form.location) {
-      window.alert("Pick the store this stock belongs to.");
+      window.alert("Pick the store this stock is at.");
       return;
     }
     const clash = findBarcodeOwner(products, form.barcode, { ignoreId: form.id, ignoreSku: form.sku });
@@ -8319,16 +9043,19 @@ function InventoryPage({
     }
     if (form.requiresImei) {
       const target = Number(form.quantity) || 0;
-      if (!target) {
-        window.alert("Set a stock quantity, then scan that many IMEIs.");
-        return;
-      }
+      // A store with none of a phone is a fine thing to save — the item still
+      // exists for every other store.
       if (form.imeis.length !== target) {
         window.alert(`Stock quantity is ${target} but you scanned ${form.imeis.length} IMEIs. Scan exactly ${target}.`);
         return;
       }
     }
-    onSaveProduct(form);
+    // The product is shared by every store; the quantity typed here is only the
+    // chosen store's, so the other stores' counts are carried over untouched.
+    const existing = form.id ? products.find((item) => item.id === form.id) : null;
+    const { quantity, imeis, location, ...fields } = form;
+    const base = { ...(existing || {}), ...fields, stock: existing ? productStockMap(existing) : {} };
+    onSaveProduct(setStoreStock(base, location, { quantity, imeis }));
     setForm({ ...emptyForm, location: form.location });
   }
 
@@ -8337,13 +9064,17 @@ function InventoryPage({
   // scrolling away from the item you clicked and left it unclear whether you
   // were adding or editing.
   function editProduct(product) {
+    // Opens on this register's store; the Store box switches to another one.
+    const store = activeLocation || storeLocations[0] || "";
+    const entry = storeStockEntry(product, store);
     setForm({
       ...emptyForm,
       ...product,
       price: String(product.price ?? ""),
       cost: String(product.cost ?? ""),
-      quantity: String(product.quantity ?? 0),
-      imeis: product.imeis || [],
+      location: store,
+      quantity: String(entry.quantity),
+      imeis: entry.imeis,
     });
     setSelectedKey("");
   }
@@ -8367,9 +9098,6 @@ function InventoryPage({
     const map = new Map();
     for (const product of products) {
       const key = String(product.sku || product.name || product.id).trim().toLowerCase();
-      const stock = product.requiresImei ? product.imeis?.length || 0 : Number(product.quantity) || 0;
-      const rawLocation = String(product.location || "").trim();
-      const loc = rawLocation ? canonicalByKey.get(normalizeStoreKey(rawLocation)) ?? rawLocation : "";
       const group = map.get(key) || {
         key,
         name: product.name,
@@ -8379,7 +9107,13 @@ function InventoryPage({
         byStore: {},
         variants: [],
       };
-      group.byStore[loc] = (group.byStore[loc] || 0) + stock;
+      Object.entries(productStockMap(product)).forEach(([rawName, entry]) => {
+        const rawLocation = String(rawName || "").trim();
+        const loc = rawLocation ? canonicalByKey.get(normalizeStoreKey(rawLocation)) ?? rawLocation : "";
+        const stock = product.requiresImei ? (entry?.imeis || []).length : Number(entry?.quantity) || 0;
+        if (!stock && storeSet.has(loc)) return;
+        group.byStore[loc] = (group.byStore[loc] || 0) + stock;
+      });
       group.variants.push(product);
       if (!group.name && product.name) group.name = product.name;
       if (!group.sku && product.sku) group.sku = product.sku;
@@ -8516,8 +9250,8 @@ function InventoryPage({
         </select>
       </label>
       <label className="field">
-        <span>Store</span>
-        {/* Stock always belongs to one store — there is no "all stores" option. */}
+        <span>Stock at store</span>
+        {/* The item itself is in every store; the quantity below is this store's. */}
         <select value={form.location} onChange={(event) => updateField("location", event.target.value)} required>
           <option value="" disabled>Select a store…</option>
           {storeLocations.map((location) => (
@@ -8527,7 +9261,7 @@ function InventoryPage({
       </label>
       <p className="form-section-title">Stock</p>
       <label className="field">
-        <span>Stock quantity</span>
+        <span>Stock quantity{form.location ? ` at ${form.location}` : ""}</span>
         <input
           type="number"
           min="0"
@@ -8657,6 +9391,8 @@ function InventoryPage({
 
       <RentalPhoneFleet
         phones={rentalPhones}
+        storeLocations={storeLocations}
+        activeLocation={activeLocation}
         isAdmin={isAdmin}
         onSavePhone={onSaveRentalPhone}
         onReleasePhone={onReleaseRentalPhone}
@@ -8681,6 +9417,7 @@ function InventoryPage({
         <RestockDialog
           product={restock}
           storeLocations={storeLocations}
+          activeLocation={activeLocation}
           products={products}
           onSaveBarcode={(code) => onSaveProduct({ ...restock, barcode: code })}
           onClose={() => setRestock(null)}
@@ -8694,43 +9431,74 @@ function InventoryPage({
 // The rental handset fleet: scan phones in one at a time to register them, then
 // see at a glance which are on the shelf and which are out with a customer.
 // Deliberately separate from `products` — these are lent, never sold.
-function RentalPhoneFleet({ phones = [], isAdmin, onSavePhone, onReleasePhone, onRemovePhone }) {
+function RentalPhoneFleet({
+  phones = [],
+  storeLocations = [],
+  activeLocation,
+  isAdmin,
+  onSavePhone,
+  onReleasePhone,
+  onRemovePhone,
+}) {
   const [imei, setImei] = useState("");
   const [name, setName] = useState("");
   const [simNumber, setSimNumber] = useState("");
+  const [simNumberIl, setSimNumberIl] = useState("");
+  // Where the phone being added lives. Defaults to the shop you are standing in,
+  // and is left alone between adds so a boxful can be booked in one after another.
+  const [location, setLocation] = useState(activeLocation || "");
+  const [editing, setEditing] = useState(null);
   const [search, setSearch] = useState("");
   const [message, setMessage] = useState("");
   const imeiRef = useRef(null);
 
-  const outCount = phones.filter((phone) => phone.status === RENTAL_PHONE_WITH_CUSTOMER).length;
+  // A shop's fleet is the phones on its own shelf. An admin sees every store's,
+  // with the store named, because somebody has to be able to find a handset that
+  // was scanned in at the wrong branch. Phones saved before handsets were tied
+  // to a store have no location and show everywhere until they are edited.
+  const ownPhones = useMemo(
+    () => phones.filter((phone) => isAdmin || !activeLocation || !phone.location || phone.location === activeLocation),
+    [phones, activeLocation, isAdmin],
+  );
+  const outCount = ownPhones.filter((phone) => phone.status === RENTAL_PHONE_WITH_CUSTOMER).length;
 
   const visible = useMemo(() => {
     const query = search.trim().toLowerCase();
-    const sorted = [...phones].sort((left, right) => String(left.name || "").localeCompare(String(right.name || "")));
+    const sorted = [...ownPhones].sort((left, right) => String(left.name || "").localeCompare(String(right.name || "")));
     if (!query) return sorted;
     return sorted.filter((phone) =>
-      [phone.name, phone.imei, phone.simNumber, phone.customerPhone]
+      [phone.name, phone.imei, phone.simNumber, phone.simNumberIl, phone.location, phone.customerPhone]
         .filter(Boolean).join(" ").toLowerCase().includes(query));
-  }, [phones, search]);
+  }, [ownPhones, search]);
 
   function addPhone(event) {
     event.preventDefault();
     const cleanImei = digitsOnly(imei);
     if (!cleanImei) { setMessage("Scan or type an IMEI."); return; }
     if (!name.trim()) { setMessage("Give the phone a name."); return; }
-    if (phones.some((phone) => digitsOnly(phone.imei) === cleanImei)) {
-      setMessage(`IMEI ${cleanImei} is already in the fleet.`);
+    // Checked against the whole fleet, not just this store's: one IMEI is one
+    // handset wherever it is standing.
+    const twin = phones.find((phone) => digitsOnly(phone.imei) === cleanImei);
+    if (twin) {
+      setMessage(twin.location && twin.location !== activeLocation
+        ? `IMEI ${cleanImei} is already in ${twin.location}'s fleet.`
+        : `IMEI ${cleanImei} is already in the fleet.`);
       return;
     }
-    const simClash = fleetSimOwner(phones, simNumber);
+    const simClash = fleetSimOwner(phones, simNumber) || fleetSimOwner(phones, simNumberIl);
     if (simClash) {
       setMessage(`That SIM is already saved against ${simClash.name}. Take it off that phone first.`);
       return;
     }
-    onSavePhone?.({ name: name.trim(), imei: cleanImei, simNumber });
-    setMessage(`Added ${name.trim()} · ${cleanImei}${digitsOnly(simNumber) ? " · SIM saved" : ""}.`);
+    onSavePhone?.({ name: name.trim(), imei: cleanImei, simNumber, simNumberIl, location });
+    const savedSims = [digitsOnly(simNumber) ? "RCUK SIM" : "", digitsOnly(simNumberIl) ? "Israeli SIM" : ""].filter(Boolean);
+    setMessage(
+      `Added ${name.trim()} · ${cleanImei}${savedSims.length ? ` · ${savedSims.join(" + ")} saved` : ""}`
+      + `${location ? ` · ${location}` : ""}.`,
+    );
     setImei("");
     setSimNumber("");
+    setSimNumberIl("");
     // Keep the name so a run of identical handsets can be scanned back to back.
     imeiRef.current?.focus();
   }
@@ -8743,15 +9511,18 @@ function RentalPhoneFleet({ phones = [], isAdmin, onSavePhone, onReleasePhone, o
           <h2>Phones &amp; IMEIs</h2>
         </div>
         <div className="summary-strip">
-          <span className="metric">Total <strong>{phones.length}</strong></span>
-          <span className="metric">In store <strong>{phones.length - outCount}</strong></span>
+          <span className="metric">
+            {isAdmin ? "All stores" : activeLocation || "Fleet"} <strong>{ownPhones.length}</strong>
+          </span>
+          <span className="metric">In store <strong>{ownPhones.length - outCount}</strong></span>
           <span className="metric">With customers <strong>{outCount}</strong></span>
         </div>
       </div>
       <p className="muted">
-        Scan every phone you lend out so the shop always knows where each handset is. Phones added here are the ones
-        offered when a rental issues a device. Give a phone the SIM number that lives in it and the rental screen fills
-        both in from one scan of the handset.
+        Scan every phone you lend out so the shop always knows where each handset is. A phone belongs to the store it
+        was added at — {isAdmin ? "as an admin you see every store's here" : `this list is ${activeLocation || "this store"}'s`}, and a rental
+        only offers the handsets standing here. Give a phone the SIM numbers that live in it — the RCUK card, the Israeli
+        card, or both — and the rental screen fills in the one that rental travels on from a single scan of the handset.
       </p>
 
       <form className="form-grid inventory-form" onSubmit={addPhone} onKeyDown={preventEnterSubmit}>
@@ -8776,15 +9547,33 @@ function RentalPhoneFleet({ phones = [], isAdmin, onSavePhone, onReleasePhone, o
           />
         </label>
         <label className="field">
-          <span>SIM in this phone (optional)</span>
+          <span>RCUK SIM (optional)</span>
           <input
             value={simNumber}
             onChange={(event) => { setSimNumber(event.target.value); setMessage(""); }}
             inputMode="numeric"
             autoComplete="off"
             spellCheck={false}
-            placeholder="Scan the SIM in the phone"
+            placeholder="Scan the RCUK SIM in the phone"
           />
+        </label>
+        <label className="field">
+          <span>Israeli SIM (optional)</span>
+          <input
+            value={simNumberIl}
+            onChange={(event) => { setSimNumberIl(event.target.value); setMessage(""); }}
+            inputMode="numeric"
+            autoComplete="off"
+            spellCheck={false}
+            placeholder="Scan the Israeli SIM in the phone"
+          />
+        </label>
+        <label className="field">
+          <span>Store</span>
+          <select value={location} onChange={(event) => { setLocation(event.target.value); setMessage(""); }}>
+            <option value="">Unassigned — every store sees it</option>
+            {storeLocations.map((store) => <option key={store}>{store}</option>)}
+          </select>
         </label>
         <div className="pos-form-actions form-actions-row">
           <button className="primary-button" type="submit">Add phone</button>
@@ -8796,7 +9585,7 @@ function RentalPhoneFleet({ phones = [], isAdmin, onSavePhone, onReleasePhone, o
         className="pos-search"
         value={search}
         onChange={(event) => setSearch(event.target.value)}
-        placeholder="Search by name, IMEI, or customer"
+        placeholder="Search by name, IMEI, SIM, or customer"
       />
 
       <div className="table-wrap">
@@ -8805,7 +9594,9 @@ function RentalPhoneFleet({ phones = [], isAdmin, onSavePhone, onReleasePhone, o
             <tr>
               <th>Phone</th>
               <th>IMEI</th>
-              <th>SIM</th>
+              <th>RCUK SIM</th>
+              <th>Israeli SIM</th>
+              {isAdmin ? <th>Store</th> : null}
               <th>Status</th>
               <th>With</th>
               <th></th>
@@ -8819,6 +9610,10 @@ function RentalPhoneFleet({ phones = [], isAdmin, onSavePhone, onReleasePhone, o
                   <td><strong>{phone.name}</strong></td>
                   <td>{phone.imei}</td>
                   <td>{phone.simNumber || <span className="muted">-</span>}</td>
+                  <td>{phone.simNumberIl || <span className="muted">-</span>}</td>
+                  {isAdmin ? (
+                    <td>{phone.location || <span className="muted">Unassigned</span>}</td>
+                  ) : null}
                   <td>
                     <span className={`status-pill ${out ? "" : "returned"}`}>
                       {out ? RENTAL_PHONE_WITH_CUSTOMER : RENTAL_PHONE_IN_STORE}
@@ -8829,21 +9624,9 @@ function RentalPhoneFleet({ phones = [], isAdmin, onSavePhone, onReleasePhone, o
                     <button
                       className="secondary-button compact-button"
                       type="button"
-                      onClick={() => {
-                        const answer = window.prompt(
-                          `SIM number in ${phone.name}. Scanning this phone on a rental fills it into the SIM box.`,
-                          phone.simNumber || "",
-                        );
-                        if (answer === null) return;
-                        const clash = fleetSimOwner(phones, answer, phone.id);
-                        if (clash) {
-                          window.alert(`That SIM is already saved against ${clash.name}. Take it off that phone first.`);
-                          return;
-                        }
-                        onSavePhone?.({ ...phone, simNumber: answer });
-                      }}
+                      onClick={() => setEditing(phone)}
                     >
-                      {phone.simNumber ? "Change SIM" : "Add SIM"}
+                      Edit
                     </button>
                     {out ? (
                       <button
@@ -8870,15 +9653,138 @@ function RentalPhoneFleet({ phones = [], isAdmin, onSavePhone, onReleasePhone, o
               );
             }) : (
               <tr>
-                <td colSpan="6" className="empty-state">
-                  {phones.length ? "No phones match that search." : "No phones in the fleet yet — scan one above."}
+                <td colSpan={isAdmin ? 8 : 7} className="empty-state">
+                  {ownPhones.length
+                    ? "No phones match that search."
+                    : `No phones in ${isAdmin ? "the" : `${activeLocation || "this store"}'s`} fleet yet — scan one above.`}
                 </td>
               </tr>
             )}
           </tbody>
         </table>
       </div>
+
+      {editing ? (
+        <EditRentalPhoneDialog
+          phone={editing}
+          phones={phones}
+          storeLocations={storeLocations}
+          onSave={(patch) => { onSavePhone?.(patch); setEditing(null); }}
+          onClose={() => setEditing(null)}
+        />
+      ) : null}
     </section>
+  );
+}
+
+// Everything about one handset in one place: its name, the IMEI on the label,
+// the SIM in each slot, and the store it lives at. Moving it between stores is
+// how a phone that has been carried to the other branch stops being offered on
+// rentals at the one it left.
+function EditRentalPhoneDialog({ phone, phones = [], storeLocations = [], onSave, onClose }) {
+  const [name, setName] = useState(phone.name || "");
+  const [imei, setImei] = useState(phone.imei || "");
+  const [simNumber, setSimNumber] = useState(phone.simNumber || "");
+  const [simNumberIl, setSimNumberIl] = useState(phone.simNumberIl || "");
+  const [location, setLocation] = useState(phone.location || "");
+  const [error, setError] = useState("");
+
+  function submit(event) {
+    event.preventDefault();
+    const cleanImei = digitsOnly(imei);
+    if (!cleanImei) { setError("Scan or type the phone's IMEI."); return; }
+    if (!name.trim()) { setError("Give the phone a name so staff can recognise it."); return; }
+    const imeiTwin = phones.find((entry) => entry.id !== phone.id && digitsOnly(entry.imei) === cleanImei);
+    if (imeiTwin) {
+      setError(`IMEI ${cleanImei} is already ${imeiTwin.name}.`);
+      return;
+    }
+    const simClash = fleetSimOwner(phones, simNumber, phone.id) || fleetSimOwner(phones, simNumberIl, phone.id);
+    if (simClash) {
+      setError(`That SIM is already saved against ${simClash.name}. Take it off that phone first.`);
+      return;
+    }
+    onSave({ ...phone, name: name.trim(), imei: cleanImei, simNumber, simNumberIl, location });
+  }
+
+  return createPortal(
+    <div className="dialog-backdrop" role="presentation" onMouseDown={onClose}>
+      <div className="dialog-card" role="dialog" aria-modal="true" onMouseDown={(event) => event.stopPropagation()}>
+        <div className="dialog-head">
+          <div>
+            <p className="eyebrow">Rental fleet</p>
+            <h3>Edit {phone.name}</h3>
+            {phone.status === RENTAL_PHONE_WITH_CUSTOMER ? (
+              <p className="muted">Out with {phone.customerPhone || "a customer"}.</p>
+            ) : null}
+          </div>
+          <DialogCloseButton onClose={onClose} label="Close edit phone" />
+        </div>
+        <form className="form-grid dialog-form" onSubmit={submit} onKeyDown={preventEnterSubmit}>
+          <label className="field full">
+            <span>Phone name</span>
+            <input
+              value={name}
+              onChange={(event) => { setName(event.target.value); setError(""); }}
+              placeholder="e.g. Nokia 105 — blue"
+              autoFocus
+            />
+          </label>
+          <label className="field full">
+            <span>IMEI</span>
+            <input
+              value={imei}
+              onChange={(event) => { setImei(event.target.value); setError(""); }}
+              inputMode="numeric"
+              autoComplete="off"
+              spellCheck={false}
+            />
+          </label>
+          <label className="field full">
+            <span>RCUK SIM (optional)</span>
+            <input
+              value={simNumber}
+              onChange={(event) => { setSimNumber(event.target.value); setError(""); }}
+              inputMode="numeric"
+              autoComplete="off"
+              spellCheck={false}
+              placeholder="Scan the RCUK SIM in the phone"
+            />
+          </label>
+          <label className="field full">
+            <span>Israeli SIM (optional)</span>
+            <input
+              value={simNumberIl}
+              onChange={(event) => { setSimNumberIl(event.target.value); setError(""); }}
+              inputMode="numeric"
+              autoComplete="off"
+              spellCheck={false}
+              placeholder="Scan the Israeli SIM in the phone"
+            />
+          </label>
+          <label className="field full">
+            <span>Store</span>
+            <select value={location} onChange={(event) => { setLocation(event.target.value); setError(""); }}>
+              <option value="">Unassigned — every store sees it</option>
+              {storeLocations.map((store) => <option key={store}>{store}</option>)}
+            </select>
+            {location !== (phone.location || "") ? (
+              <small className="muted">
+                {location
+                  ? `Moves this phone to ${location} — it comes off this list and rentals there can hand it out.`
+                  : "Leaves this phone unassigned, so every store sees it."}
+              </small>
+            ) : null}
+          </label>
+          {error ? <p className="summary-error full">{error}</p> : null}
+          <div className="pos-form-actions form-actions-row">
+            <button className="primary-button" type="submit">Save phone</button>
+            <button className="secondary-button" type="button" onClick={onClose}>Cancel</button>
+          </div>
+        </form>
+      </div>
+    </div>,
+    document.body,
   );
 }
 
@@ -8946,15 +9852,15 @@ function ItemDetailsDialog({ group, sessionRole, onClose, onRestock, onEdit, onD
 
         <div className="request-list">
           {group.variants.map((product) => {
-            const stock = product.requiresImei ? product.imeis?.length || 0 : Number(product.quantity) || 0;
+            const stock = Number(product.quantity) || 0;
             return (
               <div className="request-row store-row" key={product.id}>
                 <div>
-                  <strong>{product.location || "All stores"}</strong>
+                  <strong>{group.variants.length > 1 ? product.name : "All stores"}</strong>
                   <p className="muted">
                     {formatMoney(Number(product.price) || 0)}
                     {isAdmin ? ` · Cost ${formatMoney(Number(product.cost) || 0)}` : ""}
-                    {" · "}{stock} in stock{product.requiresImei ? " · IMEI" : ""}
+                    {" · "}{stock} in stock across stores{product.requiresImei ? " · IMEI" : ""}
                   </p>
                 </div>
                 <div className="store-row-actions">
@@ -8983,6 +9889,68 @@ function ItemDetailsDialog({ group, sessionRole, onClose, onRestock, onEdit, onD
   );
 }
 
+// What every receipt of a kind says, on top of the figures. The rental one is
+// the reason this exists: how to forward a US line to the travelling number is
+// the same paragraph every time and telling people at the counter never sticks.
+function ReceiptNotesSettings({ receiptNotes = [], onSave }) {
+  const saved = Object.fromEntries((receiptNotes || []).map((entry) => [entry.type, entry.text || ""]));
+  const [drafts, setDrafts] = useState(saved);
+  const [message, setMessage] = useState("");
+
+  // Somebody else editing on another till should not be overwritten by a stale
+  // box on this one, so a change arriving from the cloud reseeds the drafts.
+  const savedKey = JSON.stringify(saved);
+  useEffect(() => { setDrafts(saved); }, [savedKey]);
+
+  function save(type) {
+    const text = String(drafts[type] || "").trim();
+    onSave(type, text);
+    setMessage(text
+      ? `Saved. It prints on every ${RECEIPT_NOTE_TYPES.find((entry) => entry.key === type)?.label.toLowerCase()} receipt from now on.`
+      : "Cleared — nothing extra prints on that receipt now.");
+  }
+
+  return (
+    <section className="workspace">
+      <div className="workspace-header">
+        <div>
+          <p className="eyebrow">Receipts</p>
+          <h2>Standing instructions</h2>
+        </div>
+      </div>
+      <p className="muted">
+        Anything written here prints at the bottom of that kind of receipt, under the figures. Whoever is at the
+        counter can add one more line for a single receipt when they print it.
+      </p>
+      <div className="form-grid">
+        {RECEIPT_NOTE_TYPES.map((entry) => (
+          <label className="field full" key={entry.key}>
+            <span>{entry.label}</span>
+            <textarea
+              rows="3"
+              value={drafts[entry.key] ?? ""}
+              onChange={(event) => { setDrafts((c) => ({ ...c, [entry.key]: event.target.value })); setMessage(""); }}
+              placeholder={entry.hint}
+            />
+            <div className="form-actions-row">
+              <button
+                className="secondary-button compact-button"
+                type="button"
+                disabled={(drafts[entry.key] ?? "") === (saved[entry.key] ?? "")}
+                onClick={() => save(entry.key)}
+              >
+                Save
+              </button>
+              <small className="muted">{entry.hint}</small>
+            </div>
+          </label>
+        ))}
+      </div>
+      {message ? <p className="muted">{message}</p> : null}
+    </section>
+  );
+}
+
 function AdminPage({
   employees,
   reports,
@@ -8993,6 +9961,8 @@ function AdminPage({
   employeeLocations,
   storeDevices,
   storeTax,
+  receiptNotes,
+  onSaveReceiptNote,
   onMarkResetHandled,
   onResetPassword,
   onAddOrderHandler,
@@ -9406,6 +10376,8 @@ function AdminPage({
           )}
         </div>
       </section>
+
+      <ReceiptNotesSettings receiptNotes={receiptNotes} onSave={onSaveReceiptNote} />
     </>
   );
 }
@@ -9568,33 +10540,78 @@ function RentalReportActions({ report, onUpdate, activeEmployee }) {
   const [busy, setBusy] = useState("");
   const [message, setMessage] = useState("");
   const [editing, setEditing] = useState(false);
+  // A line for this receipt alone. The standing instructions an admin saved for
+  // rentals print underneath either way.
+  const [receiptNote, setReceiptNote] = useState("");
   const rentalId = details.rentalId;
   const cancelled = details.rentalStatus === "Cancelled";
   const returned = Boolean(details.returnedAt);
   const hasNumbers = Boolean(details.cli);
+  // A US number that was paid for and has not arrived: RCUK hands the UK CLI
+  // back first, so the rental can hold one number and still be owed another.
+  const usDdiOutstanding = String(details.usaNumber || "").toLowerCase() === "yes" && !details.usDdi;
 
-  // Record the phone coming back. This is what stops the past-due notice and
+  // Record the SIM coming back. This is what stops the past-due notice and
   // freezes the late fee — after this the amount owed no longer grows, so the
-  // figure stored here is the one to collect.
-  function markReturned() {
+  // figure stored here is the one to collect. It is also where a SIM-only
+  // deposit goes back: the shop took it to secure the SIM, and the SIM is here.
+  const deposit = Number(details.securityDeposit) || 0;
+  const depositHeld = deposit > 0 && details.depositStatus !== "Refunded";
+  // Only a card charge can be reversed on its own. Cash went in the till.
+  const depositGoesBackToCard = depositHeld
+    && isCardPayment(report.paymentMethod)
+    && Boolean(details.cardRefNum);
+
+  async function markReturned() {
     const { daysLate, amount } = calculateRentalLateFee(report);
     const feeLine = amount > 0
       ? `\n\nLate fee owed: ${formatMoney(amount)} (${daysLate} day${daysLate === 1 ? "" : "s"} late). This is not charged automatically — collect it before closing out.`
       : "";
-    if (!window.confirm(`Mark this rental returned?${feeLine}`)) return;
+    const depositLine = !depositHeld
+      ? ""
+      : depositGoesBackToCard
+        ? `\n\nThe ${formatMoney(deposit)} SIM deposit goes back to the customer's card now.`
+        : `\n\nHand back the ${formatMoney(deposit)} SIM deposit — this rental was not paid by card, so it cannot be refunded automatically.`;
+    if (!window.confirm(`Mark this rental returned?${feeLine}${depositLine}`)) return;
 
-    onUpdate(report.id, {
-      details: {
-        rentalStatus: "Returned",
-        returnedAt: new Date().toISOString(),
-        returnedBy: activeEmployee || "",
-        lateFeeDaysAtReturn: daysLate,
-        lateFeeAtReturn: amount ? amount.toFixed(2) : "0.00",
-      },
-    });
-    setMessage(amount > 0
+    const patch = {
+      rentalStatus: "Returned",
+      returnedAt: new Date().toISOString(),
+      returnedBy: activeEmployee || "",
+      lateFeeDaysAtReturn: daysLate,
+      lateFeeAtReturn: amount ? amount.toFixed(2) : "0.00",
+    };
+
+    // The refund runs before the report is written, so whatever happened to the
+    // money is recorded with the return rather than needing a second save.
+    let depositNote = "";
+    if (depositGoesBackToCard) {
+      setBusy("returning");
+      setMessage(`Refunding the ${formatMoney(deposit)} deposit…`);
+      try {
+        const result = await refundToCard({ amount: deposit, refNum: details.cardRefNum });
+        patch.depositStatus = "Refunded";
+        patch.depositRefundedAt = new Date().toISOString();
+        patch.depositRefundRef = result.refNum || "";
+        depositNote = ` ${formatMoney(deposit)} deposit refunded to the card.`;
+      } catch (error) {
+        // The SIM is still back and the rental is still closed — the money is
+        // the only loose end, and it has to be visible rather than swallowed.
+        patch.depositStatus = "Refund failed";
+        patch.depositRefundError = error.message || "Sola refused the refund.";
+        depositNote = ` The ${formatMoney(deposit)} deposit could NOT be refunded to the card (${error.message || "Sola refused it"}) — give it back by hand.`;
+      } finally {
+        setBusy("");
+      }
+    } else if (depositHeld) {
+      patch.depositStatus = "Refund by hand";
+      depositNote = ` Give back the ${formatMoney(deposit)} deposit — this rental was not paid by card.`;
+    }
+
+    onUpdate(report.id, { details: patch });
+    setMessage((amount > 0
       ? `Marked returned. Late fee owed: ${formatMoney(amount)} — collect it separately.`
-      : "Marked returned. No late fee owed.");
+      : "Marked returned. No late fee owed.") + depositNote);
   }
 
   async function getNumbers() {
@@ -9628,8 +10645,16 @@ function RentalReportActions({ report, onUpdate, activeEmployee }) {
   }
 
   async function cancelRental() {
+    // Israel / Local / Canada rentals were never on RCUK — cancelling one is
+    // just closing our own record.
+    if (!rentalId) {
+      const reason = window.prompt("Reason for cancelling this rental?", "Cancelled in store");
+      if (reason === null) return;
+      onUpdate(report.id, { details: { rentalStatus: "Cancelled", cancelledAt: new Date().toISOString(), cancelReason: reason } });
+      setMessage("Rental cancelled.");
+      return;
+    }
     if (!FUNCTIONS_BASE_URL) { setMessage("Functions URL not configured."); return; }
-    if (!rentalId) { setMessage("This rental has no RCUK rental ID."); return; }
     const reason = window.prompt("Reason for cancelling this rental?", "Cancelled in store");
     if (reason === null) return;
     if (!window.confirm("Cancel this rental with RCUK now? The SIM will be freed immediately.")) return;
@@ -9673,7 +10698,19 @@ function RentalReportActions({ report, onUpdate, activeEmployee }) {
       </button>
       {/* Always available, including after the rental is back: a customer can
           ask for the paperwork at any point. */}
-      <button className="secondary-button compact-button" type="button" onClick={() => printRentalReceipt(report)}>
+      <label className="field receipt-note-field">
+        <span>Note on this receipt</span>
+        <input
+          value={receiptNote}
+          onChange={(event) => setReceiptNote(event.target.value)}
+          placeholder="Anything just for this one — the standing rental instructions print anyway"
+        />
+      </label>
+      <button
+        className="secondary-button compact-button"
+        type="button"
+        onClick={() => printRentalReceipt(report, { note: receiptNote })}
+      >
         Print receipt
       </button>
       {cancelled ? (
@@ -9685,24 +10722,41 @@ function RentalReportActions({ report, onUpdate, activeEmployee }) {
         </span>
       ) : (
         <>
-          {!hasNumbers ? (
+          {/* Numbers only ever come from RCUK, so a rental that was never on
+              RCUK has nothing to fetch. */}
+          {rentalId && (!hasNumbers || usDdiOutstanding) ? (
             <>
               <button className="secondary-button compact-button" type="button" disabled={busy === "numbers"} onClick={getNumbers}>
-                {busy === "numbers" ? "Getting numbers…" : "Get numbers & tell customer"}
+                {busy === "numbers"
+                  ? "Getting numbers…"
+                  : hasNumbers
+                    ? "Get the US number"
+                    : "Get numbers & tell customer"}
               </button>
               {/* The chase runs on the server, so this button is an override,
                   not the only way the numbers ever arrive. Say which. */}
               <span className={details.numbersStatus === "failed" ? "summary-error" : "muted"}>
                 {details.numbersStatus === "failed"
-                  ? "RCUK gave no number after three tries. Press this to fetch it and text or call the customer."
+                  ? "RCUK gave no number after five tries over a day and a half. Press this to fetch it and text or call the customer."
                   : details.numbersStatus === "scheduled"
                     ? `RCUK allocates on ${details.numbersDueDate || "5 days before the start"}. The customer is told automatically.`
-                    : "Being chased automatically. The customer is told the moment it lands."}
+                    : hasNumbers
+                      ? "The UK number is in and the customer has been told. The US number the customer paid for has not been allocated yet — it is still being chased."
+                      : "Being chased automatically. The customer is told the moment it lands."}
               </span>
             </>
           ) : null}
-          <button className="primary-button compact-button" type="button" onClick={markReturned}>
-            Mark returned
+          <button
+            className="primary-button compact-button"
+            type="button"
+            disabled={busy === "returning"}
+            onClick={markReturned}
+          >
+            {busy === "returning"
+              ? "Refunding the deposit…"
+              : depositGoesBackToCard
+                ? `Mark returned & refund ${formatMoney(deposit)}`
+                : "Mark returned"}
           </button>
           <button className="secondary-button compact-button" type="button" disabled={busy === "cancel"} onClick={cancelRental}>
             {busy === "cancel" ? "Cancelling…" : "Cancel rental"}
@@ -9731,6 +10785,11 @@ function RentalEditDialog({ report, onSave, onClose }) {
   // to RCUK's system (after a confirm). Without one, it's a local-only record.
   const rentalId = details.rentalId;
   const isRcuk = Boolean(rentalId);
+  // The package, zone days, SMS and US number are RCUK's. An Israel, Local or
+  // Canada rental has none of them, so the dialog leaves them off. Old reports
+  // with no region recorded count as RCUK when they carry an RCUK rental ID.
+  const region = details.rentalRegion || (isRcuk ? "RCUK" : "");
+  const showRcukFields = isRcuk || region === "RCUK";
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [form, setForm] = useState({
@@ -9759,14 +10818,18 @@ function RentalEditDialog({ report, onSave, onClose }) {
       paymentMethod: form.paymentMethod,
       notes: form.notes.trim(),
       details: {
-        serviceType: form.serviceType,
+        ...(showRcukFields
+          ? {
+            serviceType: form.serviceType,
+            ukDays: Number(form.ukDays) || 0,
+            euDays: Number(form.euDays) || 0,
+            wtsDays: Number(form.wtsDays) || 0,
+            addSms: form.addSms ? "Yes" : "No",
+            usaNumber: form.usaNumber ? "Yes" : "No",
+          }
+          : {}),
         startDate: form.startDate,
         endDate: form.endDate,
-        ukDays: Number(form.ukDays) || 0,
-        euDays: Number(form.euDays) || 0,
-        wtsDays: Number(form.wtsDays) || 0,
-        addSms: form.addSms ? "Yes" : "No",
-        usaNumber: form.usaNumber ? "Yes" : "No",
         simNumber: form.simNumber.trim(),
         model: form.model.trim(),
         imei: form.imei.trim(),
@@ -9780,11 +10843,43 @@ function RentalEditDialog({ report, onSave, onClose }) {
     };
   }
 
+  // Price, payment, phone model and IMEI are ours alone. Only a change to
+  // something RCUK actually holds needs the live rental touched.
+  function rcukFieldsChanged() {
+    const before = {
+      serviceType: details.serviceType || "Voice",
+      startDate: details.startDate || "",
+      endDate: details.endDate || "",
+      ukDays: Number(details.ukDays) || 0,
+      euDays: Number(details.euDays) || 0,
+      wtsDays: Number(details.wtsDays) || 0,
+      addSms: details.addSms === "Yes",
+      usaNumber: details.usaNumber === "Yes",
+      simNumber: String(details.simNumber || "").trim(),
+      customerPhone: String(report.customerPhone || "").trim(),
+      notes: String(report.notes || "").trim(),
+    };
+    const after = {
+      serviceType: form.serviceType,
+      startDate: form.startDate,
+      endDate: form.endDate,
+      ukDays: Number(form.ukDays) || 0,
+      euDays: Number(form.euDays) || 0,
+      wtsDays: Number(form.wtsDays) || 0,
+      addSms: form.addSms,
+      usaNumber: form.usaNumber,
+      simNumber: form.simNumber.trim(),
+      customerPhone: form.customerPhone.trim(),
+      notes: form.notes.trim(),
+    };
+    return Object.keys(before).some((key) => before[key] !== after[key]);
+  }
+
   async function submit(event) {
     event.preventDefault();
     event.stopPropagation();
 
-    if (isRcuk) {
+    if (isRcuk && rcukFieldsChanged()) {
       if (!window.confirm("Are you sure you want to edit this rental in the RCUK LIVE system?")) return;
       if (!FUNCTIONS_BASE_URL) { setError("Functions URL not configured."); return; }
       setBusy(true);
@@ -9832,17 +10927,29 @@ function RentalEditDialog({ report, onSave, onClose }) {
         <div className="dialog-head">
           <div>
             <h2>Edit rental{rentalId ? ` #${rentalId}` : ""}</h2>
-            <p className={isRcuk ? "summary-error" : "muted"}>
-              {isRcuk
-                ? "⚠ This rental is live on RCUK. Saving updates the real rental on RCUK's system — you'll be asked to confirm."
-                : "This rental has no RCUK ID, so changes are saved locally only."}
-            </p>
+            {isRcuk ? (
+              <p className="summary-error">
+                ⚠ This rental is live on RCUK. Changing its dates, SIM or zones updates the real rental on RCUK's
+                system — you'll be asked to confirm. A price change alone is saved here only.
+              </p>
+            ) : region ? (
+              <p className="muted">{region} rental</p>
+            ) : null}
           </div>
           <DialogCloseButton onClose={onClose} label="Close edit rental" />
         </div>
         <form className="form-grid" onSubmit={submit}>
           <label className="field"><span>Customer phone</span><input value={form.customerPhone} inputMode="tel" onChange={(event) => set("customerPhone", event.target.value)} autoFocus /></label>
-          <label className="field"><span>Payment amount</span><input value={form.paymentAmount} inputMode="decimal" placeholder="0.00" onChange={(event) => set("paymentAmount", event.target.value)} /></label>
+          <label className="field">
+            <span>Price (total charged)</span>
+            <input value={form.paymentAmount} inputMode="decimal" placeholder="0.00" onChange={(event) => set("paymentAmount", event.target.value)} />
+            {details.calculatedPrice !== undefined && details.calculatedPrice !== "" ? (
+              <small className="muted">
+                Calculated {formatMoney(Number(details.calculatedPrice) || 0)}
+                {Number(details.securityDeposit) > 0 ? ` + ${formatMoney(Number(details.securityDeposit))} deposit` : ""}
+              </small>
+            ) : null}
+          </label>
           <label className="field">
             <span>Payment method</span>
             <select value={form.paymentMethod} onChange={(event) => set("paymentMethod", event.target.value)}>
@@ -9850,33 +10957,43 @@ function RentalEditDialog({ report, onSave, onClose }) {
               {paymentMethods.map((method) => <option key={method}>{method}</option>)}
             </select>
           </label>
-          <label className="field">
-            <span>Service{isRcuk ? " (RCUK)" : ""}</span>
-            <select value={form.serviceType} onChange={(event) => set("serviceType", event.target.value)}>
-              {["Voice", "Data", "Voice & Data"].map((option) => <option key={option}>{option}</option>)}
-            </select>
-          </label>
+          {showRcukFields ? (
+            <label className="field">
+              <span>Service{isRcuk ? " (RCUK)" : ""}</span>
+              <select value={form.serviceType} onChange={(event) => set("serviceType", event.target.value)}>
+                {["Voice", "Data", "Voice & Data"].map((option) => <option key={option}>{option}</option>)}
+              </select>
+            </label>
+          ) : null}
           <label className="field"><span>Start date{isRcuk ? " (RCUK)" : ""}</span><input type="date" value={form.startDate} onChange={(event) => set("startDate", event.target.value)} /></label>
           <label className="field"><span>End date{isRcuk ? " (RCUK)" : ""}</span><input type="date" value={form.endDate} onChange={(event) => set("endDate", event.target.value)} /></label>
-          <label className="field"><span>UK days{isRcuk ? " (RCUK)" : ""}</span><input value={form.ukDays} inputMode="numeric" onChange={(event) => set("ukDays", event.target.value)} /></label>
-          <label className="field"><span>EU days{isRcuk ? " (RCUK)" : ""}</span><input value={form.euDays} inputMode="numeric" onChange={(event) => set("euDays", event.target.value)} /></label>
-          <label className="field"><span>WTS days{isRcuk ? " (RCUK)" : ""}</span><input value={form.wtsDays} inputMode="numeric" onChange={(event) => set("wtsDays", event.target.value)} /></label>
+          {showRcukFields ? (
+            <>
+              <label className="field"><span>UK days{isRcuk ? " (RCUK)" : ""}</span><input value={form.ukDays} inputMode="numeric" onChange={(event) => set("ukDays", event.target.value)} /></label>
+              <label className="field"><span>EU days{isRcuk ? " (RCUK)" : ""}</span><input value={form.euDays} inputMode="numeric" onChange={(event) => set("euDays", event.target.value)} /></label>
+              <label className="field"><span>WTS days{isRcuk ? " (RCUK)" : ""}</span><input value={form.wtsDays} inputMode="numeric" onChange={(event) => set("wtsDays", event.target.value)} /></label>
+            </>
+          ) : null}
           <label className="field"><span>SIM number{isRcuk ? " (RCUK)" : ""}</span><input value={form.simNumber} inputMode="numeric" onChange={(event) => set("simNumber", event.target.value)} /></label>
           <label className="field"><span>Phone model</span><input value={form.model} onChange={(event) => set("model", event.target.value)} /></label>
           <label className="field"><span>IMEI</span><input value={form.imei} inputMode="numeric" onChange={(event) => set("imei", event.target.value)} /></label>
-          <label className="field checkbox-field">
-            <input type="checkbox" checked={form.addSms} onChange={(event) => set("addSms", event.target.checked)} />
-            <span>Add SMS{isRcuk ? " (RCUK)" : ""}</span>
-          </label>
-          <label className="field checkbox-field">
-            <input type="checkbox" checked={form.usaNumber} onChange={(event) => set("usaNumber", event.target.checked)} />
-            <span>USA number{isRcuk ? " (RCUK)" : ""}</span>
-          </label>
+          {showRcukFields ? (
+            <>
+              <label className="field checkbox-field">
+                <input type="checkbox" checked={form.addSms} onChange={(event) => set("addSms", event.target.checked)} />
+                <span>Add SMS{isRcuk ? " (RCUK)" : ""}</span>
+              </label>
+              <label className="field checkbox-field">
+                <input type="checkbox" checked={form.usaNumber} onChange={(event) => set("usaNumber", event.target.checked)} />
+                <span>USA number{isRcuk ? " (RCUK)" : ""}</span>
+              </label>
+            </>
+          ) : null}
           <label className="field full"><span>Notes</span><textarea rows={2} value={form.notes} onChange={(event) => set("notes", event.target.value)} /></label>
           {error ? <p className="summary-error full">{error}</p> : null}
           <div className="pos-form-actions form-actions-row">
             <button className="primary-button" type="submit" disabled={busy}>
-              {busy ? "Updating RCUK…" : isRcuk ? "Update on RCUK & save" : "Save changes"}
+              {busy ? "Updating RCUK…" : isRcuk && rcukFieldsChanged() ? "Update on RCUK & save" : "Save changes"}
             </button>
             <button className="secondary-button" type="button" onClick={onClose} disabled={busy}>Cancel</button>
           </div>
@@ -9985,6 +11102,9 @@ function ReportDetails({ report, compact }) {
         : ""],
       // Frozen at the moment it was marked returned, so it stops growing and the
       // amount to collect is unambiguous.
+      ["SIM deposit", Number(details.securityDeposit) > 0
+        ? `${formatMoney(Number(details.securityDeposit))}${details.depositStatus ? ` — ${details.depositStatus}` : ""}`
+        : ""],
       ["Late fee owed", Number(details.lateFeeAtReturn) > 0
         ? `${formatMoney(Number(details.lateFeeAtReturn))} (${details.lateFeeDaysAtReturn} day${Number(details.lateFeeDaysAtReturn) === 1 ? "" : "s"} late)`
         : ""],
@@ -9998,9 +11118,13 @@ function ReportDetails({ report, compact }) {
         ? `${formatMoney(Number(details.lateFeeWeekly))}/wk (${formatMoney(Number(details.lateFeeWeekly) / 7)}/day overdue)`
         : ""],
       ["Total days", details.totalDays],
-      ["UK/EU/WTS", `${details.ukDays || 0}/${details.euDays || 0}/${details.wtsDays || 0}`],
-      ["SMS", details.addSms],
-      ["USA number", details.usaNumber],
+      // RCUK-only lines. An Israel, Local or Canada rental has no zone split and
+      // no extras, so they stay off it rather than reading "0/0/0" and "No".
+      ["UK/EU/WTS", numberValue(details.ukDays) + numberValue(details.euDays) + numberValue(details.wtsDays) > 0
+        ? `${numberValue(details.ukDays)}/${numberValue(details.euDays)}/${numberValue(details.wtsDays)}`
+        : ""],
+      ["SMS", details.addSms === "Yes" ? "Yes" : ""],
+      ["USA number", details.usaNumber === "Yes" ? "Yes" : ""],
       ["CLI", details.cli],
       ["US DDI", details.usDdi],
       ["Sola", details.solaTransactionId],
@@ -10030,6 +11154,11 @@ function ReportDetails({ report, compact }) {
       ["Items", details.itemsText],
       ["IMEI", imeis],
       ["Refund method", details.refundMethod],
+      ["Refund split", (details.refundPayments || []).length > 1
+        ? details.refundPayments
+            .map((entry) => `${entry.method} ${formatMoney(Number(entry.amount) || 0)}`)
+            .join(" + ")
+        : ""],
       ["Card refund", details.solaRefundRef],
       ["Original sale", details.originalReportId],
       ["Subtotal", Number(details.refundTax) > 0 && details.refundSubtotal ? formatMoney(Number(details.refundSubtotal)) : ""],
@@ -10071,11 +11200,29 @@ function callRecordingUrl(callId, uniqueId) {
   return `${FUNCTIONS_BASE_URL}/telebroadCallRecording?callid=${encodeURIComponent(callId)}&uniqueid=${encodeURIComponent(uniqueId)}`;
 }
 
+// Money math that survives being split: every intermediate is held at whole
+// cents so the parts of a refund add up to the total instead of drifting apart.
+function roundCents(value) {
+  return Math.round((Number(value) || 0) * 100) / 100;
+}
+
 function ReturnDialog({ report, onClose, onSubmit }) {
   const details = report.details || {};
   const lineItems = details.lineItems || [];
   const returnedByIndex = details.returnedByIndex || {};
   const originalRefNum = details.solaRefNum || "";
+  // A sale can be paid part cash, part card. The refund then has to go back the
+  // same way, each method getting its share and never more than it took.
+  const salePayments = (details.payments || []).filter(
+    (entry) => entry?.method && Number(entry.amount) > 0,
+  );
+  const wasSplitPayment = salePayments.length > 1;
+  const salePaidTotal = roundCents(salePayments.reduce((sum, entry) => sum + (Number(entry.amount) || 0), 0));
+  // What earlier partial returns have already handed back on each method.
+  const refundedByMethod = details.refundedByMethod || {};
+  // The method the sales tax went out on, when only one side of a split carried
+  // it. Blank on a sale where the whole subtotal was taxed.
+  const taxPaidBy = details.taxPaidBy || "";
 
   const [lines, setLines] = useState(() =>
     lineItems.map((item, index) => {
@@ -10095,7 +11242,12 @@ function ReturnDialog({ report, onClose, onSubmit }) {
       };
     }),
   );
-  const [refundMethod, setRefundMethod] = useState(report.paymentMethod || "Cash");
+  const [refundMethod, setRefundMethod] = useState(
+    wasSplitPayment ? salePayments[0].method : (report.paymentMethod || "Cash"),
+  );
+  // Only what the cashier has typed over the pro-rata split, so the default
+  // keeps following the refund total until somebody overrides it.
+  const [splitEdits, setSplitEdits] = useState({});
   const [notes, setNotes] = useState("");
   const [refundState, setRefundState] = useState({ status: "idle", message: "", ref: "" });
 
@@ -10107,20 +11259,101 @@ function ReturnDialog({ report, onClose, onSubmit }) {
     setLines((current) => current.map((line) => ({ ...line, returnQty: line.remaining })));
   }
 
-  const refundSubtotal = lines.reduce((sum, line) => sum + line.price * line.returnQty, 0);
-  // Refund the sales tax the customer originally paid: apply the sale's tax rate
-  // to the returned subtotal. Skip it when the sale charged no tax (out of state
-  // or no store rate), so tax-free sales still refund exactly what was paid.
+  // Give each method back its share of the goods, then hand the sales tax to
+  // the side that actually paid it: on a split where the cash share was untaxed,
+  // splitting the refund pro rata over the total would give cash back tax money
+  // it never put in and short the other side by the same amount.
+  function allocateRefund(subtotalBack, taxBack) {
+    const rows = salePayments.map((entry) => {
+      const paid = roundCents(entry.amount);
+      // What this method put toward the goods themselves, tax set aside.
+      const goods = roundCents(paid - (entry.method === taxPaidBy ? saleTaxAmount : 0));
+      const refunded = roundCents(refundedByMethod[entry.method]);
+      return { method: entry.method, paid, goods, refunded, cap: roundCents(Math.max(0, paid - refunded)), amount: 0 };
+    });
+    const goodsTotal = roundCents(rows.reduce((sum, row) => sum + row.goods, 0));
+    let left = roundCents(subtotalBack + taxBack);
+    rows.forEach((row) => {
+      const goodsShare = goodsTotal > 0 ? subtotalBack * (row.goods / goodsTotal) : 0;
+      const taxShare = taxPaidBy
+        ? (row.method === taxPaidBy ? taxBack : 0)
+        : (salePaidTotal > 0 ? taxBack * (row.paid / salePaidTotal) : 0);
+      const share = roundCents(goodsShare + taxShare);
+      row.amount = Math.min(row.cap, share, left);
+      left = roundCents(left - row.amount);
+    });
+    // Rounding, or a method with nothing left on it, can leave a few cents over.
+    // They go to the first method with room so the split always balances.
+    rows.forEach((row) => {
+      if (left <= 0) return;
+      const add = Math.min(roundCents(row.cap - row.amount), left);
+      if (add <= 0) return;
+      row.amount = roundCents(row.amount + add);
+      left = roundCents(left - add);
+    });
+    return rows;
+  }
+
+  const refundSubtotal = roundCents(lines.reduce((sum, line) => sum + line.price * line.returnQty, 0));
+  // Refund the sales tax the customer originally paid, measured against the
+  // sale's own subtotal rather than re-applying the rate: on a sale split
+  // between cash and a card only the card's share was taxed, so the bare rate
+  // would hand back tax that was never collected. A sale that charged no tax
+  // (out of state, or no store rate) still refunds exactly what was paid.
+  const saleSubtotal = Number(details.subtotal) || 0;
+  const saleTaxAmount = Number(details.taxAmount) || 0;
   const saleTaxRate = Number(details.taxRate) || 0;
-  const taxApplies = Number(details.taxAmount) > 0 && saleTaxRate > 0;
-  const refundTax = taxApplies ? refundSubtotal * (saleTaxRate / 100) : 0;
-  const refundTotal = refundSubtotal + refundTax;
+  const taxApplies = saleTaxAmount > 0;
+  const effectiveTaxRate = !taxApplies
+    ? 0
+    : saleSubtotal > 0
+      ? saleTaxAmount / saleSubtotal
+      : saleTaxRate / 100;
+  // Never hand back more tax than the sale still has on it. Two halves of a
+  // sale returned separately each round their share up, and without this the
+  // second one asks for a cent the sale can no longer pay out.
+  const taxLeft = roundCents(Math.max(0, saleTaxAmount - roundCents(details.refundedTax)));
+  // Taking the whole sale back hands back the whole tax, to the cent.
+  const refundTax = !taxApplies
+    ? 0
+    : Math.min(taxLeft, saleSubtotal > 0 && refundSubtotal >= saleSubtotal
+      ? saleTaxAmount
+      : roundCents(refundSubtotal * effectiveTaxRate));
+  const refundTotal = roundCents(refundSubtotal + refundTax);
+  // The sale's stated rate only describes the tax when the whole subtotal was
+  // taxed; on a card-share-only split it would misprice what is going back.
+  const taxRateLabel = taxApplies && saleTaxRate > 0
+    && Math.abs(saleTaxAmount - saleSubtotal * (saleTaxRate / 100)) < 0.01
+      ? ` (${saleTaxRate}%)`
+      : "";
   const anySelected = lines.some((line) => line.returnQty > 0);
   const imeiNeedsScan = lines.some(
     (line) => line.requiresImei && line.returnQty > 0 && line.scanImei !== line.soldImei,
   );
-  const requiresSolaRefund = isCardPayment(refundMethod) && Boolean(originalRefNum);
-  const canSubmit = anySelected && refundTotal > 0 && !imeiNeedsScan && refundState.status !== "refunding";
+
+  // The pro-rata split, with anything the cashier has moved by hand on top.
+  const splitEdited = Object.keys(splitEdits).length > 0;
+  const splitRows = allocateRefund(refundSubtotal, refundTax).map((row) => {
+    const edited = splitEdits[row.method];
+    return edited === undefined ? row : { ...row, amount: roundCents(Math.max(0, Number(edited) || 0)) };
+  });
+  const splitTotal = roundCents(splitRows.reduce((sum, row) => sum + row.amount, 0));
+  const overRefunded = splitRows.find((row) => row.amount > row.cap + 0.001);
+  const splitIssue = !wasSplitPayment || !anySelected
+    ? ""
+    : overRefunded
+      ? `${overRefunded.method} has only ${formatMoney(overRefunded.cap)} left to give back.`
+      : Math.abs(splitTotal - refundTotal) > 0.005
+        ? `The split adds up to ${formatMoney(splitTotal)} — it has to come to ${formatMoney(refundTotal)}.`
+        : "";
+
+  // Only the card's share goes back to the card; the rest is handed over here.
+  const cardRefundAmount = wasSplitPayment
+    ? roundCents(splitRows.filter((row) => isCardPayment(row.method)).reduce((sum, row) => sum + row.amount, 0))
+    : (isCardPayment(refundMethod) ? refundTotal : 0);
+  const requiresSolaRefund = cardRefundAmount > 0 && Boolean(originalRefNum);
+  const canSubmit = anySelected && refundTotal > 0 && !imeiNeedsScan && !splitIssue
+    && refundState.status !== "refunding";
 
   async function handleConfirm() {
     if (!canSubmit) return;
@@ -10129,9 +11362,13 @@ function ReturnDialog({ report, onClose, onSubmit }) {
     if (requiresSolaRefund && refundState.status !== "refunded") {
       try {
         setRefundState({ status: "refunding", message: "Refunding card...", ref: "" });
-        const result = await refundToCard({ amount: Number(refundTotal.toFixed(2)), refNum: originalRefNum });
+        const result = await refundToCard({ amount: cardRefundAmount, refNum: originalRefNum });
         solaRef = result.refNum;
-        setRefundState({ status: "refunded", message: "Card refunded.", ref: solaRef });
+        setRefundState({
+          status: "refunded",
+          message: `${formatMoney(cardRefundAmount)} refunded to the card.`,
+          ref: solaRef,
+        });
       } catch (error) {
         setRefundState({
           status: "error",
@@ -10155,15 +11392,20 @@ function ReturnDialog({ report, onClose, onSubmit }) {
         lineIndex: line.index,
       }));
 
+    const refundPayments = (wasSplitPayment ? splitRows : [{ method: refundMethod, amount: refundTotal }])
+      .filter((row) => row.method && row.amount > 0)
+      .map((row) => ({ method: row.method, amount: row.amount.toFixed(2) }));
+
     await Promise.resolve(onSubmit(report, {
       returnLines,
-      refundMethod,
+      refundMethod: refundPayments.map((entry) => entry.method).join(" + ") || refundMethod,
+      refundPayments,
       solaRefundRef: solaRef,
       notes,
       refundSubtotal,
       refundTax,
       refundTotal,
-      taxRate: taxApplies ? saleTaxRate : 0,
+      taxRate: taxRateLabel ? saleTaxRate : 0,
     }));
     onClose();
   }
@@ -10239,12 +11481,45 @@ function ReturnDialog({ report, onClose, onSubmit }) {
         </div>
 
         <div className="form-grid">
-          <label className="field">
-            <span>Refund method</span>
-            <select value={refundMethod} onChange={(event) => setRefundMethod(event.target.value)}>
-              {paymentMethods.map((method) => <option key={method}>{method}</option>)}
-            </select>
-          </label>
+          {wasSplitPayment ? (
+            <div className="pos-split full">
+              {splitRows.map((row) => (
+                <label className="field" key={row.method}>
+                  <span>
+                    Back to {row.method}
+                    <small className="muted">
+                      {" "}(paid {formatMoney(row.paid)}{row.refunded > 0 ? `, ${formatMoney(row.refunded)} already back` : ""})
+                    </small>
+                  </span>
+                  <input
+                    inputMode="decimal"
+                    placeholder="0.00"
+                    value={splitEdits[row.method] ?? row.amount.toFixed(2)}
+                    onChange={(event) => setSplitEdits((current) => ({ ...current, [row.method]: event.target.value }))}
+                  />
+                </label>
+              ))}
+              <p className="pos-split-remainder">
+                <span>{splitEdited ? "Split by hand" : "Split the way it was paid"}</span>
+                <strong>{formatMoney(splitTotal)}</strong>
+              </p>
+              {splitEdited ? (
+                <p className="pos-split-note">
+                  <button type="button" className="ghost-button compact-button" onClick={() => setSplitEdits({})}>
+                    Put the split back
+                  </button>
+                </p>
+              ) : null}
+              {splitIssue ? <p className="pos-split-note summary-error">{splitIssue}</p> : null}
+            </div>
+          ) : (
+            <label className="field">
+              <span>Refund method</span>
+              <select value={refundMethod} onChange={(event) => setRefundMethod(event.target.value)}>
+                {paymentMethods.map((method) => <option key={method}>{method}</option>)}
+              </select>
+            </label>
+          )}
           <label className="field full">
             <span>Notes</span>
             <textarea rows="2" value={notes} onChange={(event) => setNotes(event.target.value)} />
@@ -10252,7 +11527,10 @@ function ReturnDialog({ report, onClose, onSubmit }) {
         </div>
 
         {requiresSolaRefund ? (
-          <p className="muted">This card sale will be refunded to the original card via Sola (ref {originalRefNum}).</p>
+          <p className="muted">
+            {formatMoney(cardRefundAmount)} goes back to the original card via Sola (ref {originalRefNum})
+            {wasSplitPayment ? ", and the rest is handed back on the other method" : ""}.
+          </p>
         ) : null}
         {refundState.message ? (
           <p className={refundState.status === "error" ? "summary-error" : "muted"}>{refundState.message}</p>
@@ -10261,7 +11539,7 @@ function ReturnDialog({ report, onClose, onSubmit }) {
         {taxApplies ? (
           <div className="return-lines">
             <div className="pos-totals-row"><span>Subtotal</span><span>{formatMoney(refundSubtotal)}</span></div>
-            <div className="pos-totals-row"><span>Sales tax ({saleTaxRate}%)</span><span>{formatMoney(refundTax)}</span></div>
+            <div className="pos-totals-row"><span>Sales tax{taxRateLabel}</span><span>{formatMoney(refundTax)}</span></div>
           </div>
         ) : null}
         <div className="return-summary">
@@ -10464,7 +11742,431 @@ function CustomerPhoneInput({ value, onChange, onSelectCustomer, onResolveCustom
   );
 }
 
-function CustomersPage({ sessionRole, onSave, onRemove, onSync }) {
+// A customer's account, in one place: what they are owed or owe, how it got
+// that way, and the four things that ever change it. Positive is credit the
+// shop holds for them; negative is a tab they are running.
+function formatBalance(value) {
+  const amount = Number(value) || 0;
+  if (amount > 0) return `${formatMoney(amount)} credit`;
+  if (amount < 0) return `${formatMoney(Math.abs(amount))} owed`;
+  return "Settled";
+}
+
+function balanceClass(value) {
+  const amount = Number(value) || 0;
+  if (amount > 0) return "status-pill returned";
+  if (amount < 0) return "status-pill";
+  return "muted";
+}
+
+const ACCOUNT_MOVES = [
+  { key: "credit", label: "Add credit", hint: "Money in: a deposit, a goodwill credit, or change left on account.", sign: 1 },
+  { key: "settle", label: "Customer pays their tab", hint: "They handed over cash or a card against what they owe.", sign: 1 },
+  { key: "charge", label: "Charge to the account", hint: "They took something now and will settle later.", sign: -1 },
+  { key: "spend", label: "Spend their credit", hint: "Credit used against something not rung up at the till.", sign: -1 },
+];
+
+function CustomerAccountDialog({ customer, activeEmployee, onAdjust, onClose }) {
+  const [move, setMove] = useState("credit");
+  const [amount, setAmount] = useState("");
+  const [reason, setReason] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [clearing, setClearing] = useState(false);
+
+  const balance = Number(customer.balance) || 0;
+  const history = customer.balanceEntries || [];
+  const chosen = ACCOUNT_MOVES.find((entry) => entry.key === move) || ACCOUNT_MOVES[0];
+  const value = Math.round((Number(amount) || 0) * 100) / 100;
+  const nextBalance = Math.round((balance + chosen.sign * value) * 100) / 100;
+
+  async function submit(event) {
+    event.preventDefault();
+    if (!(value > 0)) { setError("Enter how much."); return; }
+    setBusy(true);
+    setError("");
+    try {
+      await onAdjust({
+        amount: chosen.sign * value,
+        reason,
+        by: activeEmployee || "",
+        kind: chosen.label,
+      });
+      setAmount("");
+      setReason("");
+    } catch (saveError) {
+      setError(saveError.message || "That did not save. Try again.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  // Back to zero in one move. Written as an ordinary movement of the opposite
+  // amount rather than a silent overwrite, so the history still shows what was
+  // on the account and who cleared it — money leaving an account without a
+  // trace is exactly the argument this ledger exists to settle.
+  async function clearBalance() {
+    if (!balance) return;
+    const wording = balance > 0
+      ? `Clear ${formatMoney(balance)} of credit off this account?`
+      : `Write off the ${formatMoney(Math.abs(balance))} this customer owes?`;
+    if (!window.confirm(`${wording} It stays in the history below.`)) return;
+    setClearing(true);
+    setError("");
+    try {
+      await onAdjust({
+        amount: -balance,
+        reason: reason.trim() || (balance > 0 ? "Credit cleared" : "Debt written off"),
+        by: activeEmployee || "",
+        kind: balance > 0 ? "Credit cleared" : "Debt written off",
+      });
+      setReason("");
+    } catch (saveError) {
+      setError(saveError.message || "That did not save. Try again.");
+    } finally {
+      setClearing(false);
+    }
+  }
+
+  return createPortal(
+    <div className="dialog-backdrop" role="presentation" onMouseDown={onClose}>
+      <div className="dialog-card dialog-card-wide" role="dialog" aria-modal="true" onMouseDown={(event) => event.stopPropagation()}>
+        <div className="dialog-head">
+          <div>
+            <p className="eyebrow">Account</p>
+            <h3>{customer.name || customer.phone || "Customer"}</h3>
+            <p className="muted">{customer.phone || "No phone on file"}</p>
+          </div>
+          <DialogCloseButton onClose={onClose} label="Close account" />
+        </div>
+
+        <div className="return-summary">
+          <span>Balance</span>
+          <strong className={balanceClass(balance)}>{formatBalance(balance)}</strong>
+        </div>
+
+        <form className="form-grid dialog-form" onSubmit={submit} onKeyDown={preventEnterSubmit}>
+          <label className="field">
+            <span>What happened</span>
+            <select value={move} onChange={(event) => { setMove(event.target.value); setError(""); }}>
+              {ACCOUNT_MOVES.map((entry) => <option key={entry.key} value={entry.key}>{entry.label}</option>)}
+            </select>
+            <small className="muted">{chosen.hint}</small>
+          </label>
+          <label className="field">
+            <span>Amount</span>
+            <input
+              inputMode="decimal"
+              value={amount}
+              onChange={(event) => { setAmount(event.target.value); setError(""); }}
+              placeholder="0.00"
+            />
+            {value > 0 ? (
+              <small className="muted">Balance becomes {formatBalance(nextBalance)}.</small>
+            ) : null}
+          </label>
+          <label className="field full">
+            <span>What it was for</span>
+            <input
+              value={reason}
+              onChange={(event) => setReason(event.target.value)}
+              placeholder="Deposit on an iPhone 16, change left on account, repair settled later…"
+            />
+          </label>
+          {error ? <p className="summary-error full">{error}</p> : null}
+          <div className="pos-form-actions form-actions-row">
+            <button className="primary-button" type="submit" disabled={busy || clearing || !(value > 0)}>
+              {busy ? "Saving…" : `${chosen.label} · ${formatMoney(value)}`}
+            </button>
+            {balance ? (
+              <button
+                className="secondary-button"
+                type="button"
+                onClick={clearBalance}
+                disabled={busy || clearing}
+              >
+                {clearing ? "Clearing…" : balance > 0 ? "Clear the credit" : "Write off what's owed"}
+              </button>
+            ) : null}
+            <button className="secondary-button" type="button" onClick={onClose}>Done</button>
+          </div>
+        </form>
+
+        <div className="history-header">
+          <div>
+            <p className="eyebrow">History</p>
+            <h3>Last {history.length} movement{history.length === 1 ? "" : "s"}</h3>
+          </div>
+        </div>
+        {history.length ? (
+          <div className="table-wrap">
+            <table>
+              <thead>
+                <tr><th>When</th><th>What</th><th>For</th><th>Amount</th><th>Balance</th><th>By</th></tr>
+              </thead>
+              <tbody>
+                {history.map((entry) => (
+                  <tr key={entry.id}>
+                    <td>{formatShortDate(entry.at)}</td>
+                    <td>{entry.kind}</td>
+                    <td className="muted">{entry.reason || ""}</td>
+                    <td>{Number(entry.amount) > 0 ? "+" : ""}{formatMoney(Number(entry.amount) || 0)}</td>
+                    <td>{formatBalance(entry.balanceAfter)}</td>
+                    <td className="muted">{entry.by || ""}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        ) : (
+          <p className="empty-state">Nothing has gone on or off this account yet.</p>
+        )}
+      </div>
+    </div>,
+    document.body,
+  );
+}
+
+// People who asked to be told when something lands. Kept apart from the CRM
+// record itself: a customer can be waiting for three things at once, and each
+// one is finished separately.
+function StockWaitlist({ entries = [], products = [], activeEmployee, activeLocation, onSave, onRemove }) {
+  const [form, setForm] = useState({ customerPhone: "", customerName: "", productId: "", itemText: "", note: "" });
+  const [search, setSearch] = useState("");
+  const [busyId, setBusyId] = useState("");
+  const [message, setMessage] = useState("");
+  const [showDone, setShowDone] = useState(false);
+
+  const productsById = useMemo(
+    () => Object.fromEntries(products.map((product) => [product.id, product])),
+    [products],
+  );
+
+  // How much of a thing is on the shelf right now. This is what turns a waiting
+  // row into a "ring them" row — no restock hook to forget to call.
+  function stockOf(productId) {
+    const product = productsById[productId];
+    if (!product) return 0;
+    return product.requiresImei ? (product.imeis || []).length : Number(product.quantity) || 0;
+  }
+
+  const rows = useMemo(() => {
+    const term = search.trim().toLowerCase();
+    return entries
+      .filter((entry) => (showDone ? true : entry.status !== "Done"))
+      .filter((entry) => !term || [entry.customerName, entry.customerPhone, entry.itemText, entry.note]
+        .filter(Boolean).join(" ").toLowerCase().includes(term))
+      .map((entry) => ({ ...entry, inStock: stockOf(entry.productId) }))
+      // Whatever is back on the shelf floats up: those are the calls to make.
+      .sort((a, b) => (b.inStock > 0) - (a.inStock > 0)
+        || String(a.createdAt || "").localeCompare(String(b.createdAt || "")));
+  }, [entries, search, showDone, productsById]);
+
+  const readyCount = rows.filter((row) => row.inStock > 0 && row.status !== "Done").length;
+
+  function addEntry(event) {
+    event.preventDefault();
+    const product = productsById[form.productId];
+    const itemText = form.itemText.trim() || product?.name || "";
+    if (localPhoneDigits(form.customerPhone).length < 6) { setMessage("Enter the customer's phone number."); return; }
+    if (!itemText) { setMessage("Say what they are waiting for."); return; }
+    onSave({
+      id: crypto.randomUUID(),
+      customerPhone: form.customerPhone.trim(),
+      customerPhoneDigits: localPhoneDigits(form.customerPhone),
+      customerName: titleCaseName(form.customerName.trim()),
+      // Linked to a catalogue item where there is one, so the shelf itself says
+      // when to call. Free text covers what has not been stocked before.
+      productId: form.productId,
+      itemText,
+      note: form.note.trim(),
+      status: "Waiting",
+      location: activeLocation || "",
+      createdAt: new Date().toISOString(),
+      createdBy: activeEmployee || "",
+      lastContactedAt: "",
+      lastContactedHow: "",
+    });
+    setForm({ customerPhone: "", customerName: "", productId: "", itemText: "", note: "" });
+    setMessage(`${itemText} added to the waiting list.`);
+  }
+
+  async function contact(entry, method) {
+    setBusyId(entry.id);
+    setMessage("");
+    const body = `Diamant Telecom: the ${entry.itemText} you asked about is back in stock. Reply or call us to hold one for you.`;
+    try {
+      const result = await callFunction("notifyStockWaitlist", { to: entry.customerPhone, method, body });
+      if (!result?.sent) throw new Error(result?.detail || "It did not go through.");
+      onSave({
+        ...entry,
+        status: "Told",
+        lastContactedAt: new Date().toISOString(),
+        lastContactedHow: method,
+      });
+      setMessage(`${method === "Phone call" ? "Called" : "Texted"} ${entry.customerName || entry.customerPhone}.`);
+    } catch (error) {
+      setMessage(`Could not reach ${entry.customerName || entry.customerPhone}: ${error.message || "unknown error"}.`);
+    } finally {
+      setBusyId("");
+    }
+  }
+
+  return (
+    <section className="history">
+      <div className="history-header">
+        <div>
+          <p className="eyebrow">Waiting for stock</p>
+          <h2>{rows.filter((row) => row.status !== "Done").length} waiting</h2>
+        </div>
+        <div className="history-actions">
+          {readyCount ? <span className="status-pill returned">{readyCount} back in stock</span> : null}
+          <input
+            className="pos-search"
+            value={search}
+            onChange={(event) => setSearch(event.target.value)}
+            placeholder="Search by name, number, or item"
+          />
+          <label className="checkbox-field">
+            <input type="checkbox" checked={showDone} onChange={(event) => setShowDone(event.target.checked)} />
+            <span>Show finished</span>
+          </label>
+        </div>
+      </div>
+
+      <form className="form-grid inventory-form" onSubmit={addEntry} onKeyDown={preventEnterSubmit}>
+        <label className="field">
+          <span>Customer phone</span>
+          <input
+            inputMode="tel"
+            value={form.customerPhone}
+            onChange={(event) => { setForm((c) => ({ ...c, customerPhone: event.target.value })); setMessage(""); }}
+          />
+        </label>
+        <label className="field">
+          <span>Name</span>
+          <input value={form.customerName} onChange={(event) => setForm((c) => ({ ...c, customerName: event.target.value }))} />
+        </label>
+        <label className="field">
+          <span>Item from the catalogue</span>
+          <select
+            value={form.productId}
+            onChange={(event) => {
+              const productId = event.target.value;
+              setForm((c) => ({ ...c, productId, itemText: productsById[productId]?.name || c.itemText }));
+              setMessage("");
+            }}
+          >
+            <option value="">Not in the catalogue</option>
+            {products.map((product) => <option key={product.id} value={product.id}>{product.name}</option>)}
+          </select>
+          <small className="muted">Pick one and this list tells you the moment it is back on the shelf.</small>
+        </label>
+        <label className="field">
+          <span>What they want</span>
+          <input
+            value={form.itemText}
+            onChange={(event) => { setForm((c) => ({ ...c, itemText: event.target.value })); setMessage(""); }}
+            placeholder="iPhone 16 Pro 256 black"
+          />
+        </label>
+        <label className="field full">
+          <span>Note</span>
+          <input
+            value={form.note}
+            onChange={(event) => setForm((c) => ({ ...c, note: event.target.value }))}
+            placeholder="Will pay cash, wants it before Sukkos…"
+          />
+        </label>
+        <div className="pos-form-actions form-actions-row">
+          <button className="primary-button" type="submit">Add to the list</button>
+          {message ? <span className="muted">{message}</span> : null}
+        </div>
+      </form>
+
+      <div className="table-wrap">
+        <table>
+          <thead>
+            <tr><th>Customer</th><th>Waiting for</th><th>Asked</th><th>Stock</th><th>Status</th><th></th></tr>
+          </thead>
+          <tbody>
+            {rows.length ? rows.map((entry) => (
+              <tr key={entry.id}>
+                <td>
+                  <strong>{entry.customerName || "-"}</strong>
+                  <p className="muted">{entry.customerPhone}</p>
+                </td>
+                <td>
+                  {entry.itemText}
+                  {entry.note ? <p className="muted">{entry.note}</p> : null}
+                </td>
+                <td>{formatShortDate(entry.createdAt)}</td>
+                <td>
+                  {entry.productId
+                    ? (entry.inStock > 0
+                      ? <span className="status-pill returned">{entry.inStock} in stock</span>
+                      : <span className="muted">None</span>)
+                    : <span className="muted">Not tracked</span>}
+                </td>
+                <td>
+                  {entry.status === "Done"
+                    ? <span className="muted">Finished</span>
+                    : entry.lastContactedAt
+                      ? <span className="muted">{entry.lastContactedHow === "Phone call" ? "Called" : "Texted"} {formatShortDate(entry.lastContactedAt)}</span>
+                      : <span className="muted">Waiting</span>}
+                </td>
+                <td className="pos-row-actions">
+                  <button
+                    className="secondary-button compact-button"
+                    type="button"
+                    disabled={busyId === entry.id}
+                    onClick={() => contact(entry, "Text message")}
+                  >
+                    {busyId === entry.id ? "…" : "Text"}
+                  </button>
+                  <button
+                    className="secondary-button compact-button"
+                    type="button"
+                    disabled={busyId === entry.id}
+                    onClick={() => contact(entry, "Phone call")}
+                  >
+                    Call
+                  </button>
+                  {entry.status !== "Done" ? (
+                    <button
+                      className="secondary-button compact-button"
+                      type="button"
+                      onClick={() => onSave({ ...entry, status: "Done", finishedAt: new Date().toISOString() })}
+                    >
+                      Finished
+                    </button>
+                  ) : null}
+                  <button
+                    className="dialog-close"
+                    type="button"
+                    aria-label="Remove from the list"
+                    onClick={() => onRemove(entry.id)}
+                  >
+                    &times;
+                  </button>
+                </td>
+              </tr>
+            )) : (
+              <tr>
+                <td colSpan="6" className="empty-state">
+                  {entries.length ? "Nobody matches that." : "Nobody is waiting on stock right now."}
+                </td>
+              </tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  );
+}
+
+function CustomersPage({ sessionRole, activeEmployee, activeLocation, products = [], waitlist = [], onSaveWaitlistEntry, onRemoveWaitlistEntry, onSave, onRemove, onSync }) {
+  const [account, setAccount] = useState(null);
   const emptyCustomer = { id: "", name: "", phone: "", mobile: "", address: "", email: "", contactDetails: "", notes: "" };
   const [form, setForm] = useState(emptyCustomer);
   const [search, setSearch] = useState("");
@@ -10571,7 +12273,7 @@ function CustomersPage({ sessionRole, onSave, onRemove, onSync }) {
         <div className="table-wrap">
           <table>
             <thead>
-              <tr><th>Name</th><th>Phone</th><th>Mobile</th><th>Address</th><th>Email</th><th>Notes</th><th></th></tr>
+              <tr><th>Name</th><th>Phone</th><th>Mobile</th><th>Account</th><th>Address</th><th>Email</th><th>Notes</th><th></th></tr>
             </thead>
             <tbody>
               {rows.length ? (
@@ -10580,17 +12282,24 @@ function CustomersPage({ sessionRole, onSave, onRemove, onSync }) {
                     <td><strong>{customer.name || "-"}</strong></td>
                     <td>{customer.phone || "-"}</td>
                     <td>{customer.mobile || "-"}</td>
+                    <td>
+                      {/* Every row says where the account stands — "Settled" is
+                          an answer too, and reading it off the list is the whole
+                          point of the column. */}
+                      <span className={balanceClass(customer.balance)}>{formatBalance(customer.balance)}</span>
+                    </td>
                     <td>{customer.address || "-"}</td>
                     <td>{customer.email || "-"}</td>
                     <td className="muted">{customer.notes || ""}</td>
                     <td className="pos-row-actions">
+                      <button className="secondary-button compact-button" type="button" onClick={() => setAccount(customer)}>Account</button>
                       <button className="secondary-button compact-button" type="button" onClick={() => editCustomer(customer)}>Edit</button>
                       {isAdmin ? <button className="secondary-button compact-button" type="button" onClick={() => handleRemove(customer.id)}>Delete</button> : null}
                     </td>
                   </tr>
                 ))
               ) : (
-                <tr><td colSpan="7" className="empty-state">{loading ? "Loading…" : search ? "No matches." : "Type a phone number or name to search."}</td></tr>
+                <tr><td colSpan="8" className="empty-state">{loading ? "Loading…" : search ? "No matches." : "Type a phone number or name to search."}</td></tr>
               )}
             </tbody>
           </table>
@@ -10604,6 +12313,35 @@ function CustomersPage({ sessionRole, onSave, onRemove, onSync }) {
           </div>
         ) : null}
       </section>
+
+      <StockWaitlist
+        entries={waitlist}
+        products={products}
+        activeEmployee={activeEmployee}
+        activeLocation={activeLocation}
+        onSave={onSaveWaitlistEntry}
+        onRemove={onRemoveWaitlistEntry}
+      />
+
+      {account ? (
+        <CustomerAccountDialog
+          customer={account}
+          activeEmployee={activeEmployee}
+          onAdjust={async (move) => {
+            const result = await adjustCustomerBalance(account.id, move);
+            // Keep the open dialog and the row behind it showing the truth that
+            // just came back from the write, without re-running the search.
+            const next = {
+              ...account,
+              balance: result.balance,
+              balanceEntries: [result.entry, ...(account.balanceEntries || [])].slice(0, 50),
+            };
+            setAccount(next);
+            setRows((current) => current.map((row) => (row.id === next.id ? { ...row, ...next } : row)));
+          }}
+          onClose={() => setAccount(null)}
+        />
+      ) : null}
     </>
   );
 }

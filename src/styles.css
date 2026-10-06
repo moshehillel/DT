@@ -786,32 +786,139 @@ button:active {
   overflow: hidden;
 }
 
-.notification-center {
-  display: grid;
-  gap: 14px;
+/* Notifications sit behind a bell in the top bar. The panel is anchored to the
+   bell and scrolls inside itself, so opening it never pushes the page around. */
+.notif {
+  position: relative;
+  flex: none;
+}
+
+.notif-bell {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 40px;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 10px;
   background: #fff;
-  border: 1px solid #ffd6b5;
-  border-radius: 8px;
-  box-shadow: var(--shadow-soft);
-  padding: 18px;
+  color: var(--muted);
+  cursor: pointer;
+  transition: color .15s, border-color .15s, background .15s, transform .15s;
 }
 
-.notification-center h2 {
-  margin: 0;
-  font-size: 20px;
+.notif-bell svg {
+  width: 22px;
+  height: 22px;
+  display: block;
 }
 
-.notification-center-head {
+.notif-bell:hover {
+  color: var(--ink);
+  border-color: #b9c2cc;
+}
+
+.notif-bell.is-open {
+  color: var(--brand-dark);
+  border-color: var(--brand-dark);
+  background: #f2f8f7;
+}
+
+/* Something is waiting: the bell itself goes red and gives one soft nudge, so
+   it reads as new without turning into a flashing distraction all day. */
+.notif-bell.has-news {
+  color: var(--danger, #c0392b);
+  border-color: #f3bdb5;
+  background: #fff6f5;
+  animation: notif-nudge 1.6s ease-in-out 2;
+}
+
+@keyframes notif-nudge {
+  0%, 60%, 100% { transform: rotate(0deg); }
+  10%, 30%, 50% { transform: rotate(-9deg); }
+  20%, 40% { transform: rotate(9deg); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .notif-bell.has-news { animation: none; }
+}
+
+.notif-badge {
+  position: absolute;
+  top: -6px;
+  right: -6px;
+  min-width: 19px;
+  height: 19px;
+  padding: 0 5px;
+  border-radius: 999px;
+  background: var(--danger, #c0392b);
+  color: #fff;
+  font-size: 11px;
+  font-weight: 800;
+  line-height: 19px;
+  text-align: center;
+  box-shadow: 0 0 0 2px #fff;
+}
+
+.notif-panel {
+  position: absolute;
+  top: calc(100% + 10px);
+  right: 0;
+  z-index: 60;
+  width: min(400px, calc(100vw - 32px));
+  max-height: min(60vh, 520px);
+  overflow-y: auto;
+  display: grid;
+  gap: 12px;
+  align-content: start;
+  padding: 16px;
+  background: #fff;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  box-shadow: 0 16px 40px rgba(16, 32, 48, .18);
+  text-align: left;
+  animation: notif-drop .14s ease-out;
+}
+
+@keyframes notif-drop {
+  from { opacity: 0; transform: translateY(-6px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.notif-panel-head {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 12px;
   flex-wrap: wrap;
+  position: sticky;
+  top: -16px;
+  margin: -16px -16px 0;
+  padding: 16px 16px 10px;
+  background: #fff;
+  border-bottom: 1px solid var(--line);
 }
 
-.notification-list {
+.notif-panel-head h3 {
+  margin: 0;
+  font-size: 17px;
+}
+
+.notif-panel-list {
   display: grid;
   gap: 10px;
+}
+
+@media (max-width: 640px) {
+  .notif-panel {
+    position: fixed;
+    top: auto;
+    left: 16px;
+    right: 16px;
+    width: auto;
+  }
 }
 
 .app-notification {
@@ -4035,6 +4142,18 @@ tr:last-child td {
   border-top: 1px solid var(--line);
 }
 
+/* Phone and payment method share the top row at the same height; whatever a
+   chosen customer brings (name, account box) takes a full row of its own
+   below, so picking one never reshuffles or stretches the boxes beside it. */
+.pos-checkout-fields {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  align-items: start;
+}
+
+.pos-checkout-fields > .full {
+  grid-column: 1 / -1;
+}
+
 .pos-customer-name {
   margin: -4px 0 0;
   font-size: 18px;
@@ -4526,6 +4645,24 @@ input.rental-cell-num {
   white-space: nowrap;
 }
 
+.rental-cell-price input {
+  width: 84px;
+  font-weight: 800;
+  text-align: right;
+}
+
+/* The calculated price sits in the box as its placeholder; it is the price
+   unless something is typed over it, so it reads like a value, not a hint. */
+.rental-cell-price input::placeholder {
+  color: var(--ink);
+  opacity: 1;
+}
+
+.rental-cell-price small {
+  display: block;
+  white-space: nowrap;
+}
+
 .rental-cell-actions {
   display: flex;
   gap: 6px;
@@ -4676,4 +4813,34 @@ input.rental-cell-num {
   font-size: 12px;
   font-weight: 650;
   color: #9a5b00;
+}
+
+/* The one-off line that goes on a single receipt. Sits inline with the print
+   controls rather than in a form grid, so it stays narrow next to the buttons. */
+.receipt-note-field {
+  width: 100%;
+  max-width: 420px;
+  margin-bottom: 10px;
+}
+
+.receipt-note-field input {
+  font-size: 13px;
+}
+
+/* Payment already taken on the order screen: the counterpart to pos-action-warn,
+   saying the bar is clear rather than that something is missing. */
+.pos-action-paid {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--brand-dark);
+  background: #eef7f4;
+  border-radius: 999px;
+  padding: 4px 12px;
+}
+
+/* On a phone the checkout fields stack, like every other form. */
+@media (max-width: 640px) {
+  .pos-checkout-fields {
+    grid-template-columns: 1fr;
+  }
 }

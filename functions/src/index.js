@@ -19,9 +19,11 @@ const {
   RENTAL_NUMBER_MAX_ATTEMPTS,
   buildRentalNumbersMessage,
   buildRentalNumbersVoiceMessage,
+  numbersOutstanding,
   planRentalNumberChase,
   rentalNeedsNumbers,
   retryAt,
+  wantsUsDdi,
 } = require("./rentalNumbers");
 const {
   buildTelebroadPendingReport,
@@ -676,6 +678,25 @@ async function sendEmail({ to, subject, body }) {
 
 // Emails a sale receipt. Same shape and same guards as sendSaleReceiptSms: signed
 // in, a real recipient, plain text only, and a length that is actually a receipt.
+// Telling the people who asked to be called that the thing they wanted is on
+// the shelf. Same two channels as every other customer notice, so a shop that
+// only has a landline for somebody can still reach them.
+exports.notifyStockWaitlist = onCall({ region: REGION }, async (request) => {
+  if (!request.auth) throw new HttpsError("unauthenticated", "Sign in required.");
+  const to = String(request.data?.to || "").trim();
+  const body = String(request.data?.body || "").trim();
+  const method = request.data?.method === "Phone call" ? "Phone call" : "Text message";
+  if (!to) throw new HttpsError("invalid-argument", "A phone number is required.");
+  if (!body) throw new HttpsError("invalid-argument", "There is no message to send.");
+
+  const result = await sendCustomerNotification({ to, method, body });
+  return {
+    sent: result.status === "Sent",
+    status: result.status,
+    detail: result.detail || "",
+  };
+});
+
 exports.sendSaleReceiptEmail = onCall({ region: REGION }, async (request) => {
   if (!request.auth) throw new HttpsError("unauthenticated", "Sign in required.");
   const to = String(request.data?.to || "").trim();
@@ -1768,14 +1789,18 @@ async function runRentalNumberJob(jobDoc) {
   let ilDdi = report.details?.ilDdi || "";
   let rcukStatus = report.details?.rcukStatus || "";
 
-  if (!cli) {
+  // Ask while anything ordered is still missing, not merely while the CLI is:
+  // a US DDI allocated after the UK number has to be collected too.
+  if (numbersOutstanding({ cli, usDdi, usaNumber: report.details?.usaNumber })) {
     try {
       const result = await callRcuk(RCUK_GET_RENTAL_PATH, { rental_id: job.rentalId }, "GET");
       if (result.ok) {
         const lookup = normalizeRentalLookup(result.data);
-        cli = lookup.cli || "";
-        usDdi = lookup.usDdi || "";
-        ilDdi = lookup.ilDdi || "";
+        // Never trade a number already in hand for a blank: RCUK reports an
+        // add-on it has not allocated yet as "No", which reads as nothing.
+        cli = lookup.cli || cli;
+        usDdi = lookup.usDdi || usDdi;
+        ilDdi = lookup.ilDdi || ilDdi;
         rcukStatus = lookup.status || rcukStatus;
       }
     } catch (error) {
@@ -1790,7 +1815,7 @@ async function runRentalNumberJob(jobDoc) {
     if (attempt < RENTAL_NUMBER_MAX_ATTEMPTS) {
       await jobDoc.ref.set({
         attempt,
-        nextAttemptAt: admin.firestore.Timestamp.fromDate(retryAt()),
+        nextAttemptAt: admin.firestore.Timestamp.fromDate(retryAt(attempt)),
       }, { merge: true });
       return;
     }
@@ -1804,7 +1829,8 @@ async function runRentalNumberJob(jobDoc) {
       report,
       method,
       "Failed",
-      `RCUK gave no number for rental ${job.rentalId} after ${attempt} tries. Fetch it by hand and tell the customer.`,
+      `RCUK gave no number for rental ${job.rentalId} after ${attempt} tries over a day and a half. `
+        + "Fetch it by hand and tell the customer.",
       "rental-numbers",
     );
     await jobDoc.ref.set({ status: "failed", attempt, failedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
@@ -1822,18 +1848,53 @@ async function runRentalNumberJob(jobDoc) {
     ilDdi,
     rcukStatus,
     numbersStatus: "delivered",
-    numbersDeliveredAt: new Date().toISOString(),
+    // Stamped once. A later pass picking up the US DDI is the same delivery,
+    // not a new one.
+    numbersDeliveredAt: report.details?.numbersDeliveredAt || new Date().toISOString(),
   };
   await reportRef.set({ details: numbers }, { merge: true });
-  await jobDoc.ref.set({
-    status: "done",
-    attempt,
-    cli,
-    usDdi,
-    completedAt: admin.firestore.FieldValue.serverTimestamp(),
-  }, { merge: true });
+
+  // The UK number goes to the customer the moment it is in — waiting on a US
+  // DDI would hold up the one number they actually need to be reachable on.
+  // But a US number that was paid for and has not arrived keeps the job open
+  // for its remaining tries, so it lands on the report instead of being lost.
+  // deliverRentalNumbers stamps the report the first time it sends, so running
+  // again cannot tell the customer twice.
+  const usStillMissing = wantsUsDdi(report.details) && !usDdi;
+  if (usStillMissing && attempt < RENTAL_NUMBER_MAX_ATTEMPTS) {
+    await jobDoc.ref.set({
+      attempt,
+      cli,
+      usDdi,
+      nextAttemptAt: admin.firestore.Timestamp.fromDate(retryAt(attempt)),
+    }, { merge: true });
+  } else {
+    await jobDoc.ref.set({
+      status: "done",
+      attempt,
+      cli,
+      usDdi,
+      completedAt: admin.firestore.FieldValue.serverTimestamp(),
+    }, { merge: true });
+  }
 
   await deliverRentalNumbers(job.reportId, { ...report, details: { ...report.details, ...numbers } });
+
+  // Out of tries with a US number the customer paid for still missing. The UK
+  // number went out, so this is not a failed rental — but somebody has to chase
+  // RCUK for the rest, and that cannot live only in a log.
+  if (usStillMissing && attempt >= RENTAL_NUMBER_MAX_ATTEMPTS) {
+    await writeNotificationLog(
+      `rental-usddi-missing-${job.reportId}`,
+      job.reportId,
+      report,
+      method,
+      "Failed",
+      `RCUK gave no US number for rental ${job.rentalId} after ${attempt} tries, though the customer paid for one. `
+        + "The UK number was sent. Open the rental, press Get numbers, and chase RCUK if it is still blank.",
+      "rental-numbers",
+    );
+  }
 }
 
 // One card, one customer, one message. Four SIMs rented together are four
@@ -1969,10 +2030,23 @@ exports.rcukDeliverNumbers = onRequest(HTTP_OPTIONS, async (req, res) => {
       rcukStatus: report.details?.rcukStatus || "",
     };
 
-    if (!numbers.cli) {
+    // Ask whenever anything ordered is still missing. Gating this on the CLI
+    // alone made the button a no-op for the case it was most needed in: a
+    // rental holding a UK number and waiting on the US DDI.
+    if (numbersOutstanding({ ...numbers, usaNumber: report.details?.usaNumber })) {
       const result = await callRcuk(RCUK_GET_RENTAL_PATH, { rental_id: rentalId }, "GET");
-      const lookup = normalizeRentalLookup(result.data);
-      if (!result.ok || !lookup.cli) {
+      if (result.ok) {
+        const lookup = normalizeRentalLookup(result.data);
+        // Keep what is already in hand — an add-on RCUK has not allocated yet
+        // comes back as "No", and that must not wipe a number we have.
+        numbers = {
+          cli: lookup.cli || numbers.cli,
+          usDdi: lookup.usDdi || numbers.usDdi,
+          ilDdi: lookup.ilDdi || numbers.ilDdi,
+          rcukStatus: lookup.status || numbers.rcukStatus,
+        };
+      }
+      if (!numbers.cli) {
         sendJson(res, 200, {
           ok: false,
           pending: true,
@@ -1980,8 +2054,8 @@ exports.rcukDeliverNumbers = onRequest(HTTP_OPTIONS, async (req, res) => {
         });
         return;
       }
-      numbers = { cli: lookup.cli, usDdi: lookup.usDdi, ilDdi: lookup.ilDdi, rcukStatus: lookup.status };
     }
+    const usStillMissing = wantsUsDdi(report.details) && !numbers.usDdi;
 
     const details = {
       ...numbers,
@@ -1990,13 +2064,20 @@ exports.rcukDeliverNumbers = onRequest(HTTP_OPTIONS, async (req, res) => {
     };
     await reportRef.set({ details }, { merge: true });
 
-    // Whatever the chase was going to do, it is done now.
-    await db.collection(RENTAL_NUMBER_JOBS).doc(reportId).set({
-      status: "done",
-      cli: numbers.cli,
-      usDdi: numbers.usDdi,
-      completedAt: admin.firestore.FieldValue.serverTimestamp(),
-    }, { merge: true });
+    // Whatever the chase was going to do, it is done now — unless a US number
+    // the customer paid for is still out, in which case the chase keeps its
+    // remaining tries rather than being closed on a half-finished set.
+    await db.collection(RENTAL_NUMBER_JOBS).doc(reportId).set(
+      usStillMissing
+        ? { cli: numbers.cli, usDdi: numbers.usDdi }
+        : {
+          status: "done",
+          cli: numbers.cli,
+          usDdi: numbers.usDdi,
+          completedAt: admin.firestore.FieldValue.serverTimestamp(),
+        },
+      { merge: true },
+    );
 
     await deliverRentalNumbers(reportId, { ...report, details: { ...report.details, ...details } });
 
@@ -2010,11 +2091,15 @@ exports.rcukDeliverNumbers = onRequest(HTTP_OPTIONS, async (req, res) => {
       ilDdi: numbers.ilDdi,
       status: numbers.rcukStatus,
       notified,
-      message: alreadyNotified
-        ? "Numbers saved. The customer had already been told."
-        : notified
-          ? "Numbers saved and sent to the customer."
-          : "Numbers saved. The customer is told once the rest of this batch is in.",
+      usPending: usStillMissing,
+      message: [
+        alreadyNotified
+          ? "Numbers saved. The customer had already been told."
+          : notified
+            ? "Numbers saved and sent to the customer."
+            : "Numbers saved. The customer is told once the rest of this batch is in.",
+        usStillMissing ? "RCUK has not given the US number yet — press Get numbers again later." : "",
+      ].filter(Boolean).join(" "),
     });
   } catch (error) {
     logger.error("rcukDeliverNumbers failed", error);

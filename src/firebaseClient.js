@@ -19,6 +19,7 @@ import {
   persistentLocalCache,
   persistentMultipleTabManager,
   query,
+  runTransaction,
   setDoc,
   startAfter,
   where,
@@ -289,6 +290,54 @@ export async function claimRepairTicket(ticketNumber, reportId) {
   }
 }
 
+// Take a ticket number that is nobody else's, before it is printed on anything.
+//
+// The number used to be worked out from the reports this register could see, so
+// two counters serving customers in the same moment both landed on the same
+// next number and only found out afterwards — by which time a label was stuck
+// to a phone and its owner had gone home. `repairTickets/{number}` is the
+// mutex: the rules allow create and forbid update, so exactly one register can
+// ever create a given number. Walking forward from `startAt` until a create
+// succeeds hands back a number that is already ours.
+//
+// Returns null when nothing can be established (offline, or rules that were
+// never deployed). The caller then falls back to the local guess, where the
+// after-the-fact claim and renumber remain the net they always were.
+export async function allocateRepairTicketNumber(startAt, maxTries = 25) {
+  let candidate = Number(startAt) || 0;
+  if (!Number.isFinite(candidate) || candidate < 100001) candidate = 100001;
+
+  let db;
+  try {
+    ({ db } = await getFirebase());
+  } catch (error) {
+    logSyncError("Firestore unavailable for ticket allocation", error);
+    return null;
+  }
+
+  for (let tries = 0; tries < maxTries; tries += 1, candidate += 1) {
+    if (candidate > 999999) return null;
+    const number = String(candidate);
+    try {
+      const written = await withClaimTimeout(setDoc(doc(db, "repairTickets", number), {
+        reportId: "",
+        claimedBy: currentAuthUid(),
+        claimedAt: new Date().toISOString(),
+      }));
+      // Offline the write is held and nobody answers. We cannot say this number
+      // is ours, so we do not pretend it is.
+      if (written === CLAIM_TIMEOUT) return null;
+      return number;
+    } catch (error) {
+      // Somebody already owns it: step on to the next.
+      if (error?.code === "permission-denied") continue;
+      logSyncError("Firestore ticket allocation failed", error);
+      return null;
+    }
+  }
+  return null;
+}
+
 // `options.limitTo` caps the live listener to the N most recent docs (ordered by
 // `options.orderByField`, default "createdAt", descending) so large collections
 // like notificationLogs don't re-read their whole history on every load.
@@ -497,12 +546,48 @@ export async function listCustomersPage({ pageSize = 25, afterId = "", search = 
   return snap.docs.map(toDoc);
 }
 
+// Merged, not replaced. The CRM form writes the contact fields it knows about;
+// a customer's account balance and its history are written by a different
+// screen entirely, and a plain setDoc would wipe them every time somebody
+// corrected a spelling.
 export async function saveCustomerDoc(customer) {
   await ensureFirebaseAuth();
   const { db } = await getFirebase();
   const id = customer.id || doc(collection(db, "customers")).id;
-  await setDoc(doc(db, "customers", id), { ...customer, id });
+  await setDoc(doc(db, "customers", id), { ...customer, id }, { merge: true });
   return id;
+}
+
+// Money on a customer's account. Positive is credit the shop owes them,
+// negative is a tab they owe the shop. Two tills can be serving the same
+// customer at once, so the read and the write are one transaction — otherwise
+// the second one to save would overwrite the first one's balance.
+export async function adjustCustomerBalance(customerId, { amount, reason, by, kind }) {
+  const delta = Math.round((Number(amount) || 0) * 100) / 100;
+  if (!customerId || !delta) return null;
+  await ensureFirebaseAuth();
+  const { db } = await getFirebase();
+  const ref = doc(db, "customers", customerId);
+  return runTransaction(db, async (tx) => {
+    const snap = await tx.get(ref);
+    if (!snap.exists()) throw new Error("That customer is no longer in the CRM.");
+    const current = Math.round((Number(snap.data().balance) || 0) * 100) / 100;
+    const balance = Math.round((current + delta) * 100) / 100;
+    const entry = {
+      id: crypto.randomUUID(),
+      at: new Date().toISOString(),
+      by: by || "",
+      kind: kind || (delta > 0 ? "Credit added" : "Credit used"),
+      reason: String(reason || "").trim(),
+      amount: delta.toFixed(2),
+      balanceAfter: balance.toFixed(2),
+    };
+    // Only the recent history is kept on the customer: enough to settle an
+    // argument at the counter without letting one document grow forever.
+    const history = [entry, ...(snap.data().balanceEntries || [])].slice(0, 50);
+    tx.set(ref, { balance, balanceEntries: history, balanceUpdatedAt: entry.at }, { merge: true });
+    return { balance, entry };
+  });
 }
 
 export async function deleteCustomerDoc(id) {

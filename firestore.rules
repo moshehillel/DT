@@ -82,6 +82,13 @@ service cloud.firestore {
       allow delete: if isAdmin();
     }
 
+    // People waiting for something to come back into stock. Anyone at a counter
+    // adds a name, tells them when it lands, and clears the row once it is
+    // settled, so create/update/delete are all staff-level.
+    match /stockWaitlist/{entryId} {
+      allow read, create, update, delete: if signedIn();
+    }
+
     match /notificationLogs/{logId} {
       allow read, create: if signedIn();
       allow update, delete: if isAdmin();

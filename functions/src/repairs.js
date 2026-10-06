@@ -84,6 +84,14 @@ async function findRepairByLookup(db, lookupValue) {
       .where("ticketDigits", "==", digits)
       .orderBy("createdAt", "desc")
       .limit(1),
+    // A repair moved off a clashing number still has the first one stuck to the
+    // phone, and that is the number the customer reads out. Matching only the
+    // current one told them their repair did not exist.
+    db.collection("reports")
+      .where("type", "==", "repair")
+      .where("ticketDigitsAll", "array-contains", digits)
+      .orderBy("createdAt", "desc")
+      .limit(1),
   ];
 
   const snapshots = await Promise.all(queries.map((query) => query.get()));

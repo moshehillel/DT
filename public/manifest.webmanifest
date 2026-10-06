@@ -7,9 +7,21 @@
   "theme_color": "#0b1f3a",
   "icons": [
     {
+      "src": "/app-icon.svg",
+      "type": "image/svg+xml",
+      "sizes": "any",
+      "purpose": "any"
+    },
+    {
+      "src": "/app-icon.svg",
+      "type": "image/svg+xml",
+      "sizes": "any",
+      "purpose": "maskable"
+    },
+    {
       "src": "/app-icon.webp",
       "type": "image/webp",
-      "sizes": "any",
+      "sizes": "24x32",
       "purpose": "any"
     }
   ]

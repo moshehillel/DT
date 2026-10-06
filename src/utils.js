@@ -581,6 +581,101 @@ export function findBarcodeOwner(products, barcode, { ignoreId = "", ignoreSku =
   }) || null;
 }
 
+// ---- Stock per store --------------------------------------------------------
+// One catalog serves every store; only the stock belongs to a store. A product
+// carries `stock: { [store]: { quantity, imeis } }`, and its top-level
+// `quantity` / `imeis` are kept as the all-store totals, so anything asking
+// "how many does the company have" or "which product is this IMEI" reads them
+// as it always did.
+
+function cleanImeiList(list) {
+  return [...new Set((list || []).map((value) => String(value || "").replace(/\D/g, "")).filter(Boolean))];
+}
+
+// A product saved before stock went per store held one store's stock, named by
+// its own `location` field.
+export function productStockMap(product) {
+  if (product?.stock && typeof product.stock === "object") return product.stock;
+  const quantity = Number(product?.quantity) || 0;
+  const imeis = Array.isArray(product?.imeis) ? product.imeis : [];
+  if (!quantity && !imeis.length) return {};
+  return { [product?.location || ""]: { quantity, imeis } };
+}
+
+// What one store holds of a product. With no store given it is the company-wide
+// total.
+export function storeStockEntry(product, location) {
+  if (!location) {
+    return {
+      quantity: Number(product?.quantity) || 0,
+      imeis: Array.isArray(product?.imeis) ? product.imeis : [],
+    };
+  }
+  const entry = productStockMap(product)[location] || {};
+  return {
+    quantity: Number(entry.quantity) || 0,
+    imeis: Array.isArray(entry.imeis) ? entry.imeis : [],
+  };
+}
+
+// Units of a product one store can sell: scanned handsets for an IMEI item,
+// the count for everything else.
+export function storeStockCount(product, location) {
+  const entry = storeStockEntry(product, location);
+  return product?.requiresImei ? entry.imeis.length : entry.quantity;
+}
+
+// Rebuild the totals from the per-store map.
+function withStockMap(product, map) {
+  const entries = Object.values(map);
+  const imeis = product.requiresImei ? cleanImeiList(entries.flatMap((entry) => entry.imeis || [])) : [];
+  const quantity = product.requiresImei
+    ? imeis.length
+    : entries.reduce((sum, entry) => sum + (Number(entry.quantity) || 0), 0);
+  return { ...product, stock: map, imeis, quantity, location: "" };
+}
+
+// Set one store's stock outright (the inventory form's "quantity" box).
+export function setStoreStock(product, location, { quantity = 0, imeis = [] } = {}) {
+  const map = { ...productStockMap(product) };
+  const cleanImeis = product.requiresImei ? cleanImeiList(imeis) : [];
+  map[location || ""] = {
+    quantity: product.requiresImei ? cleanImeis.length : Math.max(0, Number(quantity) || 0),
+    imeis: cleanImeis,
+  };
+  return withStockMap(product, map);
+}
+
+// Move one store's stock up or down: a sale, a restock, a return. A handset is
+// one physical phone, so an IMEI leaving stock is taken out of whichever store
+// it was listed under — a record that had it at the wrong store must not keep a
+// phone that has gone.
+export function adjustStoreStock(product, location, { addQty = 0, removeQty = 0, addImeis = [], removeImeis = [] } = {}) {
+  const map = { ...productStockMap(product) };
+  const key = location || "";
+  if (product.requiresImei) {
+    const gone = new Set(cleanImeiList(removeImeis));
+    const added = cleanImeiList(addImeis);
+    // An IMEI lives at one store only, so one coming in leaves anywhere else.
+    added.forEach((imei) => gone.add(imei));
+    Object.keys(map).forEach((store) => {
+      const entry = map[store] || {};
+      const kept = (entry.imeis || []).filter((imei) => !gone.has(String(imei)));
+      map[store] = { quantity: kept.length, imeis: kept };
+    });
+    const here = map[key]?.imeis || [];
+    const imeis = cleanImeiList([...here, ...added]);
+    map[key] = { quantity: imeis.length, imeis };
+  } else {
+    const current = Number(map[key]?.quantity) || 0;
+    map[key] = {
+      quantity: Math.max(0, current + (Number(addQty) || 0) - (Number(removeQty) || 0)),
+      imeis: [],
+    };
+  }
+  return withStockMap(product, map);
+}
+
 // Minimal Code128-B barcode renderer (no dependencies). Returns an SVG string
 // that scans with a standard 1D laser scanner.
 const CODE128_PATTERNS = [

@@ -5,7 +5,10 @@ const {
   allocationWindowDate,
   buildRentalNumbersMessage,
   buildRentalNumbersVoiceMessage,
+  RENTAL_NUMBER_MAX_ATTEMPTS,
+  numbersOutstanding,
   planRentalNumberChase,
+  retryAt,
   rentalNeedsNumbers,
   shiftDateString,
   speakDigits,
@@ -129,4 +132,47 @@ test("speakDigits keeps only digits, so a formatted number still reads cleanly",
 
 test("nothing to say when RCUK gave no number", () => {
   assert.equal(buildRentalNumbersVoiceMessage([{ cli: "" }]), "");
+});
+
+// RCUK can hand back the UK CLI while the US DDI the customer paid for is still
+// "No". The chase and the Get numbers button both stopped asking as soon as a
+// CLI existed, so that US number was never collected — staff were left with a
+// rental carrying a UK number and nothing else.
+test("a rental still owed its US number keeps being chased", () => {
+  assert.equal(
+    numbersOutstanding({ cli: "07384236628", usDdi: "", usaNumber: "Yes" }),
+    true,
+  );
+});
+
+test("a rental with both numbers in is done", () => {
+  assert.equal(
+    numbersOutstanding({ cli: "07384236628", usDdi: "19177300280", usaNumber: "Yes" }),
+    false,
+  );
+});
+
+test("no US number was bought, so a UK number on its own finishes the job", () => {
+  assert.equal(numbersOutstanding({ cli: "07384236628", usDdi: "", usaNumber: "No" }), false);
+  assert.equal(numbersOutstanding({ cli: "07384236628", usDdi: "" }), false);
+});
+
+test("no CLI yet means outstanding whatever else was ordered", () => {
+  assert.equal(numbersOutstanding({ cli: "", usDdi: "", usaNumber: "No" }), true);
+  assert.equal(numbersOutstanding({}), true);
+});
+
+// Giving up three minutes after activation threw away every rental RCUK
+// allocated late. The waits now stretch: a minute, a minute, then half a day,
+// then a day.
+test("the retry ladder backs off to 12 then 24 hours", () => {
+  const now = new Date("2026-09-07T12:00:00Z");
+  const hours = (attempt) => (retryAt(attempt, now) - now) / 3600000;
+  assert.equal(hours(1), 1 / 60);
+  assert.equal(hours(2), 1 / 60);
+  assert.equal(hours(3), 12);
+  assert.equal(hours(4), 24);
+  // Past the end of the ladder the last wait repeats — never back to a minute.
+  assert.equal(hours(9), 24);
+  assert.equal(RENTAL_NUMBER_MAX_ATTEMPTS, 5);
 });

@@ -14,11 +14,24 @@
 // RCUK allocates numbers this many days before the rental starts.
 const RENTAL_NUMBER_LEAD_DAYS = 5;
 // Inside the allocation window: how long to leave RCUK alone after activating,
-// and how long to wait between the tries after that.
+// and the ladder of waits between the tries after that.
 const RENTAL_NUMBER_FIRST_DELAY_MS = 30000;
 const RENTAL_NUMBER_RETRY_DELAY_MS = 60000;
-// Three asks in total. If RCUK still has nothing, a human is told.
-const RENTAL_NUMBER_MAX_ATTEMPTS = 3;
+// A rental starting today usually has its numbers within a couple of minutes,
+// so the first tries are a minute apart. When those come back empty the wait
+// stretches to half a day and then a day: RCUK does sometimes allocate hours
+// late, and giving up after three minutes threw those rentals away — while
+// asking every minute for a day would be 1,440 calls for one rental.
+const RENTAL_NUMBER_LONG_RETRY_DELAYS_MS = [12 * 60 * 60 * 1000, 24 * 60 * 60 * 1000];
+// Every wait between one ask and the next, in order.
+const RENTAL_NUMBER_RETRY_LADDER_MS = [
+  RENTAL_NUMBER_RETRY_DELAY_MS,
+  RENTAL_NUMBER_RETRY_DELAY_MS,
+  ...RENTAL_NUMBER_LONG_RETRY_DELAYS_MS,
+];
+// Five asks in all: three quick ones, then +12h, then +24h. If RCUK still has
+// nothing after that, a human is told.
+const RENTAL_NUMBER_MAX_ATTEMPTS = RENTAL_NUMBER_RETRY_LADDER_MS.length + 1;
 // Hour of the day (in the store's time zone) the chase starts for a rental that
 // was too far out to ask about when it was created.
 const RENTAL_NUMBER_NOTICE_HOUR = 10;
@@ -100,9 +113,12 @@ function planRentalNumberChase({ startDate, now = new Date(), timeZone = "Americ
   return { mode: "scheduled", firstAttemptAt: windowOpensAt, windowDate };
 }
 
-// Every ask after the first is a flat minute apart.
-function retryAt(now = new Date()) {
-  return new Date(now.getTime() + RENTAL_NUMBER_RETRY_DELAY_MS);
+// When to make the next ask, given how many have been made already. Past the
+// end of the ladder the last wait repeats, so a caller that keeps going can
+// never fall back to asking every minute.
+function retryAt(attempt = 1, now = new Date()) {
+  const step = Math.min(Math.max(Number(attempt) || 1, 1), RENTAL_NUMBER_RETRY_LADDER_MS.length);
+  return new Date(now.getTime() + RENTAL_NUMBER_RETRY_LADDER_MS[step - 1]);
 }
 
 // RCUK answers "no" rather than blank for an add-on the customer didn't buy.
@@ -192,7 +208,25 @@ function rentalNeedsNumbers(report) {
   return true;
 }
 
+// Did the customer buy the US DDI? The rental form writes "Yes"/"No" onto the
+// report when it is filed, so this is what was ordered, not what has arrived.
+function wantsUsDdi(details) {
+  return String(details?.usaNumber || "").trim().toLowerCase() === "yes";
+}
+
+// What RCUK still owes this rental. RCUK does not always hand the set back at
+// once: the UK CLI can land while the US DDI sits at "No" for another minute or
+// an hour. Both the chase and the Get numbers button used to stop asking the
+// moment a CLI existed, so a US number that came second was never collected —
+// the rental kept the UK number and nothing else, and pressing Get numbers
+// again short-circuited on the CLI already on the report.
+function numbersOutstanding(details) {
+  if (!details?.cli) return true;
+  return wantsUsDdi(details) && !details.usDdi;
+}
+
 module.exports = {
+  RENTAL_NUMBER_RETRY_LADDER_MS,
   RENTAL_NUMBER_FIRST_DELAY_MS,
   RENTAL_NUMBER_LEAD_DAYS,
   RENTAL_NUMBER_MAX_ATTEMPTS,
@@ -202,9 +236,11 @@ module.exports = {
   buildRentalNumbersMessage,
   buildRentalNumbersVoiceMessage,
   planRentalNumberChase,
+  numbersOutstanding,
   retryAt,
   rentalNeedsNumbers,
   shiftDateString,
   speakDigits,
+  wantsUsDdi,
   zonedDateTimeToUtc,
 };

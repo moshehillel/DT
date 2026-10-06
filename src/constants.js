@@ -20,6 +20,18 @@ export const CUSTOMERS_KEY = "diamant-telecom-customers-v1";
 // is on the shelf or out with a customer. Separate from `products` on purpose —
 // these are not for sale and must never appear in POS stock.
 export const RENTAL_PHONES_KEY = "diamant-telecom-rental-phones-v1";
+export const STOCK_WAITLIST_KEY = "diamant-telecom-stock-waitlist-v1";
+export const RECEIPT_NOTES_KEY = "diamant-telecom-receipt-notes-v1";
+
+// The receipts a shop can put standing instructions on. Rental is the one that
+// needs it most — how to forward a US line to the travelling number is the same
+// paragraph every time, and reading it out at the counter never sticks.
+export const RECEIPT_NOTE_TYPES = [
+  { key: "rental", label: "Phone rental", hint: "Call forwarding, what to do if the phone is lost, when to bring it back." },
+  { key: "sale", label: "Sale", hint: "Returns policy, warranty, how to reach support." },
+  { key: "repair", label: "Repair ticket", hint: "What to bring when collecting, how long parts are held." },
+  { key: "phoneOrder", label: "Phone order", hint: "Delivery notes, what happens if nobody is home." },
+];
 export const RENTAL_PHONE_IN_STORE = "In store";
 export const RENTAL_PHONE_WITH_CUSTOMER = "With customer";
 // Notices the user dismissed from the "Needs attention" panel. Kept per-device in
@@ -28,8 +40,10 @@ export const RENTAL_PHONE_WITH_CUSTOMER = "With customer";
 export const DISMISSED_NOTICES_KEY = "diamant-telecom-dismissed-notices-v1";
 export const FUNCTIONS_BASE_URL = import.meta.env.VITE_FUNCTIONS_BASE_URL || "";
 
-/** TEMPORARY — billing reminder banner at the top of every page. Set false to hide. */
-export const PAYMENT_REMINDER_ENABLED = true;
+/** TEMPORARY — billing reminder banner at the top of every page. Set false to hide.
+ *  Off since 2026-09-15: the balance was settled. Flip back to true if another
+ *  reminder is ever needed — the text and contact below are still here. */
+export const PAYMENT_REMINDER_ENABLED = false;
 export const PAYMENT_REMINDER_TEXT =
   "You are 80% paid — make the additional payment to avoid system interruptions.";
 export const PAYMENT_REMINDER_CONTACT_EMAIL = "info@advancedautomations.net";
@@ -79,6 +93,12 @@ export const defaultOrderHandlers = [
 ];
 export const defaultStoreLocations = ["Main store"];
 export const productCategories = ["Phone", "Accessory", "SIM", "Other"];
+// A SIM going out on its own has no handset to hold as security, so the shop
+// takes a deposit against it and gives it back when the SIM comes home. Charged
+// with the rental and refunded to the same card the moment it is marked
+// returned — see markReturned in main.jsx.
+export const SIM_ONLY_DEPOSIT = 10;
+
 export const paymentMethods = ["Cash", "Card", "Check", "Zelle", "Cash App", "Apple Pay", "Other"];
 
 // Saved reports may still say "CC" from before the duplicate was removed.
