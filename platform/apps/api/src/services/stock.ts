@@ -33,7 +33,7 @@ export function mapStockError(error: unknown): never {
  */
 export async function applyMovement(
   tx: TxHandle,
-  ctx: { tenantId: string; userId: string },
+  ctx: { tenantId: string; userId: string | null },
   input: MovementInput,
   policy: StockPolicy,
 ): Promise<{ delta: number; after: number }> {

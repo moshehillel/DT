@@ -1,27 +1,22 @@
 {
-  "name": "@pos/api",
+  "name": "@pos/worker",
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "exports": {
-    "./services": "./src/services/index.ts"
-  },
   "scripts": {
-    "dev": "tsx watch src/server.ts",
-    "start": "node dist/server.js",
-    "build": "tsup src/server.ts --format esm --target node22 --clean --sourcemap --noExternal @pos/domain --noExternal @pos/contracts --noExternal @pos/db --noExternal @pos/adapters",
+    "dev": "tsx watch src/main.ts",
+    "start": "node dist/main.js",
+    "build": "tsup src/main.ts --format esm --target node22 --clean --sourcemap --noExternal @pos/domain --noExternal @pos/contracts --noExternal @pos/db --noExternal @pos/adapters --noExternal @pos/api",
     "typecheck": "tsc -p tsconfig.json",
     "test": "vitest run"
   },
   "dependencies": {
     "@pos/adapters": "workspace:*",
-    "@pos/contracts": "workspace:*",
+    "@pos/api": "workspace:*",
     "@pos/db": "workspace:*",
     "@pos/domain": "workspace:*",
-    "drizzle-orm": "^0.45.3",
-    "fastify": "^5.2.0",
-    "jose": "^5.9.6",
     "pg": "^8.13.1",
+    "pino": "^9.6.0",
     "zod": "^3.24.1"
   },
   "devDependencies": {

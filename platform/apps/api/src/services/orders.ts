@@ -49,7 +49,8 @@ export interface CreateOrderInput {
 
 interface Ctx {
   tenantId: string;
-  userId: string;
+  /** null for system actions (worker reconciliation). */
+  userId: string | null;
 }
 
 export function newExternalRequestId(): string {

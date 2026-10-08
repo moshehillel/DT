@@ -114,7 +114,7 @@ export async function searchCustomers(tx: TxHandle, q: string, limit: number, cu
 
 export async function addLedgerEntry(
   tx: TxHandle,
-  ctx: { tenantId: string; userId: string },
+  ctx: { tenantId: string; userId: string | null },
   entry: { customerId: string; amountCents: number; kind: string; reason?: string | null; orderId?: string | null },
 ): Promise<void> {
   await tx.client.query(
