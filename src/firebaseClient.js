@@ -439,6 +439,63 @@ export function watchAppStateDocument(documentId, fallback, onValue, onError) {
   };
 }
 
+// ---- Which parts of the app save through PostgreSQL ------------------------
+// `system/dataPaths` lists them. Until it is read (or if it can't be), every
+// save goes straight to Firestore, the way it always has.
+const dataPathState = { value: {}, started: false };
+
+function watchDataPaths() {
+  if (dataPathState.started) return;
+  dataPathState.started = true;
+  ensureFirebaseAuth()
+    .then(() => getFirebase())
+    .then(({ db }) => {
+      onSnapshot(
+        doc(db, "system", "dataPaths"),
+        (snapshot) => { dataPathState.value = snapshot.exists() ? snapshot.data() || {} : {}; },
+        () => { dataPathState.value = {}; },
+      );
+    })
+    .catch(() => {});
+}
+
+export function savesToPostgres(area) {
+  watchDataPaths();
+  const list = dataPathState.value.collections;
+  return Array.isArray(list) && list.includes(area);
+}
+
+// A refusal is final; anything else (no connection, the database down) means
+// the save goes the usual way instead.
+const FINAL_ERRORS = new Set([
+  "functions/permission-denied",
+  "functions/invalid-argument",
+  "functions/unauthenticated",
+  "functions/not-found",
+]);
+const OPS_PER_CALL = 200;
+
+async function saveViaPostgres(ops) {
+  try {
+    for (let index = 0; index < ops.length; index += OPS_PER_CALL) {
+      await callFunction("saveRecords", { ops: ops.slice(index, index + OPS_PER_CALL) });
+    }
+    return true;
+  } catch (error) {
+    if (FINAL_ERRORS.has(error?.code)) throw error;
+    console.warn("Diamant Telecom: PostgreSQL save did not go through, saving to Firestore instead.", error);
+    return false;
+  }
+}
+
+function saveOpsFor(collectionName, items, removedIds = []) {
+  const type = collectionName === "products" ? "merge" : "set";
+  return [
+    ...items.map((item) => ({ collection: collectionName, id: item.id, type, data: asStoredItem(collectionName, item) })),
+    ...removedIds.map((id) => ({ collection: collectionName, id, type: "delete" })),
+  ];
+}
+
 async function commitBatches(db, operations) {
   const chunkSize = 450;
   for (let index = 0; index < operations.length; index += chunkSize) {
@@ -465,8 +522,12 @@ function writeStoredItem(batch, collectionRef, collectionName, item) {
   else batch.set(ref, stored);
 }
 
+// Each save resolves with where it went, "postgres" or "firestore".
 export async function upsertCollectionItems(collectionName, items) {
   await ensureFirebaseAuth();
+  if (items.length && savesToPostgres(collectionName) && await saveViaPostgres(saveOpsFor(collectionName, items))) {
+    return "postgres";
+  }
   const { db } = await getFirebase();
   const collectionRef = collection(db, collectionName);
 
@@ -474,13 +535,17 @@ export async function upsertCollectionItems(collectionName, items) {
     db,
     items.map((item) => (batch) => writeStoredItem(batch, collectionRef, collectionName, item)),
   );
+  return "firestore";
 }
 
 // Removes specific documents by id. Used by the sync outbox when it replays a
 // deletion that couldn't reach Firestore at the time it was made.
 export async function deleteCollectionItems(collectionName, ids) {
-  if (!ids.length) return;
+  if (!ids.length) return "firestore";
   await ensureFirebaseAuth();
+  if (savesToPostgres(collectionName) && await saveViaPostgres(saveOpsFor(collectionName, [], ids))) {
+    return "postgres";
+  }
   const { db } = await getFirebase();
   const collectionRef = collection(db, collectionName);
 
@@ -488,6 +553,7 @@ export async function deleteCollectionItems(collectionName, ids) {
     db,
     ids.map((id) => (batch) => batch.delete(doc(collectionRef, id))),
   );
+  return "firestore";
 }
 
 // Stable JSON for change detection: sort object keys so two equal objects with a
@@ -505,30 +571,35 @@ function stableStringify(value) {
 
 export async function syncCollectionItems(collectionName, previousItems, nextItems) {
   await ensureFirebaseAuth();
-  const { db } = await getFirebase();
-  const collectionRef = collection(db, collectionName);
   const previousById = new Map(previousItems.map((item) => [item.id, item]));
   const nextIds = new Set(nextItems.map((item) => item.id));
-  const operations = [
-    // Only write docs that are new or whose contents actually changed, so editing
-    // one item in a large collection doesn't rewrite every document.
-    ...nextItems
-      .filter((item) => {
-        const previous = previousById.get(item.id);
-        return !previous || stableStringify(previous) !== stableStringify(item);
-      })
-      .map((item) => (batch) => writeStoredItem(batch, collectionRef, collectionName, item)),
-    ...[...previousById.keys()]
-      .filter((id) => !nextIds.has(id))
-      .map((id) => (batch) => batch.delete(doc(collectionRef, id))),
-  ];
+  // Only write docs that are new or whose contents actually changed, so editing
+  // one item in a large collection doesn't rewrite every document.
+  const changed = nextItems.filter((item) => {
+    const previous = previousById.get(item.id);
+    return !previous || stableStringify(previous) !== stableStringify(item);
+  });
+  const removed = [...previousById.keys()].filter((id) => !nextIds.has(id));
+  if (!changed.length && !removed.length) return "firestore";
 
-  if (!operations.length) return;
-  await commitBatches(db, operations);
+  if (savesToPostgres(collectionName) && await saveViaPostgres(saveOpsFor(collectionName, changed, removed))) {
+    return "postgres";
+  }
+  const { db } = await getFirebase();
+  const collectionRef = collection(db, collectionName);
+  await commitBatches(db, [
+    ...changed.map((item) => (batch) => writeStoredItem(batch, collectionRef, collectionName, item)),
+    ...removed.map((id) => (batch) => batch.delete(doc(collectionRef, id))),
+  ]);
+  return "firestore";
 }
 
 export async function replaceAppStateDocument(documentId, items) {
   await ensureFirebaseAuth();
+  if (savesToPostgres("appState")
+    && await saveViaPostgres([{ collection: "appState", id: documentId, type: "set", data: { items } }])) {
+    return;
+  }
   const { db } = await getFirebase();
   await setDoc(doc(db, "appState", documentId), { items });
 }
@@ -603,6 +674,10 @@ export async function saveCustomerDoc(customer) {
   await ensureFirebaseAuth();
   const { db } = await getFirebase();
   const id = customer.id || doc(collection(db, "customers")).id;
+  if (savesToPostgres("customers")
+    && await saveViaPostgres([{ collection: "customers", id, type: "merge", data: { ...customer, id } }])) {
+    return id;
+  }
   await setDoc(doc(db, "customers", id), { ...customer, id }, { merge: true });
   return id;
 }
@@ -615,6 +690,18 @@ export async function adjustCustomerBalance(customerId, { amount, reason, by, ki
   const delta = Math.round((Number(amount) || 0) * 100) / 100;
   if (!customerId || !delta) return null;
   await ensureFirebaseAuth();
+  if (savesToPostgres("balances")) {
+    try {
+      return await callFunction("adjustCustomerBalance", {
+        customerId, amount: delta, reason, by, kind, entryId: crypto.randomUUID(),
+      });
+    } catch (error) {
+      if (FINAL_ERRORS.has(error?.code)) {
+        throw new Error(error.message || "That balance change was refused.");
+      }
+      console.warn("Diamant Telecom: PostgreSQL balance change did not go through, using Firestore instead.", error);
+    }
+  }
   const { db } = await getFirebase();
   const ref = doc(db, "customers", customerId);
   return runTransaction(db, async (tx) => {
@@ -642,6 +729,10 @@ export async function adjustCustomerBalance(customerId, { amount, reason, by, ki
 export async function deleteCustomerDoc(id) {
   if (!id) return;
   await ensureFirebaseAuth();
+  if (savesToPostgres("customers")
+    && await saveViaPostgres([{ collection: "customers", id, type: "delete" }])) {
+    return;
+  }
   const { db } = await getFirebase();
   await deleteDoc(doc(db, "customers", id));
 }

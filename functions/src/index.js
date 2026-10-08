@@ -1,6 +1,6 @@
 const crypto = require("node:crypto");
 const { onRequest, onCall, HttpsError } = require("firebase-functions/v2/https");
-const { onDocumentCreated, onDocumentUpdated } = require("firebase-functions/v2/firestore");
+const { onDocumentCreated, onDocumentUpdated, onDocumentWritten } = require("firebase-functions/v2/firestore");
 const { onSchedule } = require("firebase-functions/v2/scheduler");
 const logger = require("firebase-functions/logger");
 const admin = require("firebase-admin");
@@ -39,6 +39,8 @@ const { Pool } = require("pg");
 const { runMirror } = require("./pgMirrorJob");
 const {
   applyMovementsPg,
+  commitOfficialStock,
+  stockFieldsFor,
   compareInventory,
   costOf,
   ensureInventorySchema,
@@ -46,6 +48,8 @@ const {
   readInventory,
   seedInventory,
 } = require("./inventoryPg");
+const { ensureRecordSchema, recordFirestoreChange } = require("./recordStore");
+const { handleAdjustBalance, handleSaveRecords, runRecordsCheck } = require("./recordsApi");
 
 const PLANETSCALE_URL = defineSecret("PLANETSCALE_URL");
 const {
@@ -663,6 +667,8 @@ function pgPool() {
       ssl: { rejectUnauthorized: true },
       max: 3,
       idleTimeoutMillis: 30000,
+      connectionTimeoutMillis: 5000,
+      query_timeout: 15000,
     });
     sharedPgPool.on("error", (error) => logger.error("PostgreSQL pool error", error));
   }
@@ -693,7 +699,7 @@ function inventoryBalanceId(productId, location) {
 
 // One transaction re-reads each product and applies only this store's change.
 // A second try of the same movement id finds the ledger row and stops.
-async function commitStockMovements(movements) {
+async function commitStockMovements(movements, { pgPending = false } = {}) {
   const normalized = [];
   for (const raw of movements) {
     const movement = normalizeMovement(raw);
@@ -749,6 +755,7 @@ async function commitStockMovements(movements) {
         shortQty: result.shortQty || 0,
         missingImeis: result.missingImeis || [],
         appliedAt: new Date().toISOString(),
+        ...(pgPending ? { pgPending: true } : {}),
       });
       for (const location of result.locations) {
         balances.set(`${movement.productId}::${location}`, {
@@ -778,6 +785,122 @@ async function commitStockMovements(movements) {
   });
 }
 
+// Which parts of the app run on PostgreSQL. Missing or unreadable means the
+// way things work today.
+let dataPathsCache = { at: 0, value: {} };
+async function dataPaths() {
+  if (Date.now() - dataPathsCache.at < 30000) return dataPathsCache.value;
+  try {
+    const snap = await db.collection("system").doc("dataPaths").get();
+    dataPathsCache = { at: Date.now(), value: snap.exists ? snap.data() || {} : {} };
+  } catch (error) {
+    logger.warn("Could not read system/dataPaths", { error: error.message || String(error) });
+  }
+  return dataPathsCache.value;
+}
+
+function movementItem(movement, product) {
+  return { movement, requiresImei: Boolean(product?.requiresImei), unitCost: costOf(product) };
+}
+
+async function readProducts(ids) {
+  const snaps = ids.length ? await db.getAll(...ids.map((id) => db.collection("products").doc(id))) : [];
+  return new Map(snaps.map((snap) => [snap.id, snap]));
+}
+
+// PostgreSQL is the official stock. The change is made there first, then each
+// touched product's stock is written to Firestore for the registers, newest
+// version only. Anything applied on Firestore while PostgreSQL was down is
+// replayed here first.
+async function commitStockViaPostgres(movements) {
+  const normalized = [];
+  for (const raw of movements) {
+    const movement = normalizeMovement(raw);
+    if (movement) normalized.push(movement);
+  }
+  if (normalized.length > 50) throw new HttpsError("invalid-argument", "Too many stock lines at once.");
+
+  const pendingSnap = await db.collection("stockMovements").where("pgPending", "==", true).limit(200).get();
+  const pending = pendingSnap.docs.map((doc) => doc.data())
+    .sort((a, b) => String(a.appliedAt).localeCompare(String(b.appliedAt)))
+    .map((entry) => ({
+      id: entry.id,
+      productId: entry.productId,
+      location: entry.location,
+      op: entry.op,
+      qty: Number(entry.qty) || 0,
+      imeis: entry.imeis || [],
+      sourceType: entry.sourceType || "",
+      sourceId: entry.sourceId || "",
+    }));
+  if (!normalized.length && !pending.length) return { applied: 0, skipped: 0 };
+
+  const products = await readProducts([...new Set(normalized.map((movement) => movement.productId))]);
+  for (const snap of products.values()) {
+    if (!snap.exists) throw new HttpsError("failed-precondition", "That product is not in inventory yet.");
+  }
+  const pendingProducts = await readProducts([...new Set(pending.map((movement) => movement.productId))].filter((id) => !products.has(id)));
+  for (const [id, snap] of pendingProducts) products.set(id, snap);
+
+  const items = [
+    ...pending.map((movement) => movementItem(movement, products.get(movement.productId)?.data())),
+    ...normalized.map((movement) => movementItem(movement, products.get(movement.productId).data())),
+  ];
+  const { results, versions, stock } = await commitOfficialStock(pgPool(), items);
+  const extra = await readProducts([...versions.keys()].filter((id) => !products.has(id)));
+  for (const [id, snap] of extra) products.set(id, snap);
+
+  const now = new Date().toISOString();
+  await db.runTransaction(async (tx) => {
+    const ids = [...versions.keys()];
+    const versionSnaps = await tx.getAll(...ids.map((id) => db.collection("stockVersions").doc(id)));
+    const productSnaps = await tx.getAll(...ids.map((id) => db.collection("products").doc(id)));
+    ids.forEach((id, index) => {
+      const version = versions.get(id);
+      const productSnap = productSnaps[index];
+      if (!productSnap.exists) return;
+      if ((Number(versionSnaps[index].data()?.version) || 0) >= version) return;
+      const fields = stockFieldsFor(productSnap.data(), stock.get(id));
+      tx.update(productSnap.ref, { ...fields, updatedAt: now });
+      tx.set(versionSnaps[index].ref, { version, updatedAt: now });
+      for (const [location, entry] of Object.entries(fields.stock)) {
+        tx.set(db.collection("inventoryBalances").doc(inventoryBalanceId(id, location)), {
+          productId: id,
+          location,
+          quantity: entry.quantity,
+          imeis: entry.imeis,
+          updatedAt: now,
+        });
+      }
+    });
+    results.forEach((result, index) => {
+      const { movement } = items[index];
+      const ref = db.collection("stockMovements").doc(movement.id);
+      if (index < pending.length) {
+        tx.update(ref, { pgPending: false });
+        return;
+      }
+      if (result.skipped) return;
+      tx.set(ref, {
+        id: movement.id,
+        productId: movement.productId,
+        location: movement.location,
+        op: movement.op,
+        qty: movement.qty,
+        imeis: movement.imeis,
+        sourceType: movement.sourceType,
+        sourceId: movement.sourceId,
+        shortQty: result.shortQty || 0,
+        missingImeis: result.missingImeis || [],
+        appliedAt: now,
+        official: "postgres",
+      });
+    });
+  });
+  const mine = results.slice(pending.length);
+  return { applied: mine.filter((result) => !result.skipped).length, skipped: mine.filter((result) => result.skipped).length };
+}
+
 exports.postStockMovements = onCall({ region: REGION, secrets: [PLANETSCALE_URL] }, async (request) => {
   if (!request.auth) throw new HttpsError("unauthenticated", "Sign in required.");
   const movements = request.data?.movements;
@@ -785,6 +908,18 @@ exports.postStockMovements = onCall({ region: REGION, secrets: [PLANETSCALE_URL]
     throw new HttpsError("invalid-argument", "Nothing to update.");
   }
   try {
+    if ((await dataPaths()).stock === "postgres") {
+      try {
+        return await commitStockViaPostgres(movements);
+      } catch (error) {
+        if (error instanceof HttpsError) throw error;
+        // A sale is never held up by PostgreSQL: Firestore takes it and the
+        // movement is replayed into PostgreSQL on the next stock change.
+        logger.error("PostgreSQL stock unavailable, applying on Firestore", { error: error.message || String(error) });
+        const { appliedMovements, ...result } = await commitStockMovements(movements, { pgPending: true });
+        return result;
+      }
+    }
     const { appliedMovements = [], ...result } = await commitStockMovements(movements);
     await shadowStockToPostgres(appliedMovements);
     return result;
@@ -2602,8 +2737,11 @@ async function runInventoryCheck() {
   if (!(await isSeeded(pool))) {
     seed = await seedInventory(pool, products);
   } else {
+    if ((await dataPaths()).stock === "postgres") await commitStockViaPostgres([]);
     const meta = await pool.query("select value from inv_meta where key = 'seeded'");
-    const since = meta.rows[0]?.value?.at || "1970-01-01T00:00:00.000Z";
+    const seededAt = meta.rows[0]?.value?.at || "1970-01-01T00:00:00.000Z";
+    const threeDaysAgo = new Date(Date.now() - 3 * 24 * 60 * 60 * 1000).toISOString();
+    const since = seededAt > threeDaysAgo ? seededAt : threeDaysAgo;
     const ledger = await db.collection("stockMovements").where("appliedAt", ">=", since).get();
     const entries = ledger.docs.map((doc) => doc.data()).sort((a, b) => String(a.appliedAt).localeCompare(String(b.appliedAt)));
     if (entries.length) {
@@ -2685,6 +2823,108 @@ exports.checkInventoryPostgres = onSchedule(
           to: alertTo,
           subject: "Diamant Telecom: nightly stock check failed",
           body: `The nightly stock check stopped with an error. Nothing in the shop was changed.\n\n${error.message || error}`,
+        }).catch(() => {});
+      }
+      throw error;
+    }
+  },
+);
+
+let recordsReady = null;
+function readyRecordPool() {
+  if (!recordsReady) {
+    recordsReady = ensureRecordSchema(pgPool()).catch((error) => {
+      recordsReady = null;
+      throw error;
+    });
+  }
+  return recordsReady.then(() => pgPool());
+}
+
+// A register saving records: PostgreSQL first, then the Firestore copy.
+exports.saveRecords = onCall(
+  { region: REGION, secrets: [PLANETSCALE_URL], timeoutSeconds: 60, memory: "512MiB" },
+  async (request) => {
+    const pool = await readyRecordPool().catch(() => null);
+    if (!pool) throw new HttpsError("unavailable", "The database could not be reached. The save will go the usual way.");
+    return handleSaveRecords({ request, db, pool, HttpsError, logger });
+  },
+);
+
+exports.adjustCustomerBalance = onCall(
+  { region: REGION, secrets: [PLANETSCALE_URL] },
+  async (request) => {
+    const pool = await readyRecordPool().catch(() => null);
+    if (!pool) throw new HttpsError("unavailable", "The database could not be reached. Using the usual way.");
+    return handleAdjustBalance({ request, db, pool, HttpsError, logger });
+  },
+);
+
+// Every Firestore write that did not come through saveRecords (webhooks,
+// scheduled jobs, a register still saving the old way) is copied into
+// PostgreSQL here, as a new version. Its own copies match and are skipped.
+exports.copyFirestoreWrite = onDocumentWritten(
+  {
+    region: REGION,
+    document: "{collection}/{docId}",
+    secrets: [PLANETSCALE_URL],
+    retry: true,
+    maxInstances: 10,
+  },
+  async (event) => {
+    const after = event.data?.after;
+    const exists = Boolean(after?.exists);
+    const updateTime = exists && after.updateTime ? after.updateTime.toDate().toISOString() : event.time;
+    // A failure that keeps repeating for a day is dropped; the nightly check finds it.
+    if (Date.now() - new Date(event.time).getTime() > 24 * 60 * 60 * 1000) {
+      logger.error("Gave up copying a Firestore write into PostgreSQL", { path: `${event.params.collection}/${event.params.docId}` });
+      return;
+    }
+    await recordFirestoreChange(await readyRecordPool(), {
+      collection: event.params.collection,
+      id: event.params.docId,
+      data: exists ? after.data() : null,
+      updateTime,
+    });
+  },
+);
+
+// Nightly: fill anything PostgreSQL is missing and compare every record.
+exports.checkRecordsPostgres = onSchedule(
+  {
+    region: REGION,
+    schedule: "every day 04:00",
+    timeZone: RENTAL_REMINDER_TIME_ZONE,
+    timeoutSeconds: 540,
+    memory: "1GiB",
+    secrets: [PLANETSCALE_URL],
+  },
+  async () => {
+    const alertTo = process.env.ALERT_EMAIL || SMTP_USER;
+    try {
+      const summary = await runRecordsCheck({ db, pool: pgPool() });
+      if (!summary.ok) {
+        logger.error("PostgreSQL records differ from Firestore", summary);
+        if (alertTo) {
+          await sendEmail({
+            to: alertTo,
+            subject: `Diamant Telecom: nightly records check found differences in ${summary.problems.length} collection(s)`,
+            body: [
+              "Some records in PostgreSQL do not match Firestore. Nothing in the shop was changed.",
+              "",
+              JSON.stringify(summary.problems, null, 2),
+            ].join("\n"),
+          });
+        }
+      } else {
+        logger.info("PostgreSQL records match Firestore", summary.collections);
+      }
+    } catch (error) {
+      if (alertTo) {
+        await sendEmail({
+          to: alertTo,
+          subject: "Diamant Telecom: nightly records check failed",
+          body: `The nightly records check stopped with an error. Nothing in the shop was changed.\n\n${error.message || error}`,
         }).catch(() => {});
       }
       throw error;

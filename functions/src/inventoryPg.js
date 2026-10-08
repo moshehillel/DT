@@ -51,6 +51,11 @@ create table if not exists inv_transfers (
   created_at timestamptz not null default now(),
   lines jsonb not null
 );
+create table if not exists inv_product_versions (
+  product_id text primary key,
+  version bigint not null default 0,
+  updated_at timestamptz not null default now()
+);
 create table if not exists inv_meta (
   key text primary key,
   value jsonb not null,
@@ -168,6 +173,15 @@ async function applyOne(client, item, origin) {
   const missingImeis = [];
   const { productId, location, op } = movement;
   const imeis = (movement.imeis || []).map(cleanImei).filter(Boolean);
+  const otherProducts = [];
+  if (requiresImei && imeis.length && (op === "addImeis" || op === "set")) {
+    const taken = await client.query(
+      `select distinct product_id from inv_phone_units
+       where imei = any($1::text[]) and product_id <> $2 and status = 'in_stock'`,
+      [imeis, productId],
+    );
+    otherProducts.push(...taken.rows.map((row) => row.product_id));
+  }
 
   if (requiresImei && (op === "addQty" || op === "removeQty")) {
     // A phone product only moves by IMEI, and a counted product only by count.
@@ -245,7 +259,75 @@ async function applyOne(client, item, origin) {
       [movement.id, shortQty, missingImeis],
     );
   }
-  return { id: movement.id, skipped: false, shortQty, missingImeis };
+  return { id: movement.id, skipped: false, shortQty, missingImeis, otherProducts };
+}
+
+async function stockOf(client, productIds) {
+  const levels = await client.query(
+    "select product_id, location, quantity from inv_stock_levels where product_id = any($1::text[])",
+    [productIds],
+  );
+  const units = await client.query(
+    `select product_id, location, imei from inv_phone_units
+     where product_id = any($1::text[]) and status = 'in_stock' order by received_at nulls first, imei`,
+    [productIds],
+  );
+  const byProduct = new Map(productIds.map((id) => [id, { levels: {}, imeis: {} }]));
+  for (const row of levels.rows) byProduct.get(row.product_id).levels[row.location] = Number(row.quantity) || 0;
+  for (const row of units.rows) {
+    const entry = byProduct.get(row.product_id).imeis;
+    (entry[row.location] = entry[row.location] || []).push(row.imei);
+  }
+  return byProduct;
+}
+
+// The product's stock as the registers show it, built from PostgreSQL. Stores
+// already on the product keep their place at zero, so nothing drops off a list.
+function stockFieldsFor(product, pgStock) {
+  const requiresImei = Boolean(product?.requiresImei);
+  const stock = {};
+  for (const location of Object.keys(stockMapOf(product))) {
+    if (location) stock[location] = { quantity: 0, imeis: [] };
+  }
+  if (requiresImei) {
+    for (const [location, imeis] of Object.entries(pgStock.imeis)) stock[location] = { quantity: imeis.length, imeis };
+  } else {
+    for (const [location, quantity] of Object.entries(pgStock.levels)) stock[location] = { quantity, imeis: [] };
+  }
+  const imeis = requiresImei ? Object.values(stock).flatMap((entry) => entry.imeis) : [];
+  const quantity = requiresImei ? imeis.length : Object.values(stock).reduce((sum, entry) => sum + entry.quantity, 0);
+  return { stock, quantity, imeis, location: "" };
+}
+
+// PostgreSQL as the official stock. Every product in the request (and any
+// product a moved IMEI came from) gets a new version and its resulting stock,
+// so the Firestore copy can be written in order.
+async function commitOfficialStock(pool, items, { schema = "public", origin = "register" } = {}) {
+  return inTransaction(pool, schema, async (client) => {
+    const requested = [...new Set(items.map((item) => item.movement.productId))].sort();
+    for (const productId of requested) {
+      await client.query("select pg_advisory_xact_lock(hashtextextended($1, 1))", [`stock/${productId}`]);
+    }
+    const results = [];
+    const touched = new Set(requested);
+    for (const item of items) {
+      const result = await applyOne(client, item, origin);
+      results.push(result);
+      for (const other of result.otherProducts || []) touched.add(other);
+    }
+    const productIds = [...touched].sort();
+    const versions = new Map();
+    for (const productId of productIds) {
+      const bumped = await client.query(
+        `insert into inv_product_versions (product_id, version) values ($1, 1)
+         on conflict (product_id) do update set version = inv_product_versions.version + 1, updated_at = now()
+         returning version`,
+        [productId],
+      );
+      versions.set(productId, Number(bumped.rows[0].version));
+    }
+    return { results, versions, stock: await stockOf(client, productIds) };
+  });
 }
 
 // items: [{ movement, requiresImei, unitCost }] in the order they were applied.
@@ -312,6 +394,8 @@ function compareInventory(products, { levels, units }) {
 module.exports = {
   applyMovementsPg,
   buildSeed,
+  commitOfficialStock,
+  stockFieldsFor,
   compareInventory,
   costOf,
   ensureInventorySchema,

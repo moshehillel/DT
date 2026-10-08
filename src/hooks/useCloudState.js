@@ -72,6 +72,36 @@ function outboxSize(outbox) {
   return Object.keys(outbox.upserts).length + outbox.deletes.length;
 }
 
+// A save through PostgreSQL reaches Firestore from the server, a moment after
+// it is confirmed, so the cloud can still send the old copy in between. The
+// saved copy is held over the cloud's until the cloud catches up.
+const HOLD_MS = 8000;
+
+function stableText(value) {
+  if (Array.isArray(value)) return `[${value.map(stableText).join(",")}]`;
+  if (value && typeof value === "object") {
+    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableText(value[key])}`).join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function applyHolds(holds, items) {
+  if (!holds.size) return items;
+  const now = Date.now();
+  const byId = new Map(items.map((item) => [item.id, item]));
+  for (const [id, hold] of holds) {
+    const cloud = byId.get(id);
+    const caughtUp = hold.item === null ? !cloud : cloud && stableText(cloud) === stableText(hold.item);
+    if (hold.until < now || caughtUp) holds.delete(id);
+  }
+  if (!holds.size) return items;
+  const held = [...holds.entries()];
+  return [
+    ...items.filter((item) => !holds.has(item.id)),
+    ...held.filter(([, hold]) => hold.item !== null).map(([, hold]) => hold.item),
+  ];
+}
+
 // Which documents actually changed between two versions of the collection.
 function diffItems(previousItems, nextItems) {
   const previousById = new Map(previousItems.map((item) => [item.id, item]));
@@ -97,7 +127,15 @@ export function useCloudCollectionState(collectionName, localKey, fallback, opti
   const outboxRef = useRef(null);
   if (outboxRef.current === null) outboxRef.current = readOutbox(localKey);
   const flushingRef = useRef(false);
+  const holdsRef = useRef(new Map());
   const [pendingCount, setPendingCount] = useState(() => outboxSize(outboxRef.current));
+
+  function holdSaved(where, changed, removed) {
+    if (where !== "postgres") return;
+    const until = Date.now() + HOLD_MS;
+    changed.forEach((item) => { if (item?.id) holdsRef.current.set(item.id, { item, until }); });
+    removed.forEach((id) => holdsRef.current.set(id, { item: null, until }));
+  }
 
   useEffect(() => {
     valueRef.current = value;
@@ -138,8 +176,8 @@ export function useCloudCollectionState(collectionName, localKey, fallback, opti
     flushingRef.current = true;
     pendingWritesRef.current += 1;
     try {
-      if (upserts.length) await upsertCollectionItems(collectionName, upserts);
-      if (deletes.length) await deleteCollectionItems(collectionName, deletes);
+      if (upserts.length) holdSaved(await upsertCollectionItems(collectionName, upserts), upserts, []);
+      if (deletes.length) holdSaved(await deleteCollectionItems(collectionName, deletes), [], deletes);
       upserts.forEach((item) => {
         // Only clear if nothing newer was queued for this id while we were away.
         if (outbox.upserts[item.id] === item) delete outbox.upserts[item.id];
@@ -202,7 +240,7 @@ export function useCloudCollectionState(collectionName, localKey, fallback, opti
           );
         }
         const merged = [
-          ...items.filter((item) => item?.id && !pendingById[item.id] && !deleted.has(item.id)),
+          ...applyHolds(holdsRef.current, items).filter((item) => item?.id && !pendingById[item.id] && !deleted.has(item.id)),
           ...Object.values(pendingById),
         ];
         const sorted = sortCloudItems(merged);
@@ -233,6 +271,7 @@ export function useCloudCollectionState(collectionName, localKey, fallback, opti
           } else {
             pendingWritesRef.current += 1;
             syncCollectionItems(collectionName, current, normalized)
+              .then((where) => holdSaved(where, changed, removed))
               .catch((error) => {
                 logSyncError(`Firestore ${collectionName} sync failed`, error);
                 // The write failed, so it is still owed. Queue it and let the

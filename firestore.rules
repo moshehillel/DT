@@ -122,6 +122,13 @@ service cloud.firestore {
       allow read, update, delete: if isAdmin();
     }
 
+    // Which parts of the app save through PostgreSQL. Changed only from the
+    // server or the console.
+    match /system/{docId} {
+      allow read: if signedIn();
+      allow write: if false;
+    }
+
     match /{document=**} {
       allow read, write: if false;
     }
