@@ -87,13 +87,13 @@ export async function chargeOnDevice({
 }
 
 // Refund a previous card sale back to the original card by reference number.
-export async function refundToCard({ amount, refNum }) {
+export async function refundToCard({ amount, refNum, refundId = "", reportId = "", kind = "sale" }) {
   if (!FUNCTIONS_BASE_URL) {
     throw new Error("Set VITE_FUNCTIONS_BASE_URL to your Firebase Functions URL to refund cards.");
   }
   if (!refNum) {
     throw new Error("This sale has no card reference, so it can't be refunded to the card automatically.");
   }
-  const result = await postJson("/solaRefund", { amount, refNum });
+  const result = await postJson("/solaRefund", { amount, refNum, refundId, reportId, kind });
   return { refNum: result.transactionId || refNum, status: result.status || "refunded" };
 }

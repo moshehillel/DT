@@ -10871,7 +10871,13 @@ function RentalReportActions({ report, onUpdate, activeEmployee }) {
       setBusy("returning");
       setMessage(`Refunding the ${formatMoney(deposit)} deposit…`);
       try {
-        const result = await refundToCard({ amount: deposit, refNum: details.cardRefNum });
+        const result = await refundToCard({
+          amount: deposit,
+          refNum: details.cardRefNum,
+          refundId: `deposit:${report.id}`,
+          reportId: report.id,
+          kind: "deposit",
+        });
         patch.depositStatus = "Refunded";
         patch.depositRefundedAt = new Date().toISOString();
         patch.depositRefundRef = result.refNum || "";
@@ -11530,6 +11536,8 @@ function ReturnDialog({ report, onClose, onSubmit }) {
   const lineItems = details.lineItems || [];
   const returnedByIndex = details.returnedByIndex || {};
   const originalRefNum = details.solaRefNum || "";
+  // One id per open dialog, so a double click or a retry is the same refund.
+  const refundIdRef = useRef(`return:${crypto.randomUUID()}`);
   // A sale can be paid part cash, part card. The refund then has to go back the
   // same way, each method getting its share and never more than it took.
   const salePayments = (details.payments || []).filter(
@@ -11681,7 +11689,13 @@ function ReturnDialog({ report, onClose, onSubmit }) {
     if (requiresSolaRefund && refundState.status !== "refunded") {
       try {
         setRefundState({ status: "refunding", message: "Refunding card...", ref: "" });
-        const result = await refundToCard({ amount: cardRefundAmount, refNum: originalRefNum });
+        const result = await refundToCard({
+          amount: cardRefundAmount,
+          refNum: originalRefNum,
+          refundId: refundIdRef.current,
+          reportId: report.id,
+          kind: "sale",
+        });
         solaRef = result.refNum;
         setRefundState({
           status: "refunded",

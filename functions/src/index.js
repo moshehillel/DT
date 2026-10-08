@@ -35,6 +35,13 @@ const { extractShopifyImei } = require("./shopify");
 const { applyStockMovement, normalizeMovement } = require("./inventory");
 const { requireEmployee } = require("./auth");
 const {
+  chargedOnCard,
+  interpretRefundReply,
+  money,
+  planRefund,
+  refundedBeforeLedger,
+} = require("./refunds");
+const {
   buildResultLookup,
   buildSaleSession,
   formatAmount,
@@ -1501,9 +1508,78 @@ exports.solaCreateCharge = onRequest(HTTP_OPTIONS, async (req, res) => {
 // Refund a previous Sola card sale by reference (the xRefNum returned when the
 // sale was charged). Uses the gateway cc:refund command, so no terminal is
 // needed to send the money back to the original card.
+const REFUND_ID_PATTERN = /^[A-Za-z0-9:_-]{6,180}$/;
+
+async function reportsChargedTo(refNum) {
+  const [sales, rentals] = await Promise.all([
+    db.collection("reports").where("details.solaRefNum", "==", refNum).get(),
+    db.collection("reports").where("details.cardRefNum", "==", refNum).get(),
+  ]);
+  const byId = new Map();
+  for (const doc of [...sales.docs, ...rentals.docs]) byId.set(doc.id, { ...doc.data(), id: doc.id });
+  return [...byId.values()];
+}
+
+async function returnsOf(reportIds) {
+  const found = [];
+  for (let index = 0; index < reportIds.length; index += 30) {
+    const chunk = reportIds.slice(index, index + 30);
+    const snapshot = await db.collection("reports").where("details.originalReportId", "in", chunk).get();
+    snapshot.docs.forEach((doc) => found.push(doc.data()));
+  }
+  return found;
+}
+
+// Reserves the refund on the card's ledger, or says why it can't go ahead.
+async function reserveCardRefund({ refNum, refundId, amount, kind, reportId, by }) {
+  const reports = await reportsChargedTo(refNum);
+  if (!reports.length) {
+    return { refuse: true, status: 404, message: "Can't find the original sale for this card, so it can't be refunded from here." };
+  }
+  const ledgerRef = db.collection("cardRefunds").doc(refNum.replace(/\//g, "_"));
+  const existing = await ledgerRef.get();
+  const refundedBefore = existing.exists
+    ? null
+    : refundedBeforeLedger(reports, await returnsOf(reports.map((report) => report.id)));
+  const report = reports.find((entry) => entry.id === reportId) || null;
+  const charged = chargedOnCard(reports);
+
+  return db.runTransaction(async (transaction) => {
+    const snapshot = await transaction.get(ledgerRef);
+    const ledger = snapshot.exists
+      ? { ...snapshot.data(), charged }
+      : { refNum, charged, refundedBefore: refundedBefore ?? 0, entries: {} };
+    const plan = planRefund(ledger, { refundId, amount, kind, report });
+    if (plan.action === "refuse") return { refuse: true, status: plan.status, message: plan.message };
+    if (plan.action === "repeat") return { repeat: true, entry: plan.entry };
+
+    const entries = { ...(ledger.entries || {}) };
+    entries[refundId] = {
+      amount: money(amount),
+      kind,
+      reportId: reportId || "",
+      status: "pending",
+      by: by || "",
+      at: new Date().toISOString(),
+    };
+    transaction.set(ledgerRef, { ...ledger, entries, updatedAt: new Date().toISOString() });
+    return { ledgerRef };
+  });
+}
+
+async function settleCardRefund(ledgerRef, refundId, fields) {
+  const updates = [];
+  for (const [key, value] of Object.entries(fields)) {
+    updates.push(new admin.firestore.FieldPath("entries", refundId, key), value);
+  }
+  updates.push("updatedAt", new Date().toISOString());
+  await ledgerRef.update(...updates);
+}
+
 exports.solaRefund = onRequest(HTTP_OPTIONS, async (req, res) => {
   if (handleCors(req, res)) return;
-  if (!(await signedInEmployee(req, res))) return;
+  const employee = await signedInEmployee(req, res);
+  if (!employee) return;
   if (req.method !== "POST") {
     sendJson(res, 405, { error: "POST required" });
     return;
@@ -1529,6 +1605,44 @@ exports.solaRefund = onRequest(HTTP_OPTIONS, async (req, res) => {
     return;
   }
 
+  const refundId = REFUND_ID_PATTERN.test(String(payload.refundId || ""))
+    ? String(payload.refundId)
+    : `auto:${crypto.randomUUID()}`;
+  const kind = payload.kind === "deposit" ? "deposit" : "sale";
+  const reportId = String(payload.reportId || "");
+
+  let reservation;
+  try {
+    reservation = await reserveCardRefund({
+      refNum: String(refNum),
+      refundId,
+      amount,
+      kind,
+      reportId,
+      by: employee.email || employee.uid || "",
+    });
+  } catch (error) {
+    logger.error("solaRefund could not reserve", error);
+    sendJson(res, 500, { ok: false, message: "Could not check this refund. Nothing was refunded; try again." });
+    return;
+  }
+  if (reservation.refuse) {
+    sendJson(res, reservation.status, { ok: false, message: reservation.message });
+    return;
+  }
+  if (reservation.repeat) {
+    sendJson(res, 200, {
+      ok: true,
+      message: "This refund was already approved.",
+      transactionId: reservation.entry.solaRef || "",
+      status: "refunded",
+    });
+    return;
+  }
+  const { ledgerRef } = reservation;
+
+  let response;
+  let data;
   try {
     const solaPayload = {
       xKey: SOLA_API_KEY,
@@ -1540,41 +1654,69 @@ exports.solaRefund = onRequest(HTTP_OPTIONS, async (req, res) => {
       xRefNum: refNum,
     };
 
-    const response = await fetch(`${SOLA_API_BASE_URL}${SOLA_CREATE_CHARGE_PATH}`, {
+    response = await fetch(`${SOLA_API_BASE_URL}${SOLA_CREATE_CHARGE_PATH}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(solaPayload),
     });
     const text = await response.text();
-    let data;
     try {
       data = text ? JSON.parse(text) : {};
     } catch {
       data = { message: text || "Sola returned a non-JSON response." };
     }
-    const normalized = normalizeSolaCharge(data);
-    const approved = String(data.xResult || data.xStatus || data.status || "").toLowerCase() === "approved"
-      || String(data.xStatus || data.status || "").toLowerCase() === "success";
+  } catch (error) {
+    // The request may or may not have reached Sola. The amount stays reserved
+    // so nobody refunds it a second time without looking first.
+    logger.error("solaRefund got no answer", error);
+    await settleCardRefund(ledgerRef, refundId, { status: "pending", note: String(error.message || error) })
+      .catch((settleError) => logger.error("solaRefund could not note the missing answer", settleError));
+    sendJson(res, 502, {
+      ok: false,
+      message: "No answer from Sola, so this refund may or may not have gone through. Check Sola before trying again.",
+    });
+    return;
+  }
 
-    if (!response.ok || !approved) {
-      sendJson(res, 400, {
-        ok: false,
-        message: data.xError || data.xErrorCode || data.message || "Sola refund failed.",
-        ...normalized,
+  const normalized = normalizeSolaCharge(data);
+  const outcome = interpretRefundReply(response.ok, data);
+  try {
+    if (outcome === "approved") {
+      await settleCardRefund(ledgerRef, refundId, { status: "approved", solaRef: normalized.transactionId || "" });
+    } else if (outcome === "declined") {
+      await settleCardRefund(ledgerRef, refundId, {
+        status: "declined",
+        note: String(data.xError || data.xErrorCode || data.message || ""),
       });
-      return;
+    } else {
+      await settleCardRefund(ledgerRef, refundId, { status: "pending", note: JSON.stringify(data).slice(0, 500) });
     }
+  } catch (error) {
+    logger.error("solaRefund could not record the outcome", { refNum, refundId, outcome, error });
+  }
 
+  if (outcome === "approved") {
     sendJson(res, 200, {
       ok: true,
-      message: data.xResult || data.message || "Sola refund approved.",
+      message: data.xStatus || data.message || "Sola refund approved.",
       ...normalized,
       status: "refunded",
     });
-  } catch (error) {
-    logger.error("solaRefund failed", error);
-    sendJson(res, 500, { ok: false, message: error.message || "Sola refund failed." });
+    return;
   }
+  if (outcome === "declined") {
+    sendJson(res, 400, {
+      ok: false,
+      message: data.xError || data.xErrorCode || data.message || "Sola refund failed.",
+      ...normalized,
+    });
+    return;
+  }
+  sendJson(res, 502, {
+    ok: false,
+    message: "Sola's answer was unclear, so this refund may or may not have gone through. Check Sola before trying again.",
+    ...normalized,
+  });
 });
 
 async function callSolaDevice(path, body) {

@@ -76,6 +76,12 @@ service cloud.firestore {
       allow write: if false;
     }
 
+    // What has gone back on each card. Only solaRefund writes it.
+    match /cardRefunds/{refNum} {
+      allow read: if signedIn();
+      allow write: if false;
+    }
+
     match /customers/{customerId} {
       allow read, create, update: if signedIn();
       allow delete: if isAdmin();
