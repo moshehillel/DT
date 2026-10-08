@@ -37,6 +37,7 @@ import {
 } from "./constants";
 import { useCloudCollectionState, useCloudDocumentState } from "./hooks/useCloudState";
 import {
+  authorizedFetch,
   callFunction,
   claimRepairTicket,
   deleteCustomerDoc,
@@ -1313,7 +1314,7 @@ function Workspace({ currentUser, isAdmin }) {
     if (!FUNCTIONS_BASE_URL) return false;
 
     try {
-      const response = await fetch(`${FUNCTIONS_BASE_URL}/${endpoint}`, {
+      const response = await authorizedFetch(`${FUNCTIONS_BASE_URL}/${endpoint}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
@@ -3039,7 +3040,7 @@ function RentalReportForm({
 
   // ---- talking to RCUK ----------------------------------------------------
   async function postFunction(path, body) {
-    const response = await fetch(`${FUNCTIONS_BASE_URL}${path}`, {
+    const response = await authorizedFetch(`${FUNCTIONS_BASE_URL}${path}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
@@ -5204,9 +5205,7 @@ function PendingReportCard({ pendingReport, activeEmployee, onSaveCustomerName, 
             {crmMatch?.address ? <span><strong>Address:</strong> {crmMatch.address}</span> : null}
             <span><strong>Received:</strong> {pendingReport.createdAt ? formatShortDate(pendingReport.createdAt) : "-"}</span>
             {recordingHref ? (
-              <a className="secondary-button compact-button" href={recordingHref} target="_blank" rel="noopener noreferrer">
-                {isVoicemailCall ? "▶ Voicemail" : "▶ Recording"}
-              </a>
+              <RecordingLink href={recordingHref}>{isVoicemailCall ? "▶ Voicemail" : "▶ Recording"}</RecordingLink>
             ) : null}
           </div>
         ) : null}
@@ -5246,9 +5245,7 @@ function PendingReportCard({ pendingReport, activeEmployee, onSaveCustomerName, 
             <span><strong>Talk time:</strong> {imported.talkDuration !== "" && imported.talkDuration !== undefined ? `${imported.talkDuration}s` : "-"}</span>
             <span><strong>Imported:</strong> {pendingReport.createdAt ? formatShortDate(pendingReport.createdAt) : "-"}</span>
             {recordingHref ? (
-              <a className="secondary-button compact-button" href={recordingHref} target="_blank" rel="noopener noreferrer">
-                ▶ Call recording
-              </a>
+              <RecordingLink href={recordingHref}>▶ Call recording</RecordingLink>
             ) : null}
           </>
         ) : (
@@ -10905,7 +10902,7 @@ function RentalReportActions({ report, onUpdate, activeEmployee }) {
     setBusy("numbers");
     setMessage("Fetching numbers from RCUK…");
     try {
-      const response = await fetch(`${FUNCTIONS_BASE_URL}/rcukDeliverNumbers`, {
+      const response = await authorizedFetch(`${FUNCTIONS_BASE_URL}/rcukDeliverNumbers`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ report_id: report.id }),
@@ -10946,7 +10943,7 @@ function RentalReportActions({ report, onUpdate, activeEmployee }) {
     setBusy("cancel");
     setMessage("Cancelling rental with RCUK…");
     try {
-      const response = await fetch(`${FUNCTIONS_BASE_URL}/rcukCancelRental`, {
+      const response = await authorizedFetch(`${FUNCTIONS_BASE_URL}/rcukCancelRental`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -11170,7 +11167,7 @@ function RentalEditDialog({ report, onSave, onClose }) {
       setBusy(true);
       setError("");
       try {
-        const response = await fetch(`${FUNCTIONS_BASE_URL}/rcukUpdateRental`, {
+        const response = await authorizedFetch(`${FUNCTIONS_BASE_URL}/rcukUpdateRental`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -11470,9 +11467,7 @@ function ReportDetails({ report, compact }) {
         <span>-</span>
       )}
       {!compact && recordingUrl ? (
-        <a className="secondary-button compact-button" href={recordingUrl} target="_blank" rel="noopener noreferrer">
-          ▶ Call recording
-        </a>
+        <RecordingLink href={recordingUrl}>▶ Call recording</RecordingLink>
       ) : null}
       {!compact && report.notes ? <span className="muted">{report.notes}</span> : null}
     </div>
@@ -11483,6 +11478,45 @@ function ReportDetails({ report, compact }) {
 function callRecordingUrl(callId, uniqueId) {
   if (!FUNCTIONS_BASE_URL || !callId || !uniqueId) return "";
   return `${FUNCTIONS_BASE_URL}/telebroadCallRecording?callid=${encodeURIComponent(callId)}&uniqueid=${encodeURIComponent(uniqueId)}`;
+}
+
+// A plain link cannot carry the sign-in our recording function requires, so a
+// recording served by us is fetched first and then opened. Links straight to
+// Telebroad open as they always did.
+function RecordingLink({ href, children }) {
+  const ours = Boolean(FUNCTIONS_BASE_URL) && href.startsWith(`${FUNCTIONS_BASE_URL}/telebroadCallRecording`);
+
+  async function open(event) {
+    if (!ours) return;
+    event.preventDefault();
+    // Opened before the await, or the browser treats it as an unrequested pop-up.
+    const tab = window.open("about:blank", "_blank");
+    try {
+      const response = await authorizedFetch(`${href}&json=1`);
+      const type = response.headers.get("content-type") || "";
+      if (type.includes("application/json")) {
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok || !data.url) throw new Error(data.message || "Recording not available.");
+        if (tab) tab.location.href = data.url;
+        else window.open(data.url, "_blank");
+        return;
+      }
+      if (!response.ok) throw new Error("Recording not available.");
+      const blobUrl = URL.createObjectURL(await response.blob());
+      if (tab) tab.location.href = blobUrl;
+      else window.open(blobUrl, "_blank");
+      setTimeout(() => URL.revokeObjectURL(blobUrl), 5 * 60 * 1000);
+    } catch (error) {
+      tab?.close();
+      window.alert(error.message || "Could not open the recording.");
+    }
+  }
+
+  return (
+    <a className="secondary-button compact-button" href={href} target="_blank" rel="noopener noreferrer" onClick={open}>
+      {children}
+    </a>
+  );
 }
 
 // Money math that survives being split: every intermediate is held at whole

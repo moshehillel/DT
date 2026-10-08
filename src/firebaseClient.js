@@ -199,6 +199,16 @@ export async function sendReset(email) {
   await sendPasswordResetEmail(auth, String(email || "").trim());
 }
 
+// fetch() for our HTTP Cloud Functions, carrying the employee's sign-in. Those
+// functions refuse any request without it.
+export async function authorizedFetch(url, init = {}) {
+  const user = await ensureFirebaseAuth();
+  const token = await user.getIdToken();
+  const headers = new Headers(init.headers || {});
+  headers.set("Authorization", `Bearer ${token}`);
+  return fetch(url, { ...init, headers });
+}
+
 // Calls an admin-only Cloud Function (callable) such as employee management.
 export async function callFunction(name, data) {
   const { functions } = await getFirebase();

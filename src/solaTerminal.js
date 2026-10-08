@@ -1,11 +1,12 @@
 import { FUNCTIONS_BASE_URL } from "./constants";
+import { authorizedFetch } from "./firebaseClient";
 
 // Card-present payments run through Sola CloudIM: our Cloud Function starts a
 // sale on the physical terminal (PAX A80), then we poll for the result while
 // the customer taps / dips / swipes their card. No card data touches the browser.
 
 async function postJson(path, body) {
-  const response = await fetch(`${FUNCTIONS_BASE_URL}${path}`, {
+  const response = await authorizedFetch(`${FUNCTIONS_BASE_URL}${path}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body || {}),
