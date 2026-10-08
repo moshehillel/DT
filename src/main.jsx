@@ -7518,6 +7518,9 @@ function PosPage({ products, reports = [], storeLocations = [], activeEmployee, 
               <p className="eyebrow">Checkout</p>
               <h2>{formatMoney(total)}</h2>
             </div>
+            {saleCustomer?.name ? (
+              <p className="pos-customer-name" title={saleCustomer.name}>{saleCustomer.name}</p>
+            ) : null}
           </div>
           <div className="pos-checkout-scroll">
           <div className="form-grid pos-checkout-fields">
@@ -7542,9 +7545,6 @@ function PosPage({ products, reports = [], storeLocations = [], activeEmployee, 
                 ))}
               </select>
             </label>
-            {saleCustomer?.name ? (
-              <p className="pos-customer-name full">{saleCustomer.name}</p>
-            ) : null}
             {accountCustomer ? (
               <div className="pos-split full">
                 <p className="pos-split-remainder">
@@ -7597,17 +7597,40 @@ function PosPage({ products, reports = [], storeLocations = [], activeEmployee, 
                 ) : null}
               </div>
             ) : null}
-            <label className="checkbox-field full pos-split-toggle">
-              <input
-                type="checkbox"
-                checked={splitPayment}
-                onChange={(event) => {
-                  setSplitPayment(event.target.checked);
-                  if (!event.target.checked) { setSplitSecondMethod(""); setSplitFirstInput(""); }
-                }}
-              />
-              <span>Split between two payment methods</span>
-            </label>
+            <div className="pos-checkout-options full">
+              <label className="pos-option-toggle" title="Split between two payment methods">
+                <input
+                  type="checkbox"
+                  checked={splitPayment}
+                  onChange={(event) => {
+                    setSplitPayment(event.target.checked);
+                    if (!event.target.checked) { setSplitSecondMethod(""); setSplitFirstInput(""); }
+                  }}
+                />
+                <span className="pos-option-full">Split between two payment methods</span>
+                <span className="pos-option-short">Split payment</span>
+              </label>
+              <label className="pos-option-toggle" title="Collect this payment later">
+                <input
+                  type="checkbox"
+                  checked={collectLater}
+                  onChange={(event) => {
+                    setCollectLater(event.target.checked);
+                    if (event.target.checked) {
+                      setSplitPayment(false);
+                      setSplitSecondMethod("");
+                      setSplitFirstInput("");
+                    }
+                  }}
+                />
+                <span className="pos-option-full">Collect this payment later</span>
+                <span className="pos-option-short">Collect later</span>
+              </label>
+              <button className="secondary-button compact-button pos-option-button" type="button" onClick={textPaymentRequest} disabled={!total}>
+                Text payment request
+              </button>
+            </div>
+            {payRequest ? <p className="muted full pos-pay-request">{payRequest}</p> : null}
             {splitPayment ? (
               <div className="pos-split full">
                 <label className="field">
@@ -7643,45 +7666,27 @@ function PosPage({ products, reports = [], storeLocations = [], activeEmployee, 
                 ) : null}
               </div>
             ) : null}
-            <label className="checkbox-field full pos-split-toggle">
-              <input
-                type="checkbox"
-                checked={collectLater}
-                onChange={(event) => {
-                  setCollectLater(event.target.checked);
-                  if (event.target.checked) {
-                    setSplitPayment(false);
-                    setSplitSecondMethod("");
-                    setSplitFirstInput("");
-                  }
-                }}
-              />
-              <span>Collect this payment later</span>
-            </label>
             {collectLater ? (
               <label className="field">
                 <span>Payment due</span>
                 <input type="date" value={paymentDueAt} onChange={(event) => setPaymentDueAt(event.target.value)} required />
               </label>
             ) : null}
-            <div className="pos-form-actions form-actions-row">
-              <button className="secondary-button" type="button" onClick={textPaymentRequest} disabled={!total}>
-                Text payment request
-              </button>
-              {payRequest ? <p className="muted">{payRequest}</p> : null}
-            </div>
-            <label className="field full">
+            <label className="field full pos-notes-field">
               <span>Notes (optional)</span>
               <textarea value={notes} onChange={(event) => setNotes(event.target.value)} rows={1} />
             </label>
           </div>
 
           <div className="pos-totals">
-            <div className="pos-totals-row pos-totals-sub"><span>Subtotal</span><span>{formatMoney(subtotal)}</span></div>
-            <label className="checkbox-field pos-out-of-state">
-              <input type="checkbox" checked={outOfState} onChange={(event) => setOutOfState(event.target.checked)} />
-              <span>Out of state (no sales tax)</span>
-            </label>
+            <div className="pos-totals-row pos-totals-sub">
+              <span>Subtotal</span>
+              <label className="checkbox-field pos-out-of-state">
+                <input type="checkbox" checked={outOfState} onChange={(event) => setOutOfState(event.target.checked)} />
+                <span>Out of state (no sales tax)</span>
+              </label>
+              <span>{formatMoney(subtotal)}</span>
+            </div>
             <div className="pos-totals-row pos-totals-tax">
               <span>Tax{taxApplies ? ` (${taxRate}%${splitTaxOnOneSide ? ` · ${taxedSideMethod} share` : ""})` : ""}</span>
               <span>{formatMoney(taxAmount)}</span>
