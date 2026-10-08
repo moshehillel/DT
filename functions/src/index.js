@@ -921,7 +921,7 @@ async function commitStockViaPostgres(movements) {
   return { applied: mine.filter((result) => !result.skipped).length, skipped: mine.filter((result) => result.skipped).length };
 }
 
-exports.postStockMovements = onCall({ region: REGION, secrets: [PLANETSCALE_URL] }, async (request) => {
+exports.postStockMovements = onCall({ region: REGION, secrets: [PLANETSCALE_URL], minInstances: 1 }, async (request) => {
   if (!request.auth) throw new HttpsError("unauthenticated", "Sign in required.");
   const movements = request.data?.movements;
   if (!Array.isArray(movements) || !movements.length) {
@@ -3000,7 +3000,7 @@ function readyRecordPool() {
 
 // A register saving records: PostgreSQL first, then the Firestore copy.
 exports.saveRecords = onCall(
-  { region: REGION, secrets: [PLANETSCALE_URL], timeoutSeconds: 60, memory: "512MiB" },
+  { region: REGION, secrets: [PLANETSCALE_URL], timeoutSeconds: 60, memory: "512MiB", minInstances: 1 },
   async (request) => {
     const pool = await readyRecordPool().catch(() => null);
     if (!pool) throw new HttpsError("unavailable", "The database could not be reached. The save will go the usual way.");
@@ -3009,7 +3009,7 @@ exports.saveRecords = onCall(
 );
 
 exports.adjustCustomerBalance = onCall(
-  { region: REGION, secrets: [PLANETSCALE_URL] },
+  { region: REGION, secrets: [PLANETSCALE_URL], minInstances: 1 },
   async (request) => {
     const pool = await readyRecordPool().catch(() => null);
     if (!pool) throw new HttpsError("unavailable", "The database could not be reached. Using the usual way.");
