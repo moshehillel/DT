@@ -33,6 +33,7 @@ const {
 } = require("./telebroad");
 const { extractShopifyImei } = require("./shopify");
 const { applyStockMovement, normalizeMovement } = require("./inventory");
+const { requireEmployee } = require("./auth");
 const {
   buildResultLookup,
   buildSaleSession,
@@ -230,6 +231,7 @@ function sendJson(res, status, body) {
 // account credentials stay server-side.
 exports.telebroadCallRecording = onRequest(HTTP_OPTIONS, async (req, res) => {
   if (handleCors(req, res)) return;
+  if (!(await signedInEmployee(req, res))) return;
 
   const payload = getPayload(req);
   const callid = String(payload.callid || payload.callId || "").trim();
@@ -284,8 +286,10 @@ exports.telebroadCallRecording = onRequest(HTTP_OPTIONS, async (req, res) => {
   }
 });
 
+const signedInEmployee = (req, res) => requireEmployee(req, res, (token) => admin.auth().verifyIdToken(token));
+
 function handleCors(req, res) {
-  res.set("Access-Control-Allow-Origin", process.env.ALLOWED_WEB_ORIGIN || "*");
+  res.set("Access-Control-Allow-Origin", process.env.ALLOWED_WEB_ORIGIN || "https://diamant-telecom.web.app");
   res.set("Access-Control-Allow-Headers", "Content-Type, Authorization");
   res.set("Access-Control-Allow-Methods", "POST, OPTIONS");
   if (req.method === "OPTIONS") {
@@ -1125,6 +1129,7 @@ exports.telebroadCallWebhook = onRequest(HTTP_OPTIONS, async (req, res) => {
 
 exports.rcukAddRental = onRequest(HTTP_OPTIONS, async (req, res) => {
   if (handleCors(req, res)) return;
+  if (!(await signedInEmployee(req, res))) return;
   if (req.method !== "POST") {
     sendJson(res, 405, { error: "POST required" });
     return;
@@ -1183,6 +1188,7 @@ exports.rcukAddRental = onRequest(HTTP_OPTIONS, async (req, res) => {
 
 exports.rcukCheckSim = onRequest(HTTP_OPTIONS, async (req, res) => {
   if (handleCors(req, res)) return;
+  if (!(await signedInEmployee(req, res))) return;
   if (req.method !== "POST") {
     sendJson(res, 405, { error: "POST required" });
     return;
@@ -1229,6 +1235,7 @@ exports.rcukCheckSim = onRequest(HTTP_OPTIONS, async (req, res) => {
 
 exports.rcukGetRental = onRequest(HTTP_OPTIONS, async (req, res) => {
   if (handleCors(req, res)) return;
+  if (!(await signedInEmployee(req, res))) return;
   if (req.method !== "POST") {
     sendJson(res, 405, { error: "POST required" });
     return;
@@ -1274,6 +1281,7 @@ exports.rcukGetRental = onRequest(HTTP_OPTIONS, async (req, res) => {
 
 exports.rcukCancelRental = onRequest(HTTP_OPTIONS, async (req, res) => {
   if (handleCors(req, res)) return;
+  if (!(await signedInEmployee(req, res))) return;
   if (req.method !== "POST") {
     sendJson(res, 405, { error: "POST required" });
     return;
@@ -1328,6 +1336,7 @@ exports.rcukCancelRental = onRequest(HTTP_OPTIONS, async (req, res) => {
 // user before calling this, since it changes a live rental.
 exports.rcukUpdateRental = onRequest(HTTP_OPTIONS, async (req, res) => {
   if (handleCors(req, res)) return;
+  if (!(await signedInEmployee(req, res))) return;
   if (req.method !== "POST") {
     sendJson(res, 405, { error: "POST required" });
     return;
@@ -1396,6 +1405,7 @@ function normalizeSolaCharge(data) {
 
 exports.solaCreateCharge = onRequest(HTTP_OPTIONS, async (req, res) => {
   if (handleCors(req, res)) return;
+  if (!(await signedInEmployee(req, res))) return;
   if (req.method !== "POST") {
     sendJson(res, 405, { error: "POST required" });
     return;
@@ -1493,6 +1503,7 @@ exports.solaCreateCharge = onRequest(HTTP_OPTIONS, async (req, res) => {
 // needed to send the money back to the original card.
 exports.solaRefund = onRequest(HTTP_OPTIONS, async (req, res) => {
   if (handleCors(req, res)) return;
+  if (!(await signedInEmployee(req, res))) return;
   if (req.method !== "POST") {
     sendJson(res, 405, { error: "POST required" });
     return;
@@ -1590,6 +1601,7 @@ async function callSolaDevice(path, body) {
 // POS polls with solaDeviceResult.
 exports.solaDeviceSale = onRequest(HTTP_OPTIONS, async (req, res) => {
   if (handleCors(req, res)) return;
+  if (!(await signedInEmployee(req, res))) return;
   if (req.method !== "POST") {
     sendJson(res, 405, { ok: false, message: "POST required" });
     return;
@@ -1653,6 +1665,7 @@ exports.solaDeviceSale = onRequest(HTTP_OPTIONS, async (req, res) => {
 // Sola CloudIM: poll the result of a terminal sale by session id.
 exports.solaDeviceResult = onRequest(HTTP_OPTIONS, async (req, res) => {
   if (handleCors(req, res)) return;
+  if (!(await signedInEmployee(req, res))) return;
   if (req.method !== "POST") {
     sendJson(res, 405, { ok: false, message: "POST required" });
     return;
@@ -2175,6 +2188,7 @@ async function deliverRentalNumbers(reportId, report) {
 // customer. Pressing it twice cannot send twice; the claim above sees to that.
 exports.rcukDeliverNumbers = onRequest(HTTP_OPTIONS, async (req, res) => {
   if (handleCors(req, res)) return;
+  if (!(await signedInEmployee(req, res))) return;
   if (req.method !== "POST") {
     sendJson(res, 405, { error: "POST required" });
     return;
@@ -2375,6 +2389,7 @@ function buildPhoneOrderHandlerMessage(order) {
 
 exports.notifyPhoneOrderAssigned = onRequest(HTTP_OPTIONS, async (req, res) => {
   if (handleCors(req, res)) return;
+  if (!(await signedInEmployee(req, res))) return;
   if (req.method !== "POST") {
     sendJson(res, 405, { error: "POST required" });
     return;
@@ -2424,6 +2439,7 @@ exports.notifyPhoneOrderAssigned = onRequest(HTTP_OPTIONS, async (req, res) => {
 
 exports.notifyPhoneOrderDelivered = onRequest(HTTP_OPTIONS, async (req, res) => {
   if (handleCors(req, res)) return;
+  if (!(await signedInEmployee(req, res))) return;
   if (req.method !== "POST") {
     sendJson(res, 405, { error: "POST required" });
     return;
