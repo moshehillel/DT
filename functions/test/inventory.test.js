@@ -118,3 +118,29 @@ test("a count sets one store and leaves the other", () => {
   assert.equal(products["phone-1"].stock.Brooklyn.quantity, 2);
   assert.equal(products["phone-1"].stock.Monroe.quantity, 10);
 });
+
+test("a count change on a phone product keeps its IMEIs and is recorded as short", () => {
+  const product = {
+    id: "phone-1",
+    requiresImei: true,
+    stock: { Monroe: { quantity: 2, imeis: ["222", "333"] } },
+  };
+  const { products, applied } = planStockCommit({ "phone-1": product }, new Set(), [
+    { id: "sale:s1:phone-1", productId: "phone-1", location: "Monroe", op: "removeQty", qty: 1 },
+    { id: "return:r1:phone-1", productId: "phone-1", location: "Monroe", op: "addQty", qty: 1 },
+  ]);
+  assert.deepEqual(products["phone-1"].stock.Monroe.imeis, ["222", "333"]);
+  assert.equal(products["phone-1"].quantity, 2);
+  assert.equal(applied[0].result.shortQty, 1);
+});
+
+test("an IMEI change on a counted product keeps every store's count", () => {
+  const { products, applied } = planStockCommit({ "phone-1": phone() }, new Set(), [
+    { id: "return:r1:phone-1", productId: "phone-1", location: "Monroe", op: "addImeis", imeis: ["555"] },
+    { id: "sale:s2:phone-1", productId: "phone-1", location: "Monroe", op: "removeImeis", imeis: ["666"] },
+  ]);
+  assert.equal(products["phone-1"].stock.Brooklyn.quantity, 5);
+  assert.equal(products["phone-1"].stock.Monroe.quantity, 10);
+  assert.equal(products["phone-1"].quantity, 15);
+  assert.deepEqual(applied[1].result.missingImeis, ["666"]);
+});

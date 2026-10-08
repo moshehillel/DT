@@ -65,7 +65,14 @@ function applyStockMovement(product, movement) {
   let shortQty = 0;
   const missingImeis = [];
 
-  if (movement.op === "set") {
+  const byImei = movement.op === "removeImeis" || movement.op === "addImeis";
+  const byCount = movement.op === "removeQty" || movement.op === "addQty";
+  if ((requiresImei && byCount) || (!requiresImei && byImei)) {
+    // The product decides how its stock moves, the same as on the register.
+    // A movement of the other kind is recorded and leaves stock alone.
+    if (movement.op === "removeQty") shortQty = movement.qty;
+    if (movement.op === "removeImeis") missingImeis.push(...movement.imeis);
+  } else if (movement.op === "set") {
     const imeis = requiresImei ? movement.imeis : [];
     map[location] = {
       quantity: requiresImei ? imeis.length : movement.qty,
