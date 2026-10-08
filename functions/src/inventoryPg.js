@@ -51,6 +51,12 @@ create table if not exists inv_transfers (
   created_at timestamptz not null default now(),
   lines jsonb not null
 );
+alter table inv_movements add column if not exists cost_total numeric(12, 2);
+create table if not exists inv_avg_cost (
+  product_id text primary key,
+  avg_cost numeric(12, 4),
+  updated_at timestamptz not null default now()
+);
 create table if not exists inv_product_versions (
   product_id text primary key,
   version bigint not null default 0,
@@ -98,7 +104,9 @@ function buildSeed(products) {
   const levels = [];
   const units = new Map();
   const duplicates = [];
+  const averages = [];
   for (const product of products) {
+    if (!product.requiresImei) averages.push({ productId: product.id, cost: costOf(product) });
     const map = stockMapOf(product);
     for (const [location, entry] of Object.entries(map)) {
       if (!location) continue;
@@ -117,7 +125,23 @@ function buildSeed(products) {
       }
     }
   }
-  return { levels, units: [...units.values()], duplicates };
+  return { levels, units: [...units.values()], duplicates, averages };
+}
+
+// Average cost of a counted product across every store, from its current cost
+// of goods. Products already given an average keep theirs.
+async function seedAverageCosts(client, averages) {
+  for (const entry of averages) {
+    await client.query(
+      "insert into inv_avg_cost (product_id, avg_cost) values ($1, $2) on conflict (product_id) do nothing",
+      [entry.productId, entry.cost],
+    );
+  }
+}
+
+async function ensureAverageCosts(pool, products, schema = "public") {
+  const { averages } = buildSeed(products);
+  await inTransaction(pool, schema, (client) => seedAverageCosts(client, averages));
 }
 
 async function seedInventory(pool, products, schema = "public") {
@@ -140,6 +164,7 @@ async function seedInventory(pool, products, schema = "public") {
         [unit.imei, unit.productId, unit.location, unit.cost],
       );
     }
+    await seedAverageCosts(client, seed.averages);
     const value = {
       at: new Date().toISOString(),
       levels: seed.levels.length,
@@ -158,8 +183,23 @@ async function isSeeded(pool, schema = "public") {
   });
 }
 
+async function averageCost(client, productId, productCost) {
+  await client.query(
+    "insert into inv_avg_cost (product_id, avg_cost) values ($1, $2) on conflict (product_id) do nothing",
+    [productId, productCost ?? null],
+  );
+  const row = await client.query("select avg_cost from inv_avg_cost where product_id = $1 for update", [productId]);
+  const value = row.rows[0]?.avg_cost;
+  return value === null || value === undefined ? null : Number(value);
+}
+
+// unitCost is what staff typed on a restock (null when nothing was typed);
+// productCost is the product's cost of goods, used when there is nothing better.
 async function applyOne(client, item, origin) {
-  const { movement, requiresImei, unitCost } = item;
+  const { movement, requiresImei } = item;
+  const unitCost = item.unitCost ?? null;
+  const productCost = item.productCost ?? null;
+  let costTotal = null;
   const claimed = await client.query(
     `insert into inv_movements (id, product_id, location, op, qty, imeis, source_type, source_id, unit_cost, origin)
      values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
@@ -201,38 +241,67 @@ async function applyOne(client, item, origin) {
     );
     const have = Number(current.rows[0]?.quantity) || 0;
     let next = have;
-    if (op === "addQty") next = have + movement.qty;
-    else if (op === "removeQty") {
+    if (op === "addQty") {
+      next = have + movement.qty;
+      // Stock bought at a typed cost moves the average; stock coming back
+      // (a return, a cancelled order, a transfer in) comes back at the average.
+      const average = await averageCost(client, productId, productCost);
+      if (unitCost !== null) {
+        const total = await client.query(
+          "select coalesce(sum(quantity), 0) as total from inv_stock_levels where product_id = $1",
+          [productId],
+        );
+        const onHand = Number(total.rows[0].total) || 0;
+        const blended = average === null || onHand <= 0
+          ? unitCost
+          : (average * onHand + unitCost * movement.qty) / (onHand + movement.qty);
+        await client.query(
+          "update inv_avg_cost set avg_cost = $2, updated_at = now() where product_id = $1",
+          [productId, Math.round(blended * 10000) / 10000],
+        );
+      }
+    } else if (op === "removeQty") {
       shortQty = Math.max(0, movement.qty - have);
       next = Math.max(0, have - movement.qty);
+      const average = await averageCost(client, productId, productCost);
+      if (average !== null) costTotal = Math.round(average * (movement.qty - shortQty) * 100) / 100;
     } else next = Math.max(0, movement.qty || 0);
     await client.query(
       "update inv_stock_levels set quantity = $3, updated_at = now() where product_id = $1 and location = $2",
       [productId, location, next],
     );
   } else if (op === "removeImeis") {
+    let soldCost = 0;
+    let anyCost = false;
     for (const imei of imeis) {
       const sold = await client.query(
         `update inv_phone_units set status = 'sold', sold_at = now(), sold_source_type = $2, sold_source_id = $3, updated_at = now()
-         where imei = $1 and product_id = $4 and status = 'in_stock' returning imei`,
+         where imei = $1 and product_id = $4 and status = 'in_stock' returning cost`,
         [imei, movement.sourceType || null, movement.sourceId || null, productId],
       );
       if (!sold.rows.length) missingImeis.push(imei);
+      else if (sold.rows[0].cost !== null) {
+        soldCost += Number(sold.rows[0].cost);
+        anyCost = true;
+      }
     }
+    if (anyCost) costTotal = Math.round(soldCost * 100) / 100;
   } else if (op === "addImeis") {
+    // A typed cost is this handset's cost. Without one, a handset coming back
+    // keeps the cost it had, and a new one takes the product's cost of goods.
     for (const imei of imeis) {
       await client.query(
         `insert into inv_phone_units (imei, product_id, location, status, cost, received_at)
-         values ($1, $2, $3, 'in_stock', $4, now())
+         values ($1, $2, $3, 'in_stock', coalesce($4::numeric, $5::numeric), now())
          on conflict (imei) do update set
            product_id = excluded.product_id,
            location = excluded.location,
            status = 'in_stock',
-           cost = coalesce(inv_phone_units.cost, excluded.cost),
+           cost = coalesce($4::numeric, inv_phone_units.cost, $5::numeric),
            received_at = coalesce(inv_phone_units.received_at, excluded.received_at),
            sold_at = null, sold_source_type = null, sold_source_id = null,
            updated_at = now()`,
-        [imei, productId, location, unitCost ?? null],
+        [imei, productId, location, unitCost, productCost],
       );
     }
   } else if (op === "set" && requiresImei) {
@@ -248,15 +317,15 @@ async function applyOne(client, item, origin) {
          on conflict (imei) do update set
            product_id = excluded.product_id, location = excluded.location, status = 'in_stock',
            cost = coalesce(inv_phone_units.cost, excluded.cost), updated_at = now()`,
-        [imei, productId, location, unitCost ?? null],
+        [imei, productId, location, unitCost ?? productCost],
       );
     }
   }
 
-  if (shortQty || missingImeis.length) {
+  if (shortQty || missingImeis.length || costTotal !== null) {
     await client.query(
-      "update inv_movements set short_qty = $2, missing_imeis = $3 where id = $1",
-      [movement.id, shortQty, missingImeis],
+      "update inv_movements set short_qty = $2, missing_imeis = $3, cost_total = $4 where id = $1",
+      [movement.id, shortQty, missingImeis, costTotal],
     );
   }
   return { id: movement.id, skipped: false, shortQty, missingImeis, otherProducts };
@@ -340,6 +409,81 @@ async function applyMovementsPg(pool, items, { schema = "public", origin = "regi
   });
 }
 
+// What one product has at each store right now, from the official stock.
+async function availableStock(pool, productId, schema = "public") {
+  return inTransaction(pool, schema, async (client) => (await stockOf(client, [productId])).get(productId));
+}
+
+// Stock on hand at cost: phones at the cost of each handset, counted items at
+// their average cost. Units with no cost known are counted apart.
+async function stockValue(pool, schema = "public") {
+  return inTransaction(pool, schema, async (client) => {
+    const phones = await client.query(
+      `select product_id, location, count(*)::int as units, coalesce(sum(cost), 0) as value,
+              count(*) filter (where cost is null)::int as no_cost
+       from inv_phone_units where status = 'in_stock' group by product_id, location`,
+    );
+    const counted = await client.query(
+      `select l.product_id, l.location, l.quantity as units, a.avg_cost
+       from inv_stock_levels l left join inv_avg_cost a using (product_id)
+       where l.quantity > 0`,
+    );
+    const rows = [
+      ...phones.rows.map((row) => ({
+        productId: row.product_id,
+        location: row.location,
+        units: Number(row.units),
+        value: Math.round(Number(row.value) * 100) / 100,
+        unitsWithoutCost: Number(row.no_cost),
+        method: "each",
+      })),
+      ...counted.rows.map((row) => {
+        const average = row.avg_cost === null ? null : Number(row.avg_cost);
+        return {
+          productId: row.product_id,
+          location: row.location,
+          units: Number(row.units),
+          value: average === null ? 0 : Math.round(average * Number(row.units) * 100) / 100,
+          unitsWithoutCost: average === null ? Number(row.units) : 0,
+          averageCost: average === null ? null : Math.round(average * 100) / 100,
+          method: "average",
+        };
+      }),
+    ];
+    return rows;
+  });
+}
+
+// What the stock sold in each sale and phone order cost, with the sale's own
+// record so its price can sit beside the cost.
+async function saleCosts(pool, { from, to }, schema = "public") {
+  return inTransaction(pool, schema, async (client) => {
+    const result = await client.query(
+      `select m.source_type, m.source_id, min(m.applied_at) as at,
+              sum(m.cost_total) as cost, bool_or(m.cost_total is null and m.short_qty = 0) as missing_cost,
+              (array_agg(r.data))[1] as record
+       from inv_movements m
+       left join records r
+         on r.collection = case m.source_type when 'sale' then 'reports' else 'phoneOrders' end
+        and r.id = m.source_id
+       where m.source_type in ('sale', 'order') and m.op in ('removeQty', 'removeImeis')
+         and m.applied_at >= $1::timestamptz and m.applied_at < $2::timestamptz
+       group by m.source_type, m.source_id
+       order by at desc
+       limit 1000`,
+      [from, to],
+    );
+    return result.rows.map((row) => ({
+      sourceType: row.source_type,
+      sourceId: row.source_id,
+      at: row.at instanceof Date ? row.at.toISOString() : row.at,
+      cost: row.cost === null ? null : Math.round(Number(row.cost) * 100) / 100,
+      missingCost: Boolean(row.missing_cost),
+      record: row.record || null,
+    }));
+  });
+}
+
 async function readInventory(pool, schema = "public") {
   return inTransaction(pool, schema, async (client) => {
     const levels = await client.query("select product_id, location, quantity from inv_stock_levels");
@@ -394,6 +538,10 @@ function compareInventory(products, { levels, units }) {
 module.exports = {
   applyMovementsPg,
   buildSeed,
+  ensureAverageCosts,
+  stockValue,
+  saleCosts,
+  availableStock,
   commitOfficialStock,
   stockFieldsFor,
   compareInventory,

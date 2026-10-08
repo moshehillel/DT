@@ -32,13 +32,17 @@ const {
   shouldImportCall,
 } = require("./telebroad");
 const { extractShopifyImei } = require("./shopify");
-const { applyStockMovement, normalizeMovement } = require("./inventory");
+const { applyStockMovement, normalizeMovement, stockMapOf } = require("./inventory");
 const { requireEmployee } = require("./auth");
 const { defineSecret } = require("firebase-functions/params");
 const { Pool } = require("pg");
 const { runMirror } = require("./pgMirrorJob");
 const {
   applyMovementsPg,
+  availableStock,
+  ensureAverageCosts,
+  saleCosts,
+  stockValue,
   commitOfficialStock,
   stockFieldsFor,
   compareInventory,
@@ -675,12 +679,23 @@ function pgPool() {
   return sharedPgPool;
 }
 
+let stockReady = null;
+function readyStockPool() {
+  if (!stockReady) {
+    stockReady = ensureInventorySchema(pgPool()).catch((error) => {
+      stockReady = null;
+      throw error;
+    });
+  }
+  return stockReady.then(() => pgPool());
+}
+
 // Firestore is still the official stock. A failure here never touches the sale;
 // the nightly stock check reports any difference it leaves.
 async function shadowStockToPostgres(appliedMovements) {
   if (!appliedMovements.length) return;
   try {
-    const pool = pgPool();
+    const pool = await readyStockPool();
     if (!(await isSeeded(pool))) return;
     const results = await applyMovementsPg(pool, appliedMovements);
     const flagged = results.filter((entry) => entry.shortQty || entry.missingImeis?.length);
@@ -755,6 +770,7 @@ async function commitStockMovements(movements, { pgPending = false } = {}) {
         shortQty: result.shortQty || 0,
         missingImeis: result.missingImeis || [],
         appliedAt: new Date().toISOString(),
+        ...(movement.unitCost !== null && movement.unitCost !== undefined ? { unitCost: movement.unitCost } : {}),
         ...(pgPending ? { pgPending: true } : {}),
       });
       for (const location of result.locations) {
@@ -777,10 +793,7 @@ async function commitStockMovements(movements, { pgPending = false } = {}) {
     return {
       applied: applied.length,
       skipped: normalized.length - applied.length,
-      appliedMovements: applied.map(({ movement }) => {
-        const product = productSnaps.get(movement.productId).data() || {};
-        return { movement, requiresImei: Boolean(product.requiresImei), unitCost: costOf(product) };
-      }),
+      appliedMovements: applied.map(({ movement }) => movementItem(movement, productSnaps.get(movement.productId).data() || {})),
     };
   });
 }
@@ -800,7 +813,12 @@ async function dataPaths() {
 }
 
 function movementItem(movement, product) {
-  return { movement, requiresImei: Boolean(product?.requiresImei), unitCost: costOf(product) };
+  return {
+    movement,
+    requiresImei: Boolean(product?.requiresImei),
+    unitCost: movement.unitCost ?? null,
+    productCost: costOf(product),
+  };
 }
 
 async function readProducts(ids) {
@@ -832,6 +850,7 @@ async function commitStockViaPostgres(movements) {
       imeis: entry.imeis || [],
       sourceType: entry.sourceType || "",
       sourceId: entry.sourceId || "",
+      unitCost: entry.unitCost ?? null,
     }));
   if (!normalized.length && !pending.length) return { applied: 0, skipped: 0 };
 
@@ -846,7 +865,7 @@ async function commitStockViaPostgres(movements) {
     ...pending.map((movement) => movementItem(movement, products.get(movement.productId)?.data())),
     ...normalized.map((movement) => movementItem(movement, products.get(movement.productId).data())),
   ];
-  const { results, versions, stock } = await commitOfficialStock(pgPool(), items);
+  const { results, versions, stock } = await commitOfficialStock(await readyStockPool(), items);
   const extra = await readProducts([...versions.keys()].filter((id) => !products.has(id)));
   for (const [id, snap] of extra) products.set(id, snap);
 
@@ -893,6 +912,7 @@ async function commitStockViaPostgres(movements) {
         shortQty: result.shortQty || 0,
         missingImeis: result.missingImeis || [],
         appliedAt: now,
+        ...(movement.unitCost !== null && movement.unitCost !== undefined ? { unitCost: movement.unitCost } : {}),
         official: "postgres",
       });
     });
@@ -907,6 +927,141 @@ exports.postStockMovements = onCall({ region: REGION, secrets: [PLANETSCALE_URL]
   if (!Array.isArray(movements) || !movements.length) {
     throw new HttpsError("invalid-argument", "Nothing to update.");
   }
+  return applyStockChange(movements);
+});
+
+const TRANSFER_ID_PATTERN = /^[A-Za-z0-9-]{8,80}$/;
+
+// Moving stock from one store to another in one step. What the first store
+// has is checked against the official stock before anything moves.
+exports.transferStock = onCall({ region: REGION, secrets: [PLANETSCALE_URL] }, async (request) => {
+  if (!request.auth) throw new HttpsError("unauthenticated", "Sign in required.");
+  const input = request.data || {};
+  const transferId = String(input.transferId || "");
+  const productId = String(input.productId || "").trim();
+  const from = String(input.from || "").trim();
+  const to = String(input.to || "").trim();
+  if (!TRANSFER_ID_PATTERN.test(transferId)) throw new HttpsError("invalid-argument", "Transfer id is not valid.");
+  if (!productId) throw new HttpsError("invalid-argument", "Pick an item to move.");
+  if (!from || !to) throw new HttpsError("invalid-argument", "Pick both stores.");
+  if (from === to) throw new HttpsError("invalid-argument", "The two stores are the same.");
+
+  const transferRef = db.collection("stockTransfers").doc(transferId);
+  const earlier = await transferRef.get();
+  if (earlier.exists) return { transferId, repeated: true };
+
+  const productSnap = await db.collection("products").doc(productId).get();
+  if (!productSnap.exists) throw new HttpsError("failed-precondition", "That product is not in inventory yet.");
+  const product = productSnap.data() || {};
+  const requiresImei = Boolean(product.requiresImei);
+  const qty = Math.max(0, Math.round(Number(input.qty) || 0));
+  const imeis = [...new Set((input.imeis || []).map((value) => String(value || "").replace(/\D/g, "")).filter(Boolean))];
+  if (requiresImei ? !imeis.length : !qty) throw new HttpsError("invalid-argument", "Nothing to move.");
+
+  let atFrom;
+  if ((await dataPaths()).stock === "postgres") {
+    const official = await availableStock(await readyStockPool(), productId).catch(() => null);
+    if (official) atFrom = requiresImei ? official.imeis[from] || [] : official.levels[from] || 0;
+  }
+  if (atFrom === undefined) {
+    const entry = stockMapOf(product)[from] || { quantity: 0, imeis: [] };
+    atFrom = requiresImei ? entry.imeis || [] : Number(entry.quantity) || 0;
+  }
+  if (requiresImei) {
+    const missing = imeis.filter((imei) => !atFrom.includes(imei));
+    if (missing.length) throw new HttpsError("failed-precondition", `Not at ${from}: ${missing.join(", ")}.`);
+  } else if (qty > atFrom) {
+    throw new HttpsError("failed-precondition", `${from} only has ${atFrom}.`);
+  }
+
+  const base = { productId, sourceType: "transfer", sourceId: transferId };
+  // A phone moving in is taken off every other store, so one movement moves it.
+  const movements = requiresImei
+    ? [{ ...base, id: `transfer:${transferId}:in`, location: to, op: "addImeis", imeis }]
+    : [
+      { ...base, id: `transfer:${transferId}:out`, location: from, op: "removeQty", qty },
+      { ...base, id: `transfer:${transferId}:in`, location: to, op: "addQty", qty },
+    ];
+  await applyStockChange(movements);
+
+  const record = {
+    id: transferId,
+    productId,
+    productName: String(product.name || ""),
+    sku: String(product.sku || ""),
+    from,
+    to,
+    qty: requiresImei ? imeis.length : qty,
+    imeis,
+    by: String(input.by || "").slice(0, 120),
+    byUid: request.auth.uid,
+    createdAt: new Date().toISOString(),
+  };
+  await transferRef.set(record);
+  readyStockPool()
+    .then((pool) => pool.query(
+      `insert into inv_transfers (id, from_location, to_location, created_by, lines)
+       values ($1, $2, $3, $4, $5::jsonb) on conflict (id) do nothing`,
+      [transferId, from, to, record.by || request.auth.uid, JSON.stringify([{ productId, qty: record.qty, imeis }])],
+    ))
+    .catch((error) => logger.error("Transfer not recorded in PostgreSQL", { transferId, error: error.message || String(error) }));
+  return { transferId };
+});
+
+function isAdminRequest(request) {
+  const token = request.auth?.token || {};
+  return token.role === "admin" || token.admin === true;
+}
+
+// Admin only: stock on hand at cost, and what the stock in each sale cost.
+exports.stockValueReport = onCall({ region: REGION, secrets: [PLANETSCALE_URL], timeoutSeconds: 120 }, async (request) => {
+  if (!request.auth) throw new HttpsError("unauthenticated", "Sign in required.");
+  if (!isAdminRequest(request)) throw new HttpsError("permission-denied", "Only an admin can see stock value.");
+  const to = request.data?.to ? new Date(request.data.to) : new Date();
+  const from = request.data?.from ? new Date(request.data.from) : new Date(to.getTime() - 30 * 24 * 60 * 60 * 1000);
+  if (Number.isNaN(from.getTime()) || Number.isNaN(to.getTime())) throw new HttpsError("invalid-argument", "Dates are not valid.");
+  let pool;
+  try {
+    pool = await readyStockPool();
+    await readyRecordPool();
+  } catch (error) {
+    throw new HttpsError("unavailable", "The database could not be reached. Try again in a minute.");
+  }
+  const [holdings, sales] = await Promise.all([
+    stockValue(pool),
+    saleCosts(pool, { from: from.toISOString(), to: to.toISOString() }),
+  ]);
+  const productIds = [...new Set(holdings.map((row) => row.productId))];
+  const names = new Map();
+  for (let index = 0; index < productIds.length; index += 300) {
+    const snaps = await db.getAll(...productIds.slice(index, index + 300).map((id) => db.collection("products").doc(id)));
+    snaps.forEach((snap) => names.set(snap.id, snap.exists ? { name: snap.data().name || "", sku: snap.data().sku || "" } : null));
+  }
+  return {
+    from: from.toISOString(),
+    to: to.toISOString(),
+    holdings: holdings
+      .filter((row) => names.get(row.productId))
+      .map((row) => ({ ...row, ...names.get(row.productId) })),
+    sales: sales.map((sale) => {
+      const record = sale.record || {};
+      const details = record.details || {};
+      const revenue = Number.parseFloat(details.subtotal ?? record.subtotal ?? record.paymentAmount ?? record.orderTotal);
+      return {
+        sourceType: sale.sourceType,
+        sourceId: sale.sourceId,
+        at: sale.at,
+        customer: String(record.customerName || details.customerName || ""),
+        location: String(record.location || details.location || ""),
+        revenue: Number.isFinite(revenue) ? Math.round(revenue * 100) / 100 : null,
+        cost: sale.cost,
+        missingCost: sale.missingCost,
+      };
+    }),
+  };
+});
+
+async function applyStockChange(movements) {
   try {
     if ((await dataPaths()).stock === "postgres") {
       try {
@@ -928,7 +1083,7 @@ exports.postStockMovements = onCall({ region: REGION, secrets: [PLANETSCALE_URL]
     logger.error("postStockMovements failed", error);
     throw new HttpsError("invalid-argument", error.message || "Stock update failed.");
   }
-});
+}
 
 exports.sendSaleReceiptSms = onCall({ region: REGION }, async (request) => {
   if (!request.auth) throw new HttpsError("unauthenticated", "Sign in required.");
@@ -2737,6 +2892,7 @@ async function runInventoryCheck() {
   if (!(await isSeeded(pool))) {
     seed = await seedInventory(pool, products);
   } else {
+    await ensureAverageCosts(pool, products);
     if ((await dataPaths()).stock === "postgres") await commitStockViaPostgres([]);
     const meta = await pool.query("select value from inv_meta where key = 'seeded'");
     const seededAt = meta.rows[0]?.value?.at || "1970-01-01T00:00:00.000Z";
@@ -2761,7 +2917,8 @@ async function runInventoryCheck() {
             sourceId: entry.sourceId || "",
           },
           requiresImei: Boolean(byId.get(entry.productId)?.requiresImei),
-          unitCost: costOf(byId.get(entry.productId)),
+          unitCost: entry.unitCost ?? null,
+          productCost: costOf(byId.get(entry.productId)),
         })), { origin: "replay" });
         replayed = missing.length;
       }

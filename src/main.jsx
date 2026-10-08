@@ -53,6 +53,7 @@ import {
   stampAuthMetadata,
   subscribeAuth,
   subscribeCloudStatus,
+  watchCollection,
 } from "./firebaseClient";
 import { refundToCard } from "./solaTerminal";
 import { chargeOnLocalTerminal } from "./bbposTerminal";
@@ -1799,6 +1800,7 @@ function Workspace({ currentUser, isAdmin }) {
             products={products}
             storeLocations={storeLocations}
             activeLocation={activeLocation}
+            activeEmployee={activeEmployee}
             sessionRole={sessionRole}
             onSaveProduct={saveProduct}
             onCommitStock={commitStockMovements}
@@ -6953,7 +6955,7 @@ function PosPage({ products, reports = [], storeLocations = [], activeEmployee, 
 
   // Add stock to a product straight from checkout (e.g. a scanned item that just
   // came in). Mirrors Inventory's restock so counts stay consistent.
-  function addStock(product, { addQuantity, newImeis, location, barcode }) {
+  function addStock(product, { addQuantity, newImeis, location, barcode, unitCost = null }) {
     if (!product) return;
     const store = location || activeLocation;
     if (barcode && !product.barcode && onSaveProduct) onSaveProduct({ ...product, barcode: String(barcode).trim() });
@@ -6968,6 +6970,7 @@ function PosPage({ products, reports = [], storeLocations = [], activeEmployee, 
       requiresImei: Boolean(product.requiresImei),
       sourceType: "restock",
       sourceId: movementId,
+      unitCost,
     }]);
     setMessage(`Restocked ${product.name} at ${store}.`);
   }
@@ -9067,6 +9070,7 @@ function RestockDialog({ product, storeLocations, activeLocation = "", products 
   // unique per handset, so there is nothing to generate and nothing to stick on.
   const needsBarcode = !product.barcode && !requiresImei;
   const [quantity, setQuantity] = useState("0");
+  const [unitCost, setUnitCost] = useState("");
   const [imeis, setImeis] = useState([]);
   const [location, setLocation] = useState(activeLocation || "");
   const [barcode, setBarcode] = useState(product.barcode || "");
@@ -9098,7 +9102,13 @@ function RestockDialog({ product, storeLocations, activeLocation = "", products 
       window.alert(`You are adding ${target} units but scanned ${imeis.length} IMEIs. Scan exactly ${target}.`);
       return;
     }
-    onAddStock({ addQuantity: target, newImeis: imeis, location, barcode: barcode.trim() });
+    const typedCost = unitCost.trim();
+    const cost = typedCost === "" ? null : Number(typedCost);
+    if (cost !== null && (!Number.isFinite(cost) || cost < 0)) {
+      window.alert("Cost each must be a number, or leave it blank.");
+      return;
+    }
+    onAddStock({ addQuantity: target, newImeis: imeis, location, barcode: barcode.trim(), unitCost: cost });
     onClose();
   }
 
@@ -9186,6 +9196,18 @@ function RestockDialog({ product, storeLocations, activeLocation = "", products 
               autoFocus={!needsBarcode}
             />
           </label>
+          <label className="field">
+            <span>Cost each (optional)</span>
+            <input
+              type="number"
+              min="0"
+              step="0.01"
+              value={unitCost}
+              onChange={(event) => setUnitCost(event.target.value)}
+              placeholder="What the shop paid per unit"
+            />
+            <small className="muted">Leave blank to use the item's usual cost.</small>
+          </label>
           {requiresImei ? (
             <ImeiLotCapture
               imeis={imeis}
@@ -9226,6 +9248,7 @@ function InventoryPage({
   products,
   storeLocations,
   activeLocation,
+  activeEmployee = "",
   sessionRole,
   onSaveProduct,
   onCommitStock,
@@ -9257,6 +9280,7 @@ function InventoryPage({
   const [stockTouched, setStockTouched] = useState(false);
   const [search, setSearch] = useState("");
   const [restock, setRestock] = useState(null);
+  const [transfer, setTransfer] = useState(null);
   const [selectedKey, setSelectedKey] = useState("");
 
   function updateField(name, value) {
@@ -9274,7 +9298,7 @@ function InventoryPage({
     });
   }
 
-  function addStock(product, { addQuantity, newImeis, location, barcode }) {
+  function addStock(product, { addQuantity, newImeis, location, barcode, unitCost = null }) {
     const store = location || activeLocation;
     if (barcode && !product.barcode) onSaveProduct({ ...product, barcode: String(barcode).trim() });
     const movementId = `restock:${crypto.randomUUID()}`;
@@ -9288,6 +9312,7 @@ function InventoryPage({
       requiresImei: Boolean(product.requiresImei),
       sourceType: "restock",
       sourceId: movementId,
+      unitCost,
     }]);
   }
 
@@ -9690,6 +9715,10 @@ function InventoryPage({
             setSelectedKey("");
             setRestock(product);
           }}
+          onTransfer={storeLocations.length > 1 ? (product) => {
+            setSelectedKey("");
+            setTransfer(product);
+          } : null}
           onEdit={editProduct}
           onDelete={canDelete ? onRemoveProduct : null}
         />
@@ -9706,7 +9735,176 @@ function InventoryPage({
           onAddStock={(payload) => addStock(restock, payload)}
         />
       ) : null}
+
+      {transfer ? (
+        <TransferDialog
+          product={products.find((item) => item.id === transfer.id) || transfer}
+          storeLocations={storeLocations}
+          activeLocation={activeLocation}
+          activeEmployee={activeEmployee}
+          onClose={() => setTransfer(null)}
+        />
+      ) : null}
+
+      <StockTransferHistory />
     </>
+  );
+}
+
+// Moving stock between stores in one step. The server checks the first store
+// really has it before anything moves, so this needs a connection.
+function TransferDialog({ product, storeLocations = [], activeLocation = "", activeEmployee = "", onClose }) {
+  const requiresImei = Boolean(product.requiresImei);
+  const [from, setFrom] = useState(activeLocation && storeLocations.includes(activeLocation) ? activeLocation : storeLocations[0] || "");
+  const [to, setTo] = useState("");
+  const [quantity, setQuantity] = useState("1");
+  const [picked, setPicked] = useState([]);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const transferIdRef = useRef(crypto.randomUUID());
+  const atFrom = storeStockEntry(product, from);
+
+  function togglePick(imei) {
+    setPicked((current) => (current.includes(imei) ? current.filter((value) => value !== imei) : [...current, imei]));
+  }
+
+  async function submit(event) {
+    event.preventDefault();
+    setError("");
+    if (!from || !to) return setError("Pick both stores.");
+    if (from === to) return setError("The two stores are the same.");
+    const qty = Number(quantity) || 0;
+    if (requiresImei ? !picked.length : qty <= 0) return setError(requiresImei ? "Pick the phones to move." : "Enter how many to move.");
+    if (!requiresImei && qty > (Number(atFrom.quantity) || 0)) return setError(`${from} only has ${atFrom.quantity}.`);
+    setBusy(true);
+    try {
+      await callFunction("transferStock", {
+        transferId: transferIdRef.current,
+        productId: product.id,
+        from,
+        to,
+        qty,
+        imeis: requiresImei ? picked : [],
+        by: activeEmployee,
+      });
+      onClose();
+    } catch (failure) {
+      setError(failure?.message || "The transfer did not go through. Check the connection and try again.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="dialog-backdrop" role="presentation">
+      <div className="dialog-card dialog-card-wide" role="dialog" aria-modal="true">
+        <div className="dialog-head">
+          <div>
+            <p className="eyebrow">Transfer stock</p>
+            <h3>{product.name}</h3>
+            <p className="muted">{from ? `At ${from}: ${atFrom.quantity}${requiresImei ? " IMEIs" : ""}` : ""}</p>
+          </div>
+          <DialogCloseButton onClose={onClose} label="Close transfer" />
+        </div>
+        <form className="form-grid dialog-form" onSubmit={submit}>
+          <label className="field">
+            <span>From store</span>
+            <select value={from} onChange={(event) => { setFrom(event.target.value); setPicked([]); }} required>
+              {storeLocations.map((store) => <option key={store}>{store}</option>)}
+            </select>
+          </label>
+          <label className="field">
+            <span>To store</span>
+            <select value={to} onChange={(event) => setTo(event.target.value)} required>
+              <option value="" disabled>Select a store…</option>
+              {storeLocations.filter((store) => store !== from).map((store) => <option key={store}>{store}</option>)}
+            </select>
+          </label>
+          {requiresImei ? (
+            <div className="field full">
+              <span>Phones to move ({picked.length} picked)</span>
+              {atFrom.imeis.length ? (
+                <div className="request-list">
+                  {atFrom.imeis.map((imei) => (
+                    <label className="field checkbox-field" key={imei}>
+                      <input type="checkbox" checked={picked.includes(imei)} onChange={() => togglePick(imei)} />
+                      <span>{imei}</span>
+                    </label>
+                  ))}
+                </div>
+              ) : (
+                <p className="muted">No phones at {from || "this store"}.</p>
+              )}
+            </div>
+          ) : (
+            <label className="field">
+              <span>Quantity to move</span>
+              <input type="number" min="1" value={quantity} onChange={(event) => setQuantity(event.target.value)} autoFocus />
+            </label>
+          )}
+          {error ? <p className="summary-error full">{error}</p> : null}
+          <div className="pos-form-actions">
+            <button className="primary-button" type="submit" disabled={busy}>{busy ? "Moving…" : "Move stock"}</button>
+            <button className="secondary-button" type="button" onClick={onClose}>Cancel</button>
+          </div>
+        </form>
+      </div>
+    </div>
+  );
+}
+
+// The latest moves between stores, newest first.
+function StockTransferHistory() {
+  const [transfers, setTransfers] = useState([]);
+  useEffect(() => watchCollection(
+    "stockTransfers",
+    (items) => setTransfers([...items].sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)))),
+    () => {},
+    { limitTo: 30, orderByField: "createdAt" },
+  ), []);
+
+  return (
+    <section className="history">
+      <div className="history-header">
+        <div>
+          <p className="eyebrow">Inventory</p>
+          <h2>Transfers between stores</h2>
+        </div>
+      </div>
+      {transfers.length ? (
+        <div className="table-wrap catalog-table">
+          <table>
+            <thead>
+              <tr>
+                <th>When</th>
+                <th>Item</th>
+                <th>From</th>
+                <th>To</th>
+                <th>Qty</th>
+                <th>By</th>
+              </tr>
+            </thead>
+            <tbody>
+              {transfers.map((entry) => (
+                <tr key={entry.id}>
+                  <td>{entry.createdAt ? new Date(entry.createdAt).toLocaleString() : ""}</td>
+                  <td>
+                    <strong>{entry.productName || entry.sku || entry.productId}</strong>
+                    {entry.imeis?.length ? <p className="muted">{entry.imeis.join(", ")}</p> : null}
+                  </td>
+                  <td>{entry.from}</td>
+                  <td>{entry.to}</td>
+                  <td>{entry.qty}</td>
+                  <td>{entry.by || ""}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      ) : (
+        <p className="empty-state">No transfers yet.</p>
+      )}
+    </section>
   );
 }
 
@@ -10072,7 +10270,7 @@ function EditRentalPhoneDialog({ phone, phones = [], storeLocations = [], onSave
 
 // Popup showing one item's stock per store plus each per-store variant, with
 // restock / edit / delete actions. Replaces the always-on inventory tables.
-function ItemDetailsDialog({ group, sessionRole, onClose, onRestock, onEdit, onDelete }) {
+function ItemDetailsDialog({ group, sessionRole, onClose, onRestock, onTransfer, onEdit, onDelete }) {
   const isAdmin = sessionRole === "admin";
   const subtitle = [group.sku ? `SKU ${group.sku}` : "", group.category || "", group.requiresImei ? "IMEI tracked" : ""]
     .filter(Boolean)
@@ -10149,6 +10347,11 @@ function ItemDetailsDialog({ group, sessionRole, onClose, onRestock, onEdit, onD
                   <button className="secondary-button compact-button" type="button" onClick={() => onRestock(product)}>
                     Restock
                   </button>
+                  {onTransfer ? (
+                    <button className="secondary-button compact-button" type="button" onClick={() => onTransfer(product)}>
+                      Transfer
+                    </button>
+                  ) : null}
                   <button className="secondary-button compact-button" type="button" onClick={() => onEdit(product)}>
                     Edit
                   </button>
@@ -10659,8 +10862,173 @@ function AdminPage({
         </div>
       </section>
 
+      <StockValueReport />
+
       <ReceiptNotesSettings receiptNotes={receiptNotes} onSave={onSaveReceiptNote} />
     </>
+  );
+}
+
+function isoDay(date) {
+  const local = new Date(date.getTime() - date.getTimezoneOffset() * 60000);
+  return local.toISOString().slice(0, 10);
+}
+
+// Admin only: what the stock on the shelves cost, and what the stock in each
+// sale cost against what it sold for (before tax). Phones count at the cost of
+// each handset, everything else at its average cost.
+function StockValueReport() {
+  const today = new Date();
+  const [from, setFrom] = useState(isoDay(new Date(today.getTime() - 30 * 24 * 60 * 60 * 1000)));
+  const [to, setTo] = useState(isoDay(today));
+  const [report, setReport] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+
+  async function load() {
+    setLoading(true);
+    setError("");
+    try {
+      const end = new Date(`${to}T00:00:00`);
+      end.setDate(end.getDate() + 1);
+      setReport(await callFunction("stockValueReport", {
+        from: new Date(`${from}T00:00:00`).toISOString(),
+        to: end.toISOString(),
+      }));
+    } catch (failure) {
+      setError(failure?.message || "Could not load the stock value.");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  const holdings = report?.holdings || [];
+  const sales = report?.sales || [];
+  const byStore = new Map();
+  for (const row of holdings) {
+    const entry = byStore.get(row.location) || { value: 0, units: 0, unitsWithoutCost: 0 };
+    entry.value += row.value;
+    entry.units += row.units;
+    entry.unitsWithoutCost += row.unitsWithoutCost;
+    byStore.set(row.location, entry);
+  }
+  const totalValue = holdings.reduce((sum, row) => sum + row.value, 0);
+  const withoutCost = holdings.reduce((sum, row) => sum + row.unitsWithoutCost, 0);
+  const priced = sales.filter((sale) => sale.revenue !== null && sale.cost !== null);
+  const revenue = priced.reduce((sum, sale) => sum + sale.revenue, 0);
+  const cost = priced.reduce((sum, sale) => sum + sale.cost, 0);
+
+  return (
+    <section className="workspace">
+      <div className="workspace-header">
+        <div>
+          <p className="eyebrow">Inventory</p>
+          <h2>Stock value and profit</h2>
+        </div>
+      </div>
+      <p className="muted">
+        Phones count at what each handset cost; other items at their average cost, which moves when stock is added
+        with a cost. Sales show the price before tax against the cost of the stock that went out.
+      </p>
+      <div className="form-grid">
+        <label className="field">
+          <span>Sales from</span>
+          <input type="date" value={from} onChange={(event) => setFrom(event.target.value)} />
+        </label>
+        <label className="field">
+          <span>Sales to</span>
+          <input type="date" value={to} onChange={(event) => setTo(event.target.value)} />
+        </label>
+        <div className="form-actions-row">
+          <button className="primary-button" type="button" onClick={load} disabled={loading}>
+            {loading ? "Loading…" : report ? "Refresh" : "Show stock value"}
+          </button>
+        </div>
+      </div>
+      {error ? <p className="summary-error">{error}</p> : null}
+      {report ? (
+        <>
+          <div className="summary-strip">
+            <span className="metric">Stock at cost <strong>{formatMoney(totalValue)}</strong></span>
+            {[...byStore.entries()].map(([store, entry]) => (
+              <span className="metric" key={store}>{store} <strong>{formatMoney(entry.value)}</strong></span>
+            ))}
+            {withoutCost ? <span className="metric">Units with no cost <strong>{withoutCost}</strong></span> : null}
+          </div>
+          <div className="table-wrap catalog-table">
+            <table>
+              <thead>
+                <tr>
+                  <th>Item</th>
+                  <th>Store</th>
+                  <th>Units</th>
+                  <th>Cost basis</th>
+                  <th>Value</th>
+                </tr>
+              </thead>
+              <tbody>
+                {holdings.length ? [...holdings]
+                  .sort((a, b) => b.value - a.value)
+                  .map((row) => (
+                    <tr key={`${row.productId}-${row.location}`}>
+                      <td><strong>{row.name}</strong>{row.sku ? <p className="muted">SKU {row.sku}</p> : null}</td>
+                      <td>{row.location}</td>
+                      <td>{row.units}</td>
+                      <td>
+                        {row.method === "each" ? "Each handset" : row.averageCost === null ? "No cost" : `Average ${formatMoney(row.averageCost)}`}
+                        {row.unitsWithoutCost && row.method === "each" ? <p className="muted">{row.unitsWithoutCost} with no cost</p> : null}
+                      </td>
+                      <td>{formatMoney(row.value)}</td>
+                    </tr>
+                  )) : (
+                  <tr><td colSpan={5} className="empty-state">No stock on hand.</td></tr>
+                )}
+              </tbody>
+            </table>
+          </div>
+
+          <div className="summary-strip">
+            <span className="metric">Sold (before tax) <strong>{formatMoney(revenue)}</strong></span>
+            <span className="metric">Cost of stock sold <strong>{formatMoney(cost)}</strong></span>
+            <span className="metric">Gross profit <strong>{formatMoney(revenue - cost)}</strong></span>
+          </div>
+          <div className="table-wrap catalog-table">
+            <table>
+              <thead>
+                <tr>
+                  <th>When</th>
+                  <th>Sale</th>
+                  <th>Store</th>
+                  <th>Sold for</th>
+                  <th>Cost</th>
+                  <th>Profit</th>
+                </tr>
+              </thead>
+              <tbody>
+                {sales.length ? sales.map((sale) => (
+                  <tr key={`${sale.sourceType}-${sale.sourceId}`}>
+                    <td>{sale.at ? new Date(sale.at).toLocaleString() : ""}</td>
+                    <td>
+                      {sale.sourceType === "order" ? "Phone order" : "Sale"}
+                      {sale.customer ? <p className="muted">{sale.customer}</p> : null}
+                    </td>
+                    <td>{sale.location}</td>
+                    <td>{sale.revenue === null ? "—" : formatMoney(sale.revenue)}</td>
+                    <td>
+                      {sale.cost === null ? "—" : formatMoney(sale.cost)}
+                      {sale.missingCost ? <p className="muted">Some items have no cost</p> : null}
+                    </td>
+                    <td>{sale.revenue === null || sale.cost === null ? "—" : formatMoney(sale.revenue - sale.cost)}</td>
+                  </tr>
+                )) : (
+                  <tr><td colSpan={6} className="empty-state">No sales with stock in these dates.</td></tr>
+                )}
+              </tbody>
+            </table>
+          </div>
+        </>
+      ) : null}
+    </section>
   );
 }
 

@@ -122,6 +122,12 @@ service cloud.firestore {
       allow read, update, delete: if isAdmin();
     }
 
+    // Moves between stores. Only transferStock writes them.
+    match /stockTransfers/{transferId} {
+      allow read: if signedIn();
+      allow write: if false;
+    }
+
     // Which parts of the app save through PostgreSQL. Changed only from the
     // server or the console.
     match /system/{docId} {

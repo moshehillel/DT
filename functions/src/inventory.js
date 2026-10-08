@@ -42,7 +42,12 @@ function normalizeMovement(raw) {
   const imeis = cleanImeis(raw?.imeis);
   if ((op === "removeQty" || op === "addQty") && qty <= 0) return null;
   if ((op === "removeImeis" || op === "addImeis") && !imeis.length) return null;
+  const cost = Number.parseFloat(raw?.unitCost);
+  const unitCost = raw?.unitCost !== undefined && raw?.unitCost !== null && raw?.unitCost !== "" && Number.isFinite(cost) && cost >= 0
+    ? Math.round(cost * 100) / 100
+    : null;
   return {
+    unitCost,
     id,
     productId,
     location,
