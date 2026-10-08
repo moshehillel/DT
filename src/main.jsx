@@ -13242,8 +13242,22 @@ class ErrorBoundary extends React.Component {
   }
 }
 
+function MaintenanceFeeNotice() {
+  return (
+    <a
+      className="maintenance-fee-notice"
+      href="https://buy.stripe.com/eVq5kE5qZcRY5fsfA7fbq05"
+      target="_blank"
+      rel="noopener noreferrer"
+    >
+      Click here to set up the monthly maintenance fee to avoid system interruption
+    </a>
+  );
+}
+
 createRoot(document.getElementById("root")).render(
   <React.StrictMode>
+    <MaintenanceFeeNotice />
     <ErrorBoundary>
       <App />
     </ErrorBoundary>
