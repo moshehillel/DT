@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { addDays, inclusiveDays, isIsoDate } from "../src/dates.js";
+import { addDays, inclusiveDays, isIsoDate, zonedTimeToUtc } from "../src/dates.js";
 import { DIAMANT_RENTAL_PRICE_BOOK, quoteRental, rcukSimEntry, rentalLateFee, returnDueDate } from "../src/rental.js";
 import { canTransition, legacyStatusToWorkOrderStatus, parseRepairPrice, readyNotificationPlan, repairTotals } from "../src/repair.js";
 import { applyToBalance, assertUnitTransition, imeiChecksumOk, normalizeImei, planTransfer, StockRuleError } from "../src/stock.js";
@@ -11,6 +11,10 @@ describe("dates", () => {
     expect(inclusiveDays("2026-03-07", "2026-03-09")).toBe(3);
     expect(addDays("2026-11-01", 1)).toBe("2026-11-02");
     expect(isIsoDate("2026-02-30")).toBe(false);
+  });
+  it("converts store wall-clock time to UTC across DST", () => {
+    expect(zonedTimeToUtc("2026-07-01", 10, 0, "America/New_York").toISOString()).toBe("2026-07-01T14:00:00.000Z");
+    expect(zonedTimeToUtc("2026-12-01", 10, 0, "America/New_York").toISOString()).toBe("2026-12-01T15:00:00.000Z");
   });
 });
 
