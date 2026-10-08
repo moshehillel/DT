@@ -38,6 +38,17 @@ const { defineSecret } = require("firebase-functions/params");
 const { Pool } = require("pg");
 const { runMirror } = require("./pgMirrorJob");
 const {
+  applyMovementsPg,
+  compareInventory,
+  costOf,
+  ensureInventorySchema,
+  isSeeded,
+  readInventory,
+  seedInventory,
+} = require("./inventoryPg");
+
+const PLANETSCALE_URL = defineSecret("PLANETSCALE_URL");
+const {
   chargedOnCard,
   interpretRefundReply,
   money,
@@ -644,6 +655,38 @@ async function sendCustomerNotification({ to, method, body, voiceBody = "", voic
 
 // Texts a sale receipt to the customer. Plain text only: the body carries the
 // receipt number and the same figures that print on paper, never an image.
+let sharedPgPool = null;
+function pgPool() {
+  if (!sharedPgPool) {
+    sharedPgPool = new Pool({
+      connectionString: PLANETSCALE_URL.value(),
+      ssl: { rejectUnauthorized: true },
+      max: 3,
+      idleTimeoutMillis: 30000,
+    });
+    sharedPgPool.on("error", (error) => logger.error("PostgreSQL pool error", error));
+  }
+  return sharedPgPool;
+}
+
+// Firestore is still the official stock. A failure here never touches the sale;
+// the nightly stock check reports any difference it leaves.
+async function shadowStockToPostgres(appliedMovements) {
+  if (!appliedMovements.length) return;
+  try {
+    const pool = pgPool();
+    if (!(await isSeeded(pool))) return;
+    const results = await applyMovementsPg(pool, appliedMovements);
+    const flagged = results.filter((entry) => entry.shortQty || entry.missingImeis?.length);
+    if (flagged.length) logger.warn("PostgreSQL stock: shortfalls recorded", flagged);
+  } catch (error) {
+    logger.error("PostgreSQL stock shadow failed", {
+      ids: appliedMovements.map((entry) => entry.movement.id),
+      error: error.message || String(error),
+    });
+  }
+}
+
 function inventoryBalanceId(productId, location) {
   return `${productId}__${crypto.createHash("sha256").update(String(location)).digest("hex").slice(0, 16)}`;
 }
@@ -724,18 +767,27 @@ async function commitStockMovements(movements) {
         updatedAt: new Date().toISOString(),
       });
     }
-    return { applied: applied.length, skipped: normalized.length - applied.length };
+    return {
+      applied: applied.length,
+      skipped: normalized.length - applied.length,
+      appliedMovements: applied.map(({ movement }) => {
+        const product = productSnaps.get(movement.productId).data() || {};
+        return { movement, requiresImei: Boolean(product.requiresImei), unitCost: costOf(product) };
+      }),
+    };
   });
 }
 
-exports.postStockMovements = onCall({ region: REGION }, async (request) => {
+exports.postStockMovements = onCall({ region: REGION, secrets: [PLANETSCALE_URL] }, async (request) => {
   if (!request.auth) throw new HttpsError("unauthenticated", "Sign in required.");
   const movements = request.data?.movements;
   if (!Array.isArray(movements) || !movements.length) {
     throw new HttpsError("invalid-argument", "Nothing to update.");
   }
   try {
-    return await commitStockMovements(movements);
+    const { appliedMovements = [], ...result } = await commitStockMovements(movements);
+    await shadowStockToPostgres(appliedMovements);
+    return result;
   } catch (error) {
     if (error instanceof HttpsError) throw error;
     logger.error("postStockMovements failed", error);
@@ -2489,8 +2541,6 @@ exports.scheduleRentalNumberChase = onDocumentCreated(
 // The chase itself. A minute is the finest schedule Cloud Scheduler offers, so
 // the 30s/60s/60s ladder is "as soon after that as the sweep comes round" — the
 // job's own nextAttemptAt is what decides, not the sweep's cadence.
-const PLANETSCALE_URL = defineSecret("PLANETSCALE_URL");
-
 // Nightly copy of every Firestore collection into PostgreSQL, then a check
 // that the copy matches. Firestore is only read.
 exports.mirrorToPostgres = onSchedule(
@@ -2536,6 +2586,108 @@ exports.mirrorToPostgres = onSchedule(
       throw error;
     } finally {
       await pool.end().catch(() => {});
+    }
+  },
+);
+
+async function runInventoryCheck() {
+  const pool = pgPool();
+  await ensureInventorySchema(pool);
+  const productsSnap = await db.collection("products").get();
+  const products = productsSnap.docs.map((doc) => ({ ...doc.data(), id: doc.id }));
+  const byId = new Map(products.map((product) => [product.id, product]));
+
+  let seed = null;
+  let replayed = 0;
+  if (!(await isSeeded(pool))) {
+    seed = await seedInventory(pool, products);
+  } else {
+    const meta = await pool.query("select value from inv_meta where key = 'seeded'");
+    const since = meta.rows[0]?.value?.at || "1970-01-01T00:00:00.000Z";
+    const ledger = await db.collection("stockMovements").where("appliedAt", ">=", since).get();
+    const entries = ledger.docs.map((doc) => doc.data()).sort((a, b) => String(a.appliedAt).localeCompare(String(b.appliedAt)));
+    if (entries.length) {
+      const known = await pool.query("select id from inv_movements where id = any($1::text[])", [entries.map((entry) => entry.id)]);
+      const have = new Set(known.rows.map((row) => row.id));
+      const missing = entries.filter((entry) => !have.has(entry.id));
+      if (missing.length) {
+        await applyMovementsPg(pool, missing.map((entry) => ({
+          movement: {
+            id: entry.id,
+            productId: entry.productId,
+            location: entry.location,
+            op: entry.op,
+            qty: Number(entry.qty) || 0,
+            imeis: entry.imeis || [],
+            sourceType: entry.sourceType || "",
+            sourceId: entry.sourceId || "",
+          },
+          requiresImei: Boolean(byId.get(entry.productId)?.requiresImei),
+          unitCost: costOf(byId.get(entry.productId)),
+        })), { origin: "replay" });
+        replayed = missing.length;
+      }
+    }
+  }
+
+  const differences = compareInventory(products, await readInventory(pool));
+  const summary = {
+    at: new Date().toISOString(),
+    products: products.length,
+    seeded: seed,
+    replayed,
+    differences: differences.slice(0, 100),
+    differenceCount: differences.length,
+  };
+  await pool.query(
+    `insert into inv_meta (key, value) values ('last_check', $1)
+     on conflict (key) do update set value = excluded.value, updated_at = now()`,
+    [summary],
+  );
+  return summary;
+}
+
+// Nightly: fill PostgreSQL stock the first time, replay any movement it missed,
+// then compare every product and store with Firestore.
+exports.checkInventoryPostgres = onSchedule(
+  {
+    region: REGION,
+    schedule: "every day 03:30",
+    timeZone: RENTAL_REMINDER_TIME_ZONE,
+    timeoutSeconds: 540,
+    memory: "512MiB",
+    secrets: [PLANETSCALE_URL],
+  },
+  async () => {
+    const alertTo = process.env.ALERT_EMAIL || SMTP_USER;
+    try {
+      const summary = await runInventoryCheck();
+      if (summary.differenceCount) {
+        logger.error("PostgreSQL stock differs from Firestore", summary);
+        if (alertTo) {
+          await sendEmail({
+            to: alertTo,
+            subject: `Diamant Telecom: nightly stock check found ${summary.differenceCount} difference(s)`,
+            body: [
+              "Stock in PostgreSQL does not match Firestore for these products.",
+              "Nothing in the shop was changed. Firestore is still the official stock.",
+              "",
+              JSON.stringify(summary.differences, null, 2),
+            ].join("\n"),
+          });
+        }
+      } else {
+        logger.info("PostgreSQL stock matches Firestore", { products: summary.products, replayed: summary.replayed, seeded: Boolean(summary.seeded) });
+      }
+    } catch (error) {
+      if (alertTo) {
+        await sendEmail({
+          to: alertTo,
+          subject: "Diamant Telecom: nightly stock check failed",
+          body: `The nightly stock check stopped with an error. Nothing in the shop was changed.\n\n${error.message || error}`,
+        }).catch(() => {});
+      }
+      throw error;
     }
   },
 );

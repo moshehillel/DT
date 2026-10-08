@@ -155,6 +155,7 @@ function planStockCommit(productsById, appliedIds, movements) {
 }
 
 module.exports = {
+  stockMapOf,
   applyStockMovement,
   normalizeMovement,
   planStockCommit,
