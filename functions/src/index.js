@@ -34,6 +34,9 @@ const {
 const { extractShopifyImei } = require("./shopify");
 const { applyStockMovement, normalizeMovement } = require("./inventory");
 const { requireEmployee } = require("./auth");
+const { defineSecret } = require("firebase-functions/params");
+const { Pool } = require("pg");
+const { runMirror } = require("./pgMirrorJob");
 const {
   chargedOnCard,
   interpretRefundReply,
@@ -2486,6 +2489,57 @@ exports.scheduleRentalNumberChase = onDocumentCreated(
 // The chase itself. A minute is the finest schedule Cloud Scheduler offers, so
 // the 30s/60s/60s ladder is "as soon after that as the sweep comes round" — the
 // job's own nextAttemptAt is what decides, not the sweep's cadence.
+const PLANETSCALE_URL = defineSecret("PLANETSCALE_URL");
+
+// Nightly copy of every Firestore collection into PostgreSQL, then a check
+// that the copy matches. Firestore is only read.
+exports.mirrorToPostgres = onSchedule(
+  {
+    region: REGION,
+    schedule: "every day 03:00",
+    timeZone: RENTAL_REMINDER_TIME_ZONE,
+    timeoutSeconds: 540,
+    memory: "512MiB",
+    secrets: [PLANETSCALE_URL],
+  },
+  async () => {
+    const pool = new Pool({
+      connectionString: PLANETSCALE_URL.value(),
+      ssl: { rejectUnauthorized: true },
+      max: 2,
+    });
+    const alertTo = process.env.ALERT_EMAIL || SMTP_USER;
+    try {
+      const result = await runMirror({ db, pool, logger });
+      if (!result.ok && alertTo) {
+        await sendEmail({
+          to: alertTo,
+          subject: "Diamant Telecom: nightly database check found a difference",
+          body: [
+            "Last night's copy of Firestore into PostgreSQL did not match.",
+            "Nothing in the shop was changed. Firestore is still the official record.",
+            "",
+            JSON.stringify(result.problems, null, 2),
+            "",
+            `Check run #${result.runId} in the sync_runs table.`,
+          ].join("\n"),
+        });
+      }
+    } catch (error) {
+      if (alertTo) {
+        await sendEmail({
+          to: alertTo,
+          subject: "Diamant Telecom: nightly database copy failed",
+          body: `The nightly copy into PostgreSQL stopped with an error. Nothing in the shop was changed.\n\n${error.message || error}`,
+        }).catch(() => {});
+      }
+      throw error;
+    } finally {
+      await pool.end().catch(() => {});
+    }
+  },
+);
+
 exports.chaseRentalNumbers = onSchedule(
   {
     region: REGION,
