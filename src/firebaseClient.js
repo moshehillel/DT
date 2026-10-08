@@ -27,6 +27,16 @@ import {
 } from "firebase/firestore";
 import { getFunctions, httpsCallable } from "firebase/functions";
 import { normalizeFirestoreDoc } from "./utils";
+import {
+  allocateRepairTicketWithoutFirestore,
+  claimRepairTicketWithoutFirestore,
+  findCustomerByPhoneWithoutFirestore,
+  listCustomersPageWithoutFirestore,
+  notePostgresLive,
+  searchCustomersByPhonePrefixWithoutFirestore,
+  watchPostgresCollection,
+  watchPostgresDocument,
+} from "./postgresLive";
 
 let firebasePromise;
 // The resolved handles, kept so `currentAuthUid` below can answer without
@@ -101,6 +111,12 @@ function setCloudOnline(online) {
   if (cloudStatus.online === online) return;
   cloudStatus.online = online;
   cloudStatus.listeners.forEach((listener) => listener(online));
+}
+
+// The Postgres poller reports reachability the same way a server snapshot does.
+// Nothing calls this while the live flag is off.
+export function noteServerReachable(online) {
+  setCloudOnline(online === true);
 }
 
 function armConnectivityTimeout() {
@@ -284,6 +300,7 @@ function ownsRepairTicket(data, reportId) {
 // cannot even be read is reported as unconfirmed and the duplicate check in the
 // app stays in charge.
 export async function claimRepairTicket(ticketNumber, reportId) {
+  if (postgresLiveEnabled()) return claimRepairTicketWithoutFirestore(ticketNumber, reportId);
   const number = String(ticketNumber || "").trim();
   if (!number) return "unconfirmed";
 
@@ -343,6 +360,7 @@ export async function claimRepairTicket(ticketNumber, reportId) {
 // never deployed). The caller then falls back to the local guess, where the
 // after-the-fact claim and renumber remain the net they always were.
 export async function allocateRepairTicketNumber(startAt, { reportId = "", maxTries = 25 } = {}) {
+  if (postgresLiveEnabled()) return allocateRepairTicketWithoutFirestore(startAt, { reportId });
   let candidate = Number(startAt) || 0;
   if (!Number.isFinite(candidate) || candidate < 100001) candidate = 100001;
 
@@ -380,7 +398,7 @@ export async function allocateRepairTicketNumber(startAt, { reportId = "", maxTr
 // `options.limitTo` caps the live listener to the N most recent docs (ordered by
 // `options.orderByField`, default "createdAt", descending) so large collections
 // like notificationLogs don't re-read their whole history on every load.
-export function watchCollection(collectionName, onItems, onError, options = {}) {
+function watchCollectionFirestore(collectionName, onItems, onError, options = {}) {
   let unsubscribe = () => {};
   let cancelled = false;
   watchDataPaths();
@@ -415,7 +433,31 @@ export function watchCollection(collectionName, onItems, onError, options = {}) 
   };
 }
 
-export function watchAppStateDocument(documentId, fallback, onValue, onError) {
+// Firestore listeners stay in place until system/dataPaths.live is "postgres".
+// A missing field is off, and hearing that again does not restart the listener.
+export function watchCollection(collectionName, onItems, onError, options = {}) {
+  let stop = () => {};
+  let mode = "";
+  const apply = (live) => {
+    const next = live ? "pg" : "fs";
+    if (mode === next) return;
+    mode = next;
+    stop();
+    stop = next === "pg"
+      ? watchPostgresCollection(collectionName, onItems, onError, options)
+      : watchCollectionFirestore(collectionName, onItems, onError, options);
+  };
+  const unsub = subscribePostgresLive((live) => {
+    notePostgresLive(live);
+    apply(live);
+  });
+  return () => {
+    unsub();
+    stop();
+  };
+}
+
+function watchAppStateFirestore(documentId, fallback, onValue, onError) {
   let unsubscribe = () => {};
   let cancelled = false;
 
@@ -445,10 +487,51 @@ export function watchAppStateDocument(documentId, fallback, onValue, onError) {
   };
 }
 
+export function watchAppStateDocument(documentId, fallback, onValue, onError, options = {}) {
+  let stop = () => {};
+  let mode = "";
+  const apply = (live) => {
+    const next = live ? "pg" : "fs";
+    if (mode === next) return;
+    mode = next;
+    stop();
+    stop = next === "pg"
+      ? watchPostgresDocument(documentId, fallback, onValue, onError, options)
+      : watchAppStateFirestore(documentId, fallback, onValue, onError);
+  };
+  const unsub = subscribePostgresLive((live) => {
+    notePostgresLive(live);
+    apply(live);
+  });
+  return () => {
+    unsub();
+    stop();
+  };
+}
+
 // ---- Which parts of the app save through PostgreSQL ------------------------
 // `system/dataPaths` lists them. Until it is read (or if it can't be), every
 // save goes straight to Firestore, the way it always has.
 const dataPathState = { value: {}, started: false };
+const liveFlagListeners = new Set();
+
+// Off unless system/dataPaths.live is exactly "postgres". Unset means the
+// registers keep using Firestore for live updates, tickets, and card locks.
+export function postgresLiveEnabled() {
+  return dataPathState.value?.live === "postgres";
+}
+
+function publishLiveFlag() {
+  const on = postgresLiveEnabled();
+  liveFlagListeners.forEach((listener) => listener(on));
+}
+
+export function subscribePostgresLive(listener) {
+  watchDataPaths();
+  liveFlagListeners.add(listener);
+  listener(postgresLiveEnabled());
+  return () => liveFlagListeners.delete(listener);
+}
 
 function watchDataPaths() {
   if (dataPathState.started) return;
@@ -460,10 +543,12 @@ function watchDataPaths() {
         doc(db, "system", "dataPaths"),
         (snapshot) => {
           dataPathState.value = snapshot.exists() ? snapshot.data() || {} : {};
+          publishLiveFlag();
           replayRecordJournal();
         },
         () => {
           dataPathState.value = {};
+          publishLiveFlag();
           replayRecordJournal();
         },
       );
@@ -624,6 +709,7 @@ function toDoc(snap) {
 
 // Exact lookup by the local 10-digit number — tries phoneDigits then mobileDigits.
 export async function findCustomerByPhone(digits) {
+  if (postgresLiveEnabled()) return findCustomerByPhoneWithoutFirestore(digits);
   const clean = String(digits || "").trim();
   if (!clean) return null;
   await ensureFirebaseAuth();
@@ -638,6 +724,7 @@ export async function findCustomerByPhone(digits) {
 
 // Type-ahead: customers whose phoneDigits start with `prefix` (prefix match).
 export async function searchCustomersByPhonePrefix(prefix, max = 8) {
+  if (postgresLiveEnabled()) return searchCustomersByPhonePrefixWithoutFirestore(prefix, max);
   const clean = String(prefix || "").trim();
   if (!clean) return [];
   await ensureFirebaseAuth();
@@ -652,6 +739,7 @@ export async function searchCustomersByPhonePrefix(prefix, max = 8) {
 // CRM page: one page at a time. `search` (digits) does a phone-prefix query;
 // otherwise lists by name. `afterDoc` is the last doc from the previous page.
 export async function listCustomersPage({ pageSize = 25, afterId = "", search = "" } = {}) {
+  if (postgresLiveEnabled()) return listCustomersPageWithoutFirestore({ pageSize, afterId, search });
   await ensureFirebaseAuth();
   const { db } = await getFirebase();
   const customers = collection(db, "customers");
@@ -703,6 +791,12 @@ function readJournal() {
   } catch {
     return {};
   }
+}
+
+// Customer saves still waiting on this register. The Postgres lookup reads
+// them so an offline sale can find a customer that was just typed in here.
+export function pendingJournalEntries() {
+  return Object.values(readJournal());
 }
 
 function writeJournal(journal) {

@@ -54,6 +54,15 @@ const {
 } = require("./inventoryPg");
 const { ensureRecordSchema, recordFirestoreChange } = require("./recordStore");
 const { handleAdjustBalance, handleSaveRecords, runRecordsCheck } = require("./recordsApi");
+const {
+  handleAllocateRepairTicket,
+  handleClaimRepairTicket,
+  handleFindCustomers,
+  handlePollRecords,
+  liveEnabled,
+  reserveCardRefundPg,
+  settleCardRefundPg,
+} = require("./postgresCutover");
 
 const PLANETSCALE_URL = defineSecret("PLANETSCALE_URL");
 const {
@@ -810,6 +819,14 @@ async function dataPaths() {
     logger.warn("Could not read system/dataPaths", { error: error.message || String(error) });
   }
   return dataPathsCache.value;
+}
+
+async function postgresLiveNow() {
+  try {
+    return liveEnabled(await dataPaths());
+  } catch {
+    return false;
+  }
 }
 
 function movementItem(movement, product) {
@@ -1912,7 +1929,41 @@ async function reserveCardRefund({ refNum, refundId, amount, kind, reportId, by 
   });
 }
 
+// The Firestore transaction above stays the lock the shop uses. PostgreSQL
+// is asked only when system/dataPaths.live is "postgres", which it is not.
+// A ledger that already exists in Firestore is copied in the first time so
+// refunds already counted there are not counted again.
+async function reserveActiveCardRefund(input) {
+  if (!(await postgresLiveNow())) return reserveCardRefund(input);
+  const reports = await reportsChargedTo(input.refNum);
+  if (!reports.length) {
+    return { refuse: true, status: 404, message: "Can't find the original sale for this card, so it can't be refunded from here." };
+  }
+  const existing = await db.collection("cardRefunds").doc(String(input.refNum).replace(/\//g, "_")).get();
+  let refundedBefore = 0;
+  let seedEntries = {};
+  if (existing.exists) {
+    const data = existing.data() || {};
+    refundedBefore = Number(data.refundedBefore) || 0;
+    seedEntries = data.entries || {};
+  } else {
+    refundedBefore = refundedBeforeLedger(reports, await returnsOf(reports.map((report) => report.id)));
+  }
+  const report = reports.find((entry) => entry.id === input.reportId) || null;
+  return reserveCardRefundPg(await readyRecordPool(), {
+    ...input,
+    charged: chargedOnCard(reports),
+    refundedBefore,
+    seedEntries,
+    report,
+  });
+}
+
 async function settleCardRefund(ledgerRef, refundId, fields) {
+  if (ledgerRef?.postgres) {
+    await settleCardRefundPg(await readyRecordPool(), ledgerRef.refNum, refundId, fields);
+    return;
+  }
   const updates = [];
   for (const [key, value] of Object.entries(fields)) {
     updates.push(new admin.firestore.FieldPath("entries", refundId, key), value);
@@ -1958,7 +2009,7 @@ exports.solaRefund = onRequest(HTTP_OPTIONS, async (req, res) => {
 
   let reservation;
   try {
-    reservation = await reserveCardRefund({
+    reservation = await reserveActiveCardRefund({
       refNum: String(refNum),
       refundId,
       amount,
@@ -3016,6 +3067,44 @@ exports.adjustCustomerBalance = onCall(
     return handleAdjustBalance({ request, db, pool, HttpsError, logger });
   },
 );
+
+// Live changes, ticket numbers, and customer lookup without Firestore.
+// Each one returns immediately unless system/dataPaths.live is "postgres".
+function recordCallOptions() {
+  return { region: REGION, secrets: [PLANETSCALE_URL], timeoutSeconds: 60, memory: "512MiB" };
+}
+
+exports.pollRecordChanges = onCall(recordCallOptions(), async (request) => {
+  const live = await postgresLiveNow();
+  if (!live) return handlePollRecords({ request, pool: null, HttpsError, live: false });
+  const pool = await readyRecordPool().catch(() => null);
+  if (!pool) throw new HttpsError("unavailable", "The database could not be reached.");
+  return handlePollRecords({ request, pool, HttpsError, live: true });
+});
+
+exports.allocateRepairTicketPg = onCall(recordCallOptions(), async (request) => {
+  const live = await postgresLiveNow();
+  if (!live) return handleAllocateRepairTicket({ request, pool: null, HttpsError, live: false });
+  const pool = await readyRecordPool().catch(() => null);
+  if (!pool) return { number: null };
+  return handleAllocateRepairTicket({ request, pool, HttpsError, live: true });
+});
+
+exports.claimRepairTicketPg = onCall(recordCallOptions(), async (request) => {
+  const live = await postgresLiveNow();
+  if (!live) return handleClaimRepairTicket({ request, pool: null, HttpsError, live: false });
+  const pool = await readyRecordPool().catch(() => null);
+  if (!pool) return { status: "unconfirmed" };
+  return handleClaimRepairTicket({ request, pool, HttpsError, live: true });
+});
+
+exports.findCustomerRecords = onCall(recordCallOptions(), async (request) => {
+  const live = await postgresLiveNow();
+  if (!live) return handleFindCustomers({ request, pool: null, HttpsError, live: false });
+  const pool = await readyRecordPool().catch(() => null);
+  if (!pool) throw new HttpsError("unavailable", "The database could not be reached.");
+  return handleFindCustomers({ request, pool, HttpsError, live: true });
+});
 
 // Every Firestore write that did not come through saveRecords (webhooks,
 // scheduled jobs, a register still saving the old way) is copied into

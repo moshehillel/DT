@@ -290,7 +290,7 @@ export function useCloudCollectionState(collectionName, localKey, fallback, opti
       (error) => {
         logSyncError(`Firestore ${collectionName} sync failed`, error);
       },
-      options,
+      { ...options, cacheKey: localKey },
     );
   }, [collectionName, enabled]);
 
@@ -479,6 +479,7 @@ export function useCloudDocumentState(documentId, localKey, fallback, options = 
       (error) => {
         logSyncError(`Firestore appState/${documentId} sync failed`, error);
       },
+      { onCache: () => { cloudReadyRef.current = true; } },
     );
   }, [documentId]);
 
