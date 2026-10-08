@@ -1,0 +1,21 @@
+# Local development only. Postgres 17 with a non-owner login for the API.
+#   pnpm db:up && pnpm db:migrate && pnpm db:seed
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: pos
+    ports:
+      - "5432:5432"
+    volumes:
+      - pos-pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d pos"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  pos-pg:

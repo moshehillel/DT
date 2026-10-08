@@ -13,7 +13,7 @@ import { registerStock } from "./modules/stock.js";
 import { registerWebhooks } from "./modules/webhooks.js";
 import { registerWorkOrders } from "./modules/workOrders.js";
 
-const REQUEST_ID_RE = /^[A-Za-z0-9_\-]{8,64}$/;
+const REQUEST_ID_RE = /^[A-Za-z0-9_-]{8,64}$/;
 
 export function buildApp(deps: Deps, opts: { logger?: boolean } = {}): FastifyInstance {
   const app = Fastify({
