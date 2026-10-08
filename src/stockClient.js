@@ -1,7 +1,9 @@
-import { callFunction } from "./firebaseClient";
+import { REGISTER_CALL_TIMEOUT, callFunction } from "./firebaseClient";
 import { adjustStoreStock, setStoreStock } from "./utils";
 
 const QUEUE_KEY = "diamant-stock-movement-queue";
+// The server takes at most this many stock lines in one call.
+const MOVEMENTS_PER_CALL = 50;
 
 function readQueue() {
   try {
@@ -23,6 +25,11 @@ export function queueStockMovements(movements) {
     if (movement?.id) byId.set(movement.id, movement);
   }
   writeQueue([...byId.values()]);
+}
+
+function unqueueStockMovements(sent) {
+  const ids = new Set(sent.map((movement) => movement.id));
+  writeQueue(readQueue().filter((movement) => !ids.has(movement.id)));
 }
 
 // One movement per product on a sale, return, or phone order. The id is the
@@ -72,23 +79,43 @@ export function applyMovementLocal(product, movement) {
   return product;
 }
 
+function sendStockMovements(movements) {
+  return callFunction("postStockMovements", { movements }, REGISTER_CALL_TIMEOUT);
+}
+
+// The movements are in the queue before the server is asked, and leave it only
+// once it has answered. A page closed or reloaded while the server is still
+// waking up sends them again from the queue; the ids keep them from applying twice.
+const inFlight = new Set();
+
 export async function postStockMovements(movements) {
   const pending = (movements || []).filter((movement) => movement?.id && movement.productId && movement.location);
   if (!pending.length) return { applied: 0, skipped: 0 };
-  return callFunction("postStockMovements", { movements: pending });
+  queueStockMovements(pending);
+  pending.forEach((movement) => inFlight.add(movement));
+  try {
+    const result = await sendStockMovements(pending);
+    unqueueStockMovements(pending);
+    return result;
+  } finally {
+    pending.forEach((movement) => inFlight.delete(movement));
+  }
 }
 
 let retrying = false;
 
 export async function retryQueuedStockMovements() {
   if (retrying) return;
-  const queued = readQueue();
+  const sending = new Set([...inFlight].map((movement) => movement.id));
+  const queued = readQueue().filter((movement) => !sending.has(movement.id));
   if (!queued.length) return;
   retrying = true;
   try {
-    await postStockMovements(queued);
-    const still = readQueue().filter((movement) => !queued.some((sent) => sent.id === movement.id));
-    writeQueue(still);
+    for (let index = 0; index < queued.length; index += MOVEMENTS_PER_CALL) {
+      const chunk = queued.slice(index, index + MOVEMENTS_PER_CALL);
+      await sendStockMovements(chunk);
+      unqueueStockMovements(chunk);
+    }
   } catch {
     // Leave the queue. The same ids are safe to send again.
   } finally {

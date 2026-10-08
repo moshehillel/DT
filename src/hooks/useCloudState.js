@@ -68,8 +68,13 @@ function writeOutbox(key, outbox) {
   }
 }
 
-function outboxSize(outbox) {
-  return Object.keys(outbox.upserts).length + outbox.deletes.length;
+// Entries whose save is still on its way are on disk (so a reload replays them)
+// but are not counted as stuck until that save has actually failed.
+function outboxSize(outbox, inFlight) {
+  if (!inFlight) return Object.keys(outbox.upserts).length + outbox.deletes.length;
+  const upserts = Object.entries(outbox.upserts).filter(([id, item]) => inFlight.upserts.get(id) !== item).length;
+  const deletes = outbox.deletes.filter((id) => !inFlight.deletes.has(id)).length;
+  return upserts + deletes;
 }
 
 // A save through PostgreSQL reaches Firestore from the server, a moment after
@@ -128,6 +133,10 @@ export function useCloudCollectionState(collectionName, localKey, fallback, opti
   if (outboxRef.current === null) outboxRef.current = readOutbox(localKey);
   const flushingRef = useRef(false);
   const holdsRef = useRef(new Map());
+  // Changes handed to the server and not yet answered: id -> the item sent, and
+  // id -> how many removals of it are on their way.
+  const inFlightRef = useRef(null);
+  if (inFlightRef.current === null) inFlightRef.current = { upserts: new Map(), deletes: new Map() };
   const [pendingCount, setPendingCount] = useState(() => outboxSize(outboxRef.current));
 
   function holdSaved(where, changed, removed) {
@@ -144,7 +153,35 @@ export function useCloudCollectionState(collectionName, localKey, fallback, opti
 
   function persistOutbox() {
     writeOutbox(localKey, outboxRef.current);
-    setPendingCount(outboxSize(outboxRef.current));
+    setPendingCount(outboxSize(outboxRef.current, inFlightRef.current));
+  }
+
+  function markInFlight(changed, removed) {
+    const inFlight = inFlightRef.current;
+    changed.forEach((item) => { if (item?.id) inFlight.upserts.set(item.id, item); });
+    removed.forEach((id) => inFlight.deletes.set(id, (inFlight.deletes.get(id) || 0) + 1));
+  }
+
+  function releaseInFlight(changed, removed) {
+    const inFlight = inFlightRef.current;
+    changed.forEach((item) => {
+      if (item?.id && inFlight.upserts.get(item.id) === item) inFlight.upserts.delete(item.id);
+    });
+    removed.forEach((id) => {
+      const left = (inFlight.deletes.get(id) || 0) - 1;
+      if (left > 0) inFlight.deletes.set(id, left);
+      else inFlight.deletes.delete(id);
+    });
+  }
+
+  // The server confirmed these. Clear only what is still exactly what was
+  // sent; anything changed again since stays owed.
+  function clearConfirmed(changed, removed) {
+    const outbox = outboxRef.current;
+    changed.forEach((item) => {
+      if (item?.id && outbox.upserts[item.id] === item) delete outbox.upserts[item.id];
+    });
+    outbox.deletes = outbox.deletes.filter((id) => !removed.includes(id) || inFlightRef.current.deletes.has(id));
   }
 
   // Queue a change for replay. An id that is being deleted drops any pending
@@ -169,8 +206,10 @@ export function useCloudCollectionState(collectionName, localKey, fallback, opti
   async function flushOutbox() {
     if (flushingRef.current || !cloudReadyRef.current) return;
     const outbox = outboxRef.current;
-    const upserts = Object.values(outbox.upserts);
-    const deletes = [...outbox.deletes];
+    const inFlight = inFlightRef.current;
+    // A save already on its way is left to answer for itself.
+    const upserts = Object.values(outbox.upserts).filter((item) => inFlight.upserts.get(item.id) !== item);
+    const deletes = outbox.deletes.filter((id) => !inFlight.deletes.has(id));
     if (!upserts.length && !deletes.length) return;
 
     flushingRef.current = true;
@@ -182,7 +221,7 @@ export function useCloudCollectionState(collectionName, localKey, fallback, opti
         // Only clear if nothing newer was queued for this id while we were away.
         if (outbox.upserts[item.id] === item) delete outbox.upserts[item.id];
       });
-      outbox.deletes = outbox.deletes.filter((id) => !deletes.includes(id));
+      outbox.deletes = outbox.deletes.filter((id) => !deletes.includes(id) || inFlight.deletes.has(id));
       persistOutbox();
     } catch (error) {
       logSyncError(`Firestore ${collectionName} retry failed`, error);
@@ -269,14 +308,25 @@ export function useCloudCollectionState(collectionName, localKey, fallback, opti
             // No confirmed connection yet — bank it rather than lose it.
             queueChanges(changed, removed);
           } else {
+            // On disk before it goes anywhere: a server call that is still
+            // waking up keeps nothing if the page is closed or reloaded, so
+            // the outbox holds it until the save is confirmed.
+            markInFlight(changed, removed);
+            queueChanges(changed, removed);
             pendingWritesRef.current += 1;
             syncCollectionItems(collectionName, current, normalized)
-              .then((where) => holdSaved(where, changed, removed))
+              .then((where) => {
+                holdSaved(where, changed, removed);
+                releaseInFlight(changed, removed);
+                clearConfirmed(changed, removed);
+                persistOutbox();
+              })
               .catch((error) => {
                 logSyncError(`Firestore ${collectionName} sync failed`, error);
-                // The write failed, so it is still owed. Queue it and let the
-                // retry loop carry it until Firestore accepts it.
-                queueChanges(changed, removed);
+                // The write failed, so it is still owed. It is already in the
+                // outbox; the retry loop carries it until it is accepted.
+                releaseInFlight(changed, removed);
+                persistOutbox();
               })
               .finally(() => {
                 pendingWritesRef.current = Math.max(0, pendingWritesRef.current - 1);
@@ -298,6 +348,30 @@ export function useCloudCollectionState(collectionName, localKey, fallback, opti
 // a register holding a shorter list can never drop names another register added.
 const trustCloud = (_local, cloud) => cloud;
 
+// The document version this computer saved and has not seen confirmed. Kept on
+// disk so a reload while the server was still waking up sends it again instead
+// of letting the older cloud copy replace it.
+const PENDING_SUFFIX = "::pending";
+const PENDING_RETRY_MS = 15000;
+
+function readPendingDocument(key) {
+  try {
+    const raw = JSON.parse(localStorage.getItem(key + PENDING_SUFFIX) || "null");
+    return raw && typeof raw === "object" && "items" in raw ? raw : null;
+  } catch {
+    return null;
+  }
+}
+
+function writePendingDocument(key, entry) {
+  try {
+    if (entry) localStorage.setItem(key + PENDING_SUFFIX, JSON.stringify(entry));
+    else localStorage.removeItem(key + PENDING_SUFFIX);
+  } catch (error) {
+    console.error(`Could not keep the pending ${key} save on this computer`, error);
+  }
+}
+
 export function useCloudDocumentState(documentId, localKey, fallback, options = {}) {
   const merge = options.merge || trustCloud;
   const [value, setValue] = useState(() => readJson(localKey, fallback));
@@ -314,11 +388,44 @@ export function useCloudDocumentState(documentId, localKey, fallback, options = 
   // stable shape difference the merge keeps re-producing) can't make us heal the
   // same value over and over — a self-sustaining write/read loop across devices.
   const lastPushedRef = useRef(null);
+  const pendingRef = useRef(undefined);
+  if (pendingRef.current === undefined) pendingRef.current = readPendingDocument(localKey);
+  const pushesRef = useRef(0);
+  const retryTimerRef = useRef(null);
 
   useEffect(() => {
     valueRef.current = value;
     localStorage.setItem(localKey, JSON.stringify(value));
   }, [localKey, value]);
+
+  useEffect(() => () => {
+    if (retryTimerRef.current) window.clearTimeout(retryTimerRef.current);
+  }, []);
+
+  function clearPending(entry) {
+    if (pendingRef.current !== entry) return;
+    pendingRef.current = null;
+    writePendingDocument(localKey, null);
+  }
+
+  // Written to disk first, cleared once the cloud has it, and sent again on a
+  // timer (and on the next snapshot) until it does.
+  function pushPending(entry) {
+    pushesRef.current += 1;
+    replaceAppStateDocument(documentId, entry.items)
+      .then(() => clearPending(entry))
+      .catch((error) => {
+        logSyncError(`Firestore appState/${documentId} sync failed`, error);
+        if (pendingRef.current !== entry || retryTimerRef.current) return;
+        retryTimerRef.current = window.setTimeout(() => {
+          retryTimerRef.current = null;
+          if (pendingRef.current && !pushesRef.current) pushPending(pendingRef.current);
+        }, PENDING_RETRY_MS);
+      })
+      .finally(() => {
+        pushesRef.current = Math.max(0, pushesRef.current - 1);
+      });
+  }
 
   useEffect(() => {
     return watchAppStateDocument(
@@ -326,6 +433,17 @@ export function useCloudDocumentState(documentId, localKey, fallback, options = 
       fallbackRef.current,
       (items) => {
         cloudReadyRef.current = true;
+        const pending = pendingRef.current;
+        if (pending) {
+          if (stableText(items) === stableText(pending.items)) {
+            clearPending(pending);
+          } else {
+            // The cloud has not caught up with this computer's save yet. Keep
+            // showing it and make sure it is on its way.
+            if (!pushesRef.current) pushPending(pending);
+            return;
+          }
+        }
         const cloudIsEmpty = isSameArray(items, fallbackRef.current);
         const localHasData = !isSameArray(valueRef.current, fallbackRef.current);
 
@@ -377,9 +495,10 @@ export function useCloudDocumentState(documentId, localKey, fallback, options = 
 
       if (cloudReadyRef.current) {
         lastPushedRef.current = nextValue;
-        replaceAppStateDocument(documentId, nextValue).catch((error) =>
-          logSyncError(`Firestore appState/${documentId} sync failed`, error),
-        );
+        const entry = { items: nextValue };
+        pendingRef.current = entry;
+        writePendingDocument(localKey, entry);
+        pushPending(entry);
       }
 
       return nextValue;

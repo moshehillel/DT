@@ -210,12 +210,17 @@ export async function authorizedFetch(url, init = {}) {
 }
 
 // Calls an admin-only Cloud Function (callable) such as employee management.
-export async function callFunction(name, data) {
+export async function callFunction(name, data, options) {
   const { functions } = await getFirebase();
-  const callable = httpsCallable(functions, name);
+  const callable = httpsCallable(functions, name, options);
   const result = await callable(data || {});
   return result.data;
 }
+
+// A register save that has not answered in this long goes the other way (or
+// back to its outbox) instead of holding the screen for the SDK's 70 seconds.
+// Sending the same save twice is harmless: the server skips what it already has.
+export const REGISTER_CALL_TIMEOUT = { timeout: 30000 };
 
 // Who is signed in, right now, without waiting for anything.
 export function currentAuthUid() {
@@ -378,6 +383,7 @@ export async function allocateRepairTicketNumber(startAt, { reportId = "", maxTr
 export function watchCollection(collectionName, onItems, onError, options = {}) {
   let unsubscribe = () => {};
   let cancelled = false;
+  watchDataPaths();
 
   ensureFirebaseAuth()
     .then(() => getFirebase())
@@ -452,8 +458,14 @@ function watchDataPaths() {
     .then(({ db }) => {
       onSnapshot(
         doc(db, "system", "dataPaths"),
-        (snapshot) => { dataPathState.value = snapshot.exists() ? snapshot.data() || {} : {}; },
-        () => { dataPathState.value = {}; },
+        (snapshot) => {
+          dataPathState.value = snapshot.exists() ? snapshot.data() || {} : {};
+          replayRecordJournal();
+        },
+        () => {
+          dataPathState.value = {};
+          replayRecordJournal();
+        },
       );
     })
     .catch(() => {});
@@ -478,7 +490,7 @@ const OPS_PER_CALL = 200;
 async function saveViaPostgres(ops) {
   try {
     for (let index = 0; index < ops.length; index += OPS_PER_CALL) {
-      await callFunction("saveRecords", { ops: ops.slice(index, index + OPS_PER_CALL) });
+      await callFunction("saveRecords", { ops: ops.slice(index, index + OPS_PER_CALL) }, REGISTER_CALL_TIMEOUT);
     }
     return true;
   } catch (error) {
@@ -670,15 +682,142 @@ export async function listCustomersPage({ pageSize = 25, afterId = "", search = 
 // a customer's account balance and its history are written by a different
 // screen entirely, and a plain setDoc would wipe them every time somebody
 // corrected a spelling.
+// ---- Customer saves still on their way -------------------------------------
+// Firestore kept a pending write on disk the moment it was made. A call to the
+// server keeps nothing: if the page goes away while the server is still waking
+// up, the change existed only in that page. Each customer save, removal and
+// balance change is written here first and taken off once it has an answer;
+// whatever is left when the app next opens is sent again. The server skips a
+// save it already has, and a balance change carries the same entry id every
+// time it is sent, so it is never applied twice.
+const RECORD_JOURNAL_KEY = "diamant-record-journal";
+const JOURNAL_RETRY_MS = 30000;
+const journalInFlight = new Set();
+let journalReplaying = false;
+let journalRetryTimer = null;
+
+function readJournal() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(RECORD_JOURNAL_KEY) || "null");
+    return raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
+  } catch {
+    return {};
+  }
+}
+
+function writeJournal(journal) {
+  try {
+    if (!Object.keys(journal).length) localStorage.removeItem(RECORD_JOURNAL_KEY);
+    else localStorage.setItem(RECORD_JOURNAL_KEY, JSON.stringify(journal));
+  } catch (error) {
+    console.error("Could not keep a pending customer save on this computer", error);
+  }
+}
+
+function journalPut(key, entry) {
+  const seq = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const journal = readJournal();
+  journal[key] = { ...entry, seq };
+  writeJournal(journal);
+  journalInFlight.add(seq);
+  return seq;
+}
+
+function journalClear(key, seq) {
+  journalInFlight.delete(seq);
+  const journal = readJournal();
+  if (journal[key]?.seq !== seq) return;
+  delete journal[key];
+  writeJournal(journal);
+}
+
+// The UI waits on these, so an answer of either kind reaches somebody and the
+// entry is done with. Only a page that went away mid-call leaves one behind.
+async function withJournal(key, entry, work) {
+  const seq = journalPut(key, entry);
+  try {
+    return await work();
+  } finally {
+    journalClear(key, seq);
+  }
+}
+
+function isFinalSaveError(error) {
+  return FINAL_ERRORS.has(error?.code) || error?.final === true;
+}
+
+async function runJournalEntry(entry) {
+  if (entry.type === "customerSave") return writeCustomer(entry.id, entry.data);
+  if (entry.type === "customerDelete") return removeCustomer(entry.id);
+  if (entry.type === "balance") return applyBalanceChange(entry);
+  return null;
+}
+
+function scheduleJournalRetry() {
+  if (journalRetryTimer || typeof window === "undefined") return;
+  journalRetryTimer = window.setTimeout(() => {
+    journalRetryTimer = null;
+    replayRecordJournal();
+  }, JOURNAL_RETRY_MS);
+}
+
+async function replayRecordJournal() {
+  if (journalReplaying) return;
+  const waiting = Object.entries(readJournal()).filter(([, entry]) => entry?.seq && !journalInFlight.has(entry.seq));
+  if (!waiting.length) return;
+  journalReplaying = true;
+  let left = false;
+  try {
+    await ensureFirebaseAuth();
+    for (const [key, entry] of waiting) {
+      journalInFlight.add(entry.seq);
+      try {
+        await runJournalEntry(entry);
+        journalClear(key, entry.seq);
+      } catch (error) {
+        if (isFinalSaveError(error)) {
+          console.error(`Diamant Telecom: a saved ${entry.type} was refused when it was sent again.`, entry, error);
+          journalClear(key, entry.seq);
+        } else {
+          journalInFlight.delete(entry.seq);
+          left = true;
+        }
+      }
+    }
+  } catch {
+    left = true;
+  } finally {
+    journalReplaying = false;
+  }
+  if (left) scheduleJournalRetry();
+}
+
+async function writeCustomer(id, data) {
+  const { db } = await getFirebase();
+  if (savesToPostgres("customers")
+    && await saveViaPostgres([{ collection: "customers", id, type: "merge", data }])) {
+    return;
+  }
+  await setDoc(doc(db, "customers", id), data, { merge: true });
+}
+
+async function removeCustomer(id) {
+  if (savesToPostgres("customers")
+    && await saveViaPostgres([{ collection: "customers", id, type: "delete" }])) {
+    return;
+  }
+  const { db } = await getFirebase();
+  await deleteDoc(doc(db, "customers", id));
+}
+
 export async function saveCustomerDoc(customer) {
-  await ensureFirebaseAuth();
   const { db } = await getFirebase();
   const id = customer.id || doc(collection(db, "customers")).id;
-  if (savesToPostgres("customers")
-    && await saveViaPostgres([{ collection: "customers", id, type: "merge", data: { ...customer, id } }])) {
-    return id;
-  }
-  await setDoc(doc(db, "customers", id), { ...customer, id }, { merge: true });
+  const data = { ...customer, id };
+  await withJournal(`customers/${id}`, { type: "customerSave", id, data }, async () => {
+    await ensureFirebaseAuth();
+    await writeCustomer(id, data);
+  });
   return id;
 }
 
@@ -689,15 +828,28 @@ export async function saveCustomerDoc(customer) {
 export async function adjustCustomerBalance(customerId, { amount, reason, by, kind }) {
   const delta = Math.round((Number(amount) || 0) * 100) / 100;
   if (!customerId || !delta) return null;
-  await ensureFirebaseAuth();
+  const change = { type: "balance", customerId, amount: delta, reason, by, kind, entryId: crypto.randomUUID() };
+  return withJournal(`balance/${change.entryId}`, change, async () => {
+    await ensureFirebaseAuth();
+    return applyBalanceChange(change);
+  });
+}
+
+// One entry id for the life of the change. The server answers a repeat with
+// what it already did, and the Firestore way below looks for it on the
+// customer before adding anything, so an answer that never arrived (the
+// change made, the reply lost) cannot take the money twice.
+async function applyBalanceChange({ customerId, amount: delta, reason, by, kind, entryId }) {
   if (savesToPostgres("balances")) {
     try {
       return await callFunction("adjustCustomerBalance", {
-        customerId, amount: delta, reason, by, kind, entryId: crypto.randomUUID(),
+        customerId, amount: delta, reason, by, kind, entryId,
       });
     } catch (error) {
       if (FINAL_ERRORS.has(error?.code)) {
-        throw new Error(error.message || "That balance change was refused.");
+        const refused = new Error(error.message || "That balance change was refused.");
+        refused.final = true;
+        throw refused;
       }
       console.warn("Diamant Telecom: PostgreSQL balance change did not go through, using Firestore instead.", error);
     }
@@ -706,11 +858,17 @@ export async function adjustCustomerBalance(customerId, { amount, reason, by, ki
   const ref = doc(db, "customers", customerId);
   return runTransaction(db, async (tx) => {
     const snap = await tx.get(ref);
-    if (!snap.exists()) throw new Error("That customer is no longer in the CRM.");
+    if (!snap.exists()) {
+      const gone = new Error("That customer is no longer in the CRM.");
+      gone.final = true;
+      throw gone;
+    }
     const current = Math.round((Number(snap.data().balance) || 0) * 100) / 100;
+    const already = (snap.data().balanceEntries || []).find((item) => item?.id === entryId);
+    if (already) return { balance: current, entry: already, repeated: true };
     const balance = Math.round((current + delta) * 100) / 100;
     const entry = {
-      id: crypto.randomUUID(),
+      id: entryId,
       at: new Date().toISOString(),
       by: by || "",
       kind: kind || (delta > 0 ? "Credit added" : "Credit used"),
@@ -728,11 +886,8 @@ export async function adjustCustomerBalance(customerId, { amount, reason, by, ki
 
 export async function deleteCustomerDoc(id) {
   if (!id) return;
-  await ensureFirebaseAuth();
-  if (savesToPostgres("customers")
-    && await saveViaPostgres([{ collection: "customers", id, type: "delete" }])) {
-    return;
-  }
-  const { db } = await getFirebase();
-  await deleteDoc(doc(db, "customers", id));
+  await withJournal(`customers/${id}`, { type: "customerDelete", id }, async () => {
+    await ensureFirebaseAuth();
+    await removeCustomer(id);
+  });
 }
