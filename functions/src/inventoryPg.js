@@ -133,15 +133,29 @@ function buildSeed(products) {
 async function seedAverageCosts(client, averages) {
   for (const entry of averages) {
     await client.query(
-      "insert into inv_avg_cost (product_id, avg_cost) values ($1, $2) on conflict (product_id) do nothing",
+      `insert into inv_avg_cost (product_id, avg_cost) values ($1, $2)
+       on conflict (product_id) do update set avg_cost = excluded.avg_cost, updated_at = now()
+       where inv_avg_cost.avg_cost is null and excluded.avg_cost is not null`,
       [entry.productId, entry.cost],
     );
   }
 }
 
+// A cost of goods entered after stock was counted fills in what had no cost.
+// A cost already known is never changed here.
 async function ensureAverageCosts(pool, products, schema = "public") {
   const { averages } = buildSeed(products);
-  await inTransaction(pool, schema, (client) => seedAverageCosts(client, averages));
+  await inTransaction(pool, schema, async (client) => {
+    await seedAverageCosts(client, averages);
+    for (const product of products) {
+      const cost = costOf(product);
+      if (!product.requiresImei || cost === null) continue;
+      await client.query(
+        "update inv_phone_units set cost = $2, updated_at = now() where product_id = $1 and cost is null and status = 'in_stock'",
+        [product.id, cost],
+      );
+    }
+  });
 }
 
 async function seedInventory(pool, products, schema = "public") {
