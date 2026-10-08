@@ -32,6 +32,7 @@ const {
   shouldImportCall,
 } = require("./telebroad");
 const { extractShopifyImei } = require("./shopify");
+const { applyStockMovement, normalizeMovement } = require("./inventory");
 const {
   buildResultLookup,
   buildSaleSession,
@@ -629,6 +630,105 @@ async function sendCustomerNotification({ to, method, body, voiceBody = "", voic
 
 // Texts a sale receipt to the customer. Plain text only: the body carries the
 // receipt number and the same figures that print on paper, never an image.
+function inventoryBalanceId(productId, location) {
+  return `${productId}__${crypto.createHash("sha256").update(String(location)).digest("hex").slice(0, 16)}`;
+}
+
+// One transaction re-reads each product and applies only this store's change.
+// A second try of the same movement id finds the ledger row and stops.
+async function commitStockMovements(movements) {
+  const normalized = [];
+  for (const raw of movements) {
+    const movement = normalizeMovement(raw);
+    if (movement) normalized.push(movement);
+  }
+  if (!normalized.length) return { applied: 0, skipped: 0 };
+  if (normalized.length > 50) throw new HttpsError("invalid-argument", "Too many stock lines at once.");
+
+  return db.runTransaction(async (tx) => {
+    const movementSnaps = [];
+    for (const movement of normalized) {
+      movementSnaps.push(await tx.get(db.collection("stockMovements").doc(movement.id)));
+    }
+    const productIds = [...new Set(normalized.map((movement) => movement.productId))];
+    const productRefs = new Map(productIds.map((id) => [id, db.collection("products").doc(id)]));
+    const productSnaps = new Map();
+    for (const [id, ref] of productRefs) productSnaps.set(id, await tx.get(ref));
+    for (const snap of productSnaps.values()) {
+      if (!snap.exists) throw new HttpsError("failed-precondition", "That product is not in inventory yet.");
+    }
+
+    const working = new Map();
+    for (const [id, snap] of productSnaps) working.set(id, snap.data() || {});
+    const applied = [];
+    normalized.forEach((movement, index) => {
+      if (movementSnaps[index].exists) return;
+      const next = applyStockMovement(working.get(movement.productId), movement);
+      working.set(movement.productId, next.product);
+      applied.push({ movement, result: next });
+    });
+
+    const changedProducts = new Set(applied.map((entry) => entry.movement.productId));
+    for (const productId of changedProducts) {
+      const product = working.get(productId);
+      tx.update(productRefs.get(productId), {
+        stock: product.stock || {},
+        quantity: Number(product.quantity) || 0,
+        imeis: product.imeis || [],
+        updatedAt: new Date().toISOString(),
+      });
+    }
+    const balances = new Map();
+    for (const { movement, result } of applied) {
+      tx.set(db.collection("stockMovements").doc(movement.id), {
+        id: movement.id,
+        productId: movement.productId,
+        location: movement.location,
+        op: movement.op,
+        qty: movement.qty,
+        imeis: movement.imeis,
+        sourceType: movement.sourceType,
+        sourceId: movement.sourceId,
+        shortQty: result.shortQty || 0,
+        missingImeis: result.missingImeis || [],
+        appliedAt: new Date().toISOString(),
+      });
+      for (const location of result.locations) {
+        balances.set(`${movement.productId}::${location}`, {
+          productId: movement.productId,
+          location,
+          entry: (result.product.stock || {})[location] || { quantity: 0, imeis: [] },
+        });
+      }
+    }
+    for (const balance of balances.values()) {
+      tx.set(db.collection("inventoryBalances").doc(inventoryBalanceId(balance.productId, balance.location)), {
+        productId: balance.productId,
+        location: balance.location,
+        quantity: Number(balance.entry.quantity) || 0,
+        imeis: balance.entry.imeis || [],
+        updatedAt: new Date().toISOString(),
+      });
+    }
+    return { applied: applied.length, skipped: normalized.length - applied.length };
+  });
+}
+
+exports.postStockMovements = onCall({ region: REGION }, async (request) => {
+  if (!request.auth) throw new HttpsError("unauthenticated", "Sign in required.");
+  const movements = request.data?.movements;
+  if (!Array.isArray(movements) || !movements.length) {
+    throw new HttpsError("invalid-argument", "Nothing to update.");
+  }
+  try {
+    return await commitStockMovements(movements);
+  } catch (error) {
+    if (error instanceof HttpsError) throw error;
+    logger.error("postStockMovements failed", error);
+    throw new HttpsError("invalid-argument", error.message || "Stock update failed.");
+  }
+});
+
 exports.sendSaleReceiptSms = onCall({ region: REGION }, async (request) => {
   if (!request.auth) throw new HttpsError("unauthenticated", "Sign in required.");
   const to = String(request.data?.to || "").trim();
@@ -733,13 +833,11 @@ async function logNotification(reportId, report, status, detail) {
 // trigger only acts on a status transition, and this changes no status.
 async function stampRepairNotice(reportRef, kind, method, status) {
   try {
-    await reportRef.set({
-      details: {
-        notices: {
-          [kind]: { method: method || "", status, at: new Date().toISOString() },
-        },
-      },
-    }, { merge: true });
+    // Dot path, so writing the notice cannot replace the rest of details.
+    // A merged set of the details map used to wipe the ticket, model, and status.
+    await reportRef.update({
+      [`details.notices.${kind}`]: { method: method || "", status, at: new Date().toISOString() },
+    });
   } catch (error) {
     logger.error("stampRepairNotice failed", error);
   }
@@ -792,6 +890,15 @@ exports.notifyRepairReceived = onDocumentCreated(
   },
 );
 
+function repairReadyBody(report) {
+  const amountDue = report.details?.finalPrice || report.paymentAmount || "";
+  const dueText =
+    amountDue && report.details?.paymentStatus !== "Paid"
+      ? ` Amount due: $${(Number(amountDue) || 0).toFixed(2)}.`
+      : "";
+  return `Diamant Telecom: repair ticket ${report.details?.ticketNumber || ""} for ${report.details?.model || "your phone"} is ready for pickup.${dueText}`;
+}
+
 exports.notifyRepairDelivered = onDocumentUpdated(
   {
     region: REGION,
@@ -830,13 +937,13 @@ exports.notifyRepairDelivered = onDocumentUpdated(
     };
 
     if (becameReady) {
-      const amountDue = after.details?.finalPrice || after.paymentAmount || "";
-      const dueText =
-        amountDue && after.details?.paymentStatus !== "Paid"
-          ? ` Amount due: $${(Number(amountDue) || 0).toFixed(2)}.`
-          : "";
-      const body = `Diamant Telecom: repair ticket ${after.details?.ticketNumber || ""} for ${after.details?.model || "your phone"} is ready for pickup.${dueText}`;
-      await sendOne("ready", after.details?.notificationPreference || "Text message", body);
+      const notifyAt = after.readyNotifyAt || after.details?.readyNotifyAt || "";
+      const sendLater = notifyAt && new Date(notifyAt).getTime() > Date.now() + 15000;
+      if (sendLater) {
+        await stampRepairNotice(event.data.after.ref, "ready", after.details?.notificationPreference || "Text message", "Scheduled");
+      } else {
+        await sendOne("ready", after.details?.notificationPreference || "Text message", repairReadyBody(after));
+      }
     }
 
     if (becamePaid) {
@@ -1646,6 +1753,79 @@ function buildSimExpiryMessage(cardLast4) {
     : "We will charge your card on file to refill it.";
   return `Diamant Telecom: your SIM is about to expire. ${cardPart} If you do not want to refill, or you want to change the card on file, please give us a call.`;
 }
+
+// Ready texts that the counter asked to hold until morning. The status change
+// itself does not send these; this pass does, once the chosen time has passed.
+exports.sendScheduledRepairReady = onSchedule(
+  {
+    region: REGION,
+    schedule: "every 15 minutes",
+    timeZone: RENTAL_REMINDER_TIME_ZONE,
+  },
+  async () => {
+    const now = new Date().toISOString();
+    const snapshot = await db.collection("reports").where("readyNoticePending", "==", true).limit(50).get();
+    await Promise.all(snapshot.docs.map(async (doc) => {
+      const report = doc.data() || {};
+      if (!report.readyNotifyAt || report.readyNotifyAt > now) return;
+      const logId = `repair-ready-${doc.id}`;
+      const logRef = db.collection("notificationLogs").doc(logId);
+      const existing = await logRef.get();
+      if (existing.exists) {
+        await doc.ref.update({ readyNoticePending: false, "details.readyNoticeStatus": "Sent" });
+        return;
+      }
+      const to = report.customerPhone || "";
+      const method = report.details?.notificationPreference || "Text message";
+      try {
+        if (!to) {
+          await writeNotificationLog(logId, doc.id, report, method, "Skipped", "No customer phone number", "repair-ready");
+        } else {
+          const result = await sendCustomerNotification({ to, method, body: repairReadyBody(report) });
+          await writeNotificationLog(logId, doc.id, report, method, result.status, result.detail, "repair-ready");
+        }
+        await doc.ref.update({ readyNoticePending: false, "details.readyNoticeStatus": "Sent" });
+      } catch (error) {
+        logger.error("sendScheduledRepairReady failed", error);
+        await writeNotificationLog(logId, doc.id, report, method, "Failed", error.message, "repair-ready");
+      }
+    }));
+  },
+);
+
+exports.sendScheduledPaymentReminders = onSchedule(
+  {
+    region: REGION,
+    schedule: "every day 10:00",
+    timeZone: RENTAL_REMINDER_TIME_ZONE,
+  },
+  async () => {
+    const today = new Date().toISOString().slice(0, 10);
+    const snapshot = await db.collection("reports").where("paymentDuePending", "==", true).limit(50).get();
+    await Promise.all(snapshot.docs.map(async (doc) => {
+      const report = doc.data() || {};
+      if (!report.paymentDueAt || report.paymentDueAt > today) return;
+      const logId = `payment-due-${doc.id}-${today}`;
+      const logRef = db.collection("notificationLogs").doc(logId);
+      if ((await logRef.get()).exists) return;
+      const to = report.customerPhone || "";
+      const amount = report.paymentAmount ? `$${Number(report.paymentAmount).toFixed(2)}` : "your balance";
+      const body = `Diamant Telecom: a payment of ${amount} is due. Call 1 (347) 388-7467 or come in to pay.`;
+      try {
+        if (!to) {
+          await writeNotificationLog(logId, doc.id, report, "Text message", "Skipped", "No customer phone number", "payment-due");
+        } else {
+          const result = await sendSms({ to, body });
+          await writeNotificationLog(logId, doc.id, report, "Text message", result.status, result.detail, "payment-due");
+        }
+        await doc.ref.update({ paymentDuePending: false });
+      } catch (error) {
+        logger.error("sendScheduledPaymentReminders failed", error);
+        await writeNotificationLog(logId, doc.id, report, "Text message", "Failed", error.message, "payment-due");
+      }
+    }));
+  },
+);
 
 exports.sendRentalReturnReminders = onSchedule(
   {

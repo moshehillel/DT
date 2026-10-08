@@ -41,3 +41,8 @@ PIPE
 
 # Temporary CRM import data
 temp-numbers
+
+# Agent worktrees and service-account keys
+.claude/worktrees/
+*-firebase-adminsdk-*.json
+service-account*.json

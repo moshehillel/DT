@@ -260,6 +260,19 @@ export function generateRepairTicketNumber(reports) {
   return String(candidate);
 }
 
+// Every number a repair must answer to: the one it has now, and the one that
+// was printed on the phone before a clash moved it.
+export function repairLookupDigits(report) {
+  return [...new Set([
+    digitsOnly(report?.ticketDigits),
+    ...(Array.isArray(report?.ticketDigitsAll) ? report.ticketDigitsAll.map(digitsOnly) : []),
+    digitsOnly(report?.details?.ticketDigits),
+    digitsOnly(report?.details?.ticketNumber),
+    digitsOnly(report?.details?.ticketNumberWas),
+    ...(Array.isArray(report?.details?.ticketDigitsAll) ? report.details.ticketDigitsAll.map(digitsOnly) : []),
+  ].filter(Boolean))];
+}
+
 export function exportCsv(reports) {
   const headers = [
     "date",

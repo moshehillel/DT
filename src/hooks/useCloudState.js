@@ -186,20 +186,26 @@ export function useCloudCollectionState(collectionName, localKey, fallback, opti
           return;
         }
         if (pendingWritesRef.current > 0) return;
-        const sorted = sortCloudItems(items);
-        // Adopting the cloud snapshot discards any local row the cloud doesn't
-        // have. That is correct for rows deleted on another register, but it is
-        // also how a write lost before the outbox existed disappeared without a
-        // trace. Name them in the console so a missing sale can still be found.
-        const cloudIds = new Set(items.map((item) => item.id));
-        const localOnly = valueRef.current.filter((item) => item?.id && !cloudIds.has(item.id));
-        if (localOnly.length) {
+        // A repair saved on this computer and still waiting to upload must not
+        // be thrown away because a cloud snapshot has not heard about it yet.
+        // That snapshot is how a labeled ticket disappeared while the customer
+        // was still holding the number.
+        const pendingById = outboxRef.current.upserts;
+        const deleted = new Set(outboxRef.current.deletes);
+        const dropped = valueRef.current.filter((item) =>
+          item?.id && !items.some((cloud) => cloud.id === item.id) && !pendingById[item.id]);
+        if (dropped.length) {
           console.warn(
-            `Diamant Telecom: ${localOnly.length} ${collectionName} row(s) exist only on this computer ` +
+            `Diamant Telecom: ${dropped.length} ${collectionName} row(s) exist only on this computer ` +
               `and are being replaced by the cloud copy.`,
-            localOnly,
+            dropped,
           );
         }
+        const merged = [
+          ...items.filter((item) => item?.id && !pendingById[item.id] && !deleted.has(item.id)),
+          ...Object.values(pendingById),
+        ];
+        const sorted = sortCloudItems(merged);
         // Skip no-op updates (e.g. metadata-only snapshots) so we don't churn
         // identity and re-run downstream effects that can trigger more writes.
         if (!isSameArray(sorted, valueRef.current)) setValue(sorted);

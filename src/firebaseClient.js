@@ -244,6 +244,18 @@ function withClaimTimeout(work) {
   return Promise.race([work, timeout]);
 }
 
+// A claim document this register created for this repair is not a clash.
+// Allocate writes the document and then stops waiting if the shop's connection
+// is slow; the write still lands, and the follow-up claim used to read "taken"
+// and move the repair off the number already printed on the phone.
+function ownsRepairTicket(data, reportId) {
+  const ownerReport = String(data?.reportId || "");
+  const owner = String(data?.claimedBy || "");
+  const me = String(currentAuthUid() || "");
+  if (reportId && ownerReport === String(reportId)) return true;
+  return Boolean(me && owner === me && !ownerReport);
+}
+
 // Claim a repair ticket number for one repair. Resolves "taken" when another
 // register already owns the number, "claimed" when this one got it, and
 // "unconfirmed" when nothing could be established — offline intake still has to
@@ -266,7 +278,7 @@ export async function claimRepairTicket(ticketNumber, reportId) {
     ticketRef = doc(db, "repairTickets", number);
     const existing = await withClaimTimeout(getDoc(ticketRef));
     if (existing === CLAIM_TIMEOUT) return "unconfirmed";
-    if (existing.exists()) return "taken";
+    if (existing.exists()) return ownsRepairTicket(existing.data(), reportId) ? "claimed" : "taken";
   } catch (error) {
     if (error?.code !== "permission-denied") logSyncError("Firestore repair ticket read failed", error);
     return "unconfirmed";
@@ -284,7 +296,19 @@ export async function claimRepairTicket(ticketNumber, reportId) {
   } catch (error) {
     // The read above found nothing, so a refusal now is the rules refusing to let
     // an existing document be overwritten: another register claimed it in between.
-    if (error?.code === "permission-denied") return "taken";
+    // Our own allocate write can win that race after we stopped waiting for it,
+    // and that one is still ours.
+    if (error?.code === "permission-denied") {
+      try {
+        const existing = await withClaimTimeout(getDoc(ticketRef));
+        if (existing !== CLAIM_TIMEOUT && existing.exists() && ownsRepairTicket(existing.data(), reportId)) {
+          return "claimed";
+        }
+      } catch (readError) {
+        if (readError?.code !== "permission-denied") logSyncError("Firestore repair ticket reread failed", readError);
+      }
+      return "taken";
+    }
     logSyncError("Firestore repair ticket claim failed", error);
     return "unconfirmed";
   }
@@ -303,7 +327,7 @@ export async function claimRepairTicket(ticketNumber, reportId) {
 // Returns null when nothing can be established (offline, or rules that were
 // never deployed). The caller then falls back to the local guess, where the
 // after-the-fact claim and renumber remain the net they always were.
-export async function allocateRepairTicketNumber(startAt, maxTries = 25) {
+export async function allocateRepairTicketNumber(startAt, { reportId = "", maxTries = 25 } = {}) {
   let candidate = Number(startAt) || 0;
   if (!Number.isFinite(candidate) || candidate < 100001) candidate = 100001;
 
@@ -320,7 +344,7 @@ export async function allocateRepairTicketNumber(startAt, maxTries = 25) {
     const number = String(candidate);
     try {
       const written = await withClaimTimeout(setDoc(doc(db, "repairTickets", number), {
-        reportId: "",
+        reportId: String(reportId || ""),
         claimedBy: currentAuthUid(),
         claimedAt: new Date().toISOString(),
       }));
@@ -416,6 +440,21 @@ async function commitBatches(db, operations) {
   }
 }
 
+// Catalog edits must not carry stock. A merge that omits these fields leaves
+// the balances already stored; the stock function is the only writer of them.
+function asStoredItem(collectionName, item) {
+  if (collectionName !== "products" || !item) return item;
+  const { stock, quantity, imeis, ...catalog } = item;
+  return catalog;
+}
+
+function writeStoredItem(batch, collectionRef, collectionName, item) {
+  const ref = doc(collectionRef, item.id);
+  const stored = asStoredItem(collectionName, item);
+  if (collectionName === "products") batch.set(ref, stored, { merge: true });
+  else batch.set(ref, stored);
+}
+
 export async function upsertCollectionItems(collectionName, items) {
   await ensureFirebaseAuth();
   const { db } = await getFirebase();
@@ -423,7 +462,7 @@ export async function upsertCollectionItems(collectionName, items) {
 
   await commitBatches(
     db,
-    items.map((item) => (batch) => batch.set(doc(collectionRef, item.id), item)),
+    items.map((item) => (batch) => writeStoredItem(batch, collectionRef, collectionName, item)),
   );
 }
 
@@ -468,7 +507,7 @@ export async function syncCollectionItems(collectionName, previousItems, nextIte
         const previous = previousById.get(item.id);
         return !previous || stableStringify(previous) !== stableStringify(item);
       })
-      .map((item) => (batch) => batch.set(doc(collectionRef, item.id), item)),
+      .map((item) => (batch) => writeStoredItem(batch, collectionRef, collectionName, item)),
     ...[...previousById.keys()]
       .filter((id) => !nextIds.has(id))
       .map((id) => (batch) => batch.delete(doc(collectionRef, id))),

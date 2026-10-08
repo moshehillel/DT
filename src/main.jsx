@@ -38,7 +38,6 @@ import {
 import { useCloudCollectionState, useCloudDocumentState } from "./hooks/useCloudState";
 import {
   callFunction,
-  allocateRepairTicketNumber,
   claimRepairTicket,
   deleteCustomerDoc,
   ensureFirebaseAuth,
@@ -79,6 +78,7 @@ import {
   formatReceiptPhone,
   formatShortDate,
   generateRepairTicketNumber,
+  repairLookupDigits,
   getMinimumRentalDays,
   isSolaPaidStatus,
   normalizeRcukSimNumber,
@@ -101,10 +101,15 @@ import {
   uniqueValues,
   storeStockCount,
   storeStockEntry,
-  setStoreStock,
-  adjustStoreStock,
   productStockMap,
 } from "./utils";
+import {
+  applyMovementLocal,
+  buildLineMovements,
+  installStockMovementRetry,
+  postStockMovements,
+  queueStockMovements,
+} from "./stockClient";
 import "./styles.css";
 
 function viewTitleFor(activeView, activeType) {
@@ -177,6 +182,7 @@ function Workspace({ currentUser, isAdmin }) {
     { enabled: isAdmin },
   );
   const [products, setProducts] = useCloudCollectionState("products", PRODUCTS_KEY, []);
+  useEffect(() => { installStockMovementRetry(); }, []);
   const [rentalPhones, setRentalPhones] = useCloudCollectionState("rentalPhones", RENTAL_PHONES_KEY, []);
   const [stockWaitlist, setStockWaitlist] = useCloudCollectionState("stockWaitlist", STOCK_WAITLIST_KEY, []);
   const [stores, setStores] = useCloudDocumentState("stores", STORES_KEY, []);
@@ -649,39 +655,46 @@ function Workspace({ currentUser, isAdmin }) {
     });
   }
 
-  // Take sold units off the selling store's shelf (scanned IMEIs leave stock,
-  // plain items count down). Shared by the till and phone orders.
-  function drawDownStock(lineItems, location) {
-    setProducts((current) =>
-      current.map((product) => {
-        const lines = lineItems.filter((line) => line.productId === product.id);
-        if (!lines.length) return product;
-        if (product.requiresImei) {
-          const soldImeis = lines.map((line) => line.imei).filter(Boolean);
-          if (!soldImeis.length) return product;
-          return { ...adjustStoreStock(product, location, { removeImeis: soldImeis }), updatedAt: new Date().toISOString() };
-        }
-        const soldQty = lines.reduce((total, line) => total + (Number(line.qty) || 0), 0);
-        return { ...adjustStoreStock(product, location, { removeQty: soldQty }), updatedAt: new Date().toISOString() };
-      }),
-    );
+  // The screen moves at once. The database applies the same change to a fresh
+  // copy of each product, and only to the store on the movement. A retry uses
+  // the same id, so the units cannot come off twice.
+  function commitStockMovements(movements) {
+    const pending = (movements || []).filter((movement) => movement?.id && movement.productId && movement.location);
+    if (!pending.length) return;
+    setProducts((current) => current.map((product) => (
+      pending
+        .filter((movement) => movement.productId === product.id)
+        .reduce((next, movement) => applyMovementLocal(next, movement), product)
+    )), { localOnly: true });
+    postStockMovements(pending).catch((error) => {
+      queueStockMovements(pending);
+      // A brand-new product may not be in Firestore for a moment. The queue
+      // sends the same movement again, and the id keeps it from applying twice.
+      if (/not in inventory yet/i.test(error?.message || "")) return;
+      window.alert(error?.message || "Stock did not update. It will retry.");
+    });
   }
 
-  // The reverse: units coming back onto a store's shelf.
-  function putBackStock(lines, location, qtyOf) {
-    setProducts((current) =>
-      current.map((product) => {
-        const mine = lines.filter((line) => line.productId === product.id);
-        if (!mine.length) return product;
-        if (product.requiresImei) {
-          const returned = mine.map((line) => line.imei).filter(Boolean);
-          if (!returned.length) return product;
-          return { ...adjustStoreStock(product, location, { addImeis: returned }), updatedAt: new Date().toISOString() };
-        }
-        const qty = mine.reduce((total, line) => total + qtyOf(line), 0);
-        return { ...adjustStoreStock(product, location, { addQty: qty }), updatedAt: new Date().toISOString() };
-      }),
-    );
+  function drawDownStock(lineItems, location, source) {
+    commitStockMovements(buildLineMovements({
+      sourceType: source.type,
+      sourceId: source.id,
+      location,
+      lines: lineItems,
+      direction: "out",
+      qtyOf: (line) => Number(line.qty) || 0,
+    }));
+  }
+
+  function putBackStock(lines, location, source, qtyOf) {
+    commitStockMovements(buildLineMovements({
+      sourceType: source.type,
+      sourceId: source.id,
+      location,
+      lines,
+      direction: "in",
+      qtyOf,
+    }));
   }
 
   function removeProduct(productId) {
@@ -704,7 +717,10 @@ function Workspace({ currentUser, isAdmin }) {
       address: sale.details?.customerAddress || "",
     });
     setReports((current) => [enriched, ...current]);
-    drawDownStock(sale.details?.lineItems || [], sale.location || sale.details?.location || activeLocation);
+    drawDownStock(sale.details?.lineItems || [], sale.location || sale.details?.location || activeLocation, {
+      type: "sale",
+      id: enriched.id,
+    });
   }
 
   // Files the report and returns it. Nothing may be awaited before `setReports`:
@@ -828,7 +844,7 @@ function Workspace({ currentUser, isAdmin }) {
 
     // Draw the sold units down from the fulfilling store exactly like a POS
     // sale (remove the scanned IMEIs, decrement plain stock).
-    drawDownStock(lineItems, order.location || activeLocation);
+    drawDownStock(lineItems, order.location || activeLocation, { type: "order", id: orderId });
 
     const phoneLine = lineItems.find((line) => line.requiresImei && line.imei);
     setPhoneOrders((current) =>
@@ -894,7 +910,7 @@ function Workspace({ currentUser, isAdmin }) {
     if (!order) return;
     const committed = order.status === "Ready" || order.status === "Out for delivery";
     if (committed) {
-      putBackStock(order.lineItems || [], order.location || activeLocation, (line) => Number(line.qty) || 0);
+      putBackStock(order.lineItems || [], order.location || activeLocation, { type: "order-cancel", id: orderId }, (line) => Number(line.qty) || 0);
     }
     setPhoneOrders((current) => current.filter((item) => item.id !== orderId));
   }
@@ -996,13 +1012,16 @@ function Workspace({ currentUser, isAdmin }) {
 
   // Mark a repair Ready with the final price the customer actually owes. The
   // final price becomes the charge/paid amount; the estimate stays on record.
-  function markRepairReady(reportId, finalPrice) {
+  function markRepairReady(reportId, finalPrice, notifyAt) {
     const report = reports.find((item) => item.id === reportId);
     const oldStatus = report?.details?.status;
     const amount = String(finalPrice ?? "").trim();
     // The final price is for the job the phone came in for. Anything else found
     // on the bench was priced separately and is still owed with it.
     const owed = amount ? String((Number(amount) || 0) + repairFixesTotal(report?.details?.additionalFixes)) : "";
+    const when = notifyAt ? new Date(notifyAt) : null;
+    const sendLater = when && Number.isFinite(when.getTime()) && when.getTime() > Date.now() + 30000;
+    const readyNotifyAt = sendLater ? when.toISOString() : "";
 
     setReports((current) =>
       current.map((item) =>
@@ -1010,13 +1029,22 @@ function Workspace({ currentUser, isAdmin }) {
           ? {
               ...item,
               paymentAmount: owed || item.paymentAmount,
-              details: { ...item.details, status: "Ready", finalPrice: amount },
+              // Top level so the scheduled sender can find it without a nested query.
+              readyNoticePending: Boolean(sendLater),
+              readyNotifyAt,
+              details: {
+                ...item.details,
+                status: "Ready",
+                finalPrice: amount,
+                readyNotifyAt,
+                readyNoticeStatus: sendLater ? "Scheduled" : "",
+              },
             }
           : item,
       ),
     );
 
-    if (oldStatus !== "Ready" && report?.customerPhone && !FUNCTIONS_BASE_URL) {
+    if (oldStatus !== "Ready" && report?.customerPhone && !FUNCTIONS_BASE_URL && !sendLater) {
       queueDeliveryNotification(report);
     }
   }
@@ -1130,6 +1158,25 @@ function Workspace({ currentUser, isAdmin }) {
   // Sorting by creation makes every register agree on which is which without
   // having to ask, so they all compute the same answer and converge.
   useEffect(() => {
+    // The phone system can only find a number that is stored on the repair.
+    // A clash used to leave the printed number in ticketNumberWas and nowhere
+    // the lookup queries, so calling in with 100185 came back as not found.
+    let changed = false;
+    const healed = reports.map((report) => {
+      if (report.type !== "repair") return report;
+      const all = repairLookupDigits(report);
+      const current = Array.isArray(report.ticketDigitsAll) ? report.ticketDigitsAll : [];
+      const ticketDigits = digitsOnly(report.details?.ticketNumber) || report.ticketDigits || "";
+      const sameList = all.length === current.length && all.every((digit) => current.includes(digit));
+      if (sameList && (report.ticketDigits || "") === ticketDigits) return report;
+      changed = true;
+      return { ...report, ticketDigits, ticketDigitsAll: all };
+    });
+    if (changed) {
+      setReports(healed);
+      return;
+    }
+
     const byNumber = new Map();
     reports.forEach((report) => {
       if (report.type !== "repair") return;
@@ -1518,7 +1565,12 @@ function Workspace({ currentUser, isAdmin }) {
 
     // Put the returned units back on the shelf of the store taking the return
     // (scanned IMEIs rejoin the lot).
-    putBackStock(returnLines, activeLocation || original.location || original.details?.location, (line) => Number(line.returnQty) || 0);
+    putBackStock(
+      returnLines,
+      activeLocation || original.location || original.details?.location,
+      { type: "return", id: returnReport.id },
+      (line) => Number(line.returnQty) || 0,
+    );
   }
 
   function requestPasswordReset(employeeName) {
@@ -1738,6 +1790,7 @@ function Workspace({ currentUser, isAdmin }) {
             onSaveCustomerName={saveCustomerName}
             onSaveCustomer={saveCustomer}
             onSaveProduct={saveProduct}
+            onCommitStock={commitStockMovements}
             onCompleteSale={savePosSale}
           />
         ) : activeView === "inventory" ? (
@@ -1747,6 +1800,7 @@ function Workspace({ currentUser, isAdmin }) {
             activeLocation={activeLocation}
             sessionRole={sessionRole}
             onSaveProduct={saveProduct}
+            onCommitStock={commitStockMovements}
             onRemoveProduct={removeProduct}
             rentalPhones={rentalPhones}
             onSaveRentalPhone={saveRentalPhone}
@@ -2201,6 +2255,8 @@ function ReportForm({ activeType, activeEmployee, activeLocation, reports, activ
       details[field.name] = String(formData.get(field.name) || "").trim();
     });
 
+    let reportId = "";
+    let localGuess = "";
     if (activeType === "repair") {
       // Require a status choice (it now defaults to the unselected "Select one").
       if (!details.status) {
@@ -2225,17 +2281,17 @@ function ReportForm({ activeType, activeEmployee, activeLocation, reports, activ
       details.hadSdCard = formData.get("hadSdCard") === "on";
       details.borrowedTempPhone = formData.get("borrowedTempPhone") === "on";
       details.additionalFixes = cleanFixes;
-      // The number is taken from the shared list before anything is printed, so
-      // two registers cannot hand out the same one. The local guess is only the
-      // starting point, and the fallback if the server cannot be reached.
-      const localGuess = generateRepairTicketNumber(reports);
-      const allocated = await allocateRepairTicketNumber(Number(digitsOnly(localGuess)));
-      details.ticketNumber = allocated || localGuess;
+      // File the repair with a number immediately. Confirming that number with
+      // the server happens after the save, never before it — a wait, a missing
+      // payment method, or a reload used to keep the number and lose the repair.
+      reportId = crypto.randomUUID();
+      localGuess = generateRepairTicketNumber(reports);
+      details.ticketNumber = localGuess;
       details.ticketDigits = digitsOnly(details.ticketNumber);
-      // Already ours — the save must not go and claim it a second time, which
-      // would read as "taken" and renumber a perfectly good ticket.
-      details.ticketPreclaimed = Boolean(allocated);
       details.ticketDigitsAll = [details.ticketDigits].filter(Boolean);
+      // One number for this repair. The claim runs after the save and only
+      // moves it if another register already filed the same number.
+      details.ticketPreclaimed = false;
       // The intake amount is the quote; the real price is set when the repair is
       // marked Ready. Record it explicitly as the estimated price.
       details.estimatedPrice = String(formData.get("paymentAmount") || "").trim();
@@ -2248,11 +2304,12 @@ function ReportForm({ activeType, activeEmployee, activeLocation, reports, activ
       details.paymentStatus = "Not paid";
     }
 
-    // Require a payment method whenever money is being recorded, so nothing is
-    // ever saved as paid under an accidental default method.
+    // A repair's price at intake is an estimate, not money collected, so a
+    // missing method must not throw the repair away. Other reports still need
+    // a method whenever an amount is being recorded.
     const paymentAmountValue = String(formData.get("paymentAmount") || "").trim();
     const paymentMethodValue = String(formData.get("paymentMethod") || "").trim();
-    if (paymentAmountValue && !paymentMethodValue) {
+    if (activeType !== "repair" && paymentAmountValue && !paymentMethodValue) {
       window.alert("Choose a payment method before saving.");
       return;
     }
@@ -2270,7 +2327,7 @@ function ReportForm({ activeType, activeEmployee, activeLocation, reports, activ
     details.customerAddress = matchedCustomer?.address || "";
 
     const savedReport = {
-      id: crypto.randomUUID(),
+      id: reportId || crypto.randomUUID(),
       type: activeType,
       createdAt: new Date().toISOString(),
       servedBy: activeEmployee,
@@ -2301,9 +2358,9 @@ function ReportForm({ activeType, activeEmployee, activeLocation, reports, activ
         window.alert("This repair was not saved, so nothing was printed. Try again.");
         return;
       }
-      // Small label to stick on the phone, then the full customer ticket.
-      printRepairPhoneLabel(filed);
-      printRepairTicket(filed);
+      // One print job, two pages: the customer's ticket and the sticker for the
+      // phone. A second window used to be blocked and the app itself got printed.
+      printRepairIntake(filed);
     }
   }
 
@@ -4232,9 +4289,9 @@ function OpenRepairsPage({ reports, employees = [], storeTax = [], activeTaxRate
     onStatusChange(repair.id, status);
   }
 
-  function confirmFinalPrice() {
+  function confirmFinalPrice(notifyAt) {
     if (!finalPrompt) return;
-    onSetReady(finalPrompt.id, finalPrompt.value);
+    onSetReady(finalPrompt.id, finalPrompt.value, notifyAt || "");
     setFinalPrompt(null);
   }
 
@@ -4445,6 +4502,9 @@ function OpenRepairsPage({ reports, employees = [], storeTax = [], activeTaxRate
                       <div className={notified ? "muted" : "repair-not-notified"}>
                         {notified || "Nothing sent yet"}
                       </div>
+                      {repair.details?.readyNoticeStatus === "Scheduled" && repair.details?.readyNotifyAt ? (
+                        <div className="muted">Ready text {formatDateTime(repair.details.readyNotifyAt)}</div>
+                      ) : null}
                     </td>
                     <td className="pos-row-actions">
                       <button className="secondary-button compact-button" type="button" onClick={() => setEditing(repair)}>
@@ -4860,11 +4920,22 @@ function RepairPaymentDialog({ repair, taxRate = 0, paying, onConfirm, onClose }
   );
 }
 
+function defaultReadyNotifyLocal() {
+  const date = new Date();
+  date.setDate(date.getDate() + 1);
+  date.setHours(10, 0, 0, 0);
+  const pad = (value) => String(value).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
 function FinalPriceDialog({ prompt, onChange, onConfirm, onClose }) {
+  const [sendLater, setSendLater] = useState(false);
+  const [notifyAt, setNotifyAt] = useState(defaultReadyNotifyLocal);
+
   function submit(event) {
     event.preventDefault();
     event.stopPropagation();
-    onConfirm();
+    onConfirm(sendLater ? notifyAt : "");
   }
 
   return createPortal(
@@ -4891,6 +4962,18 @@ function FinalPriceDialog({ prompt, onChange, onConfirm, onClose }) {
               autoFocus
             />
           </label>
+          <label className="checkbox-field full">
+            <input type="checkbox" checked={sendLater} onChange={(event) => setSendLater(event.target.checked)} />
+            <span>Send the ready text later</span>
+          </label>
+          {sendLater ? (
+            <label className="field">
+              <span>Send at</span>
+              <input type="datetime-local" value={notifyAt} onChange={(event) => setNotifyAt(event.target.value)} required />
+            </label>
+          ) : (
+            <p className="muted">The customer is texted as soon as this is marked Ready.</p>
+          )}
           <div className="pos-form-actions form-actions-row">
             <button className="primary-button" type="submit">Save &amp; mark Ready</button>
             <button className="secondary-button" type="button" onClick={onClose}>Cancel</button>
@@ -6592,7 +6675,7 @@ function DeliveryCard({ order, canDeliver, onDelivered, onUpdateOrder, orderHand
   );
 }
 
-function PosPage({ products, reports = [], storeLocations = [], activeEmployee, activeLocation, activeDeviceId, activeTaxRate, activeStoreInfo, onSaveCustomerName, onSaveCustomer, onSaveProduct, onCompleteSale }) {
+function PosPage({ products, reports = [], storeLocations = [], activeEmployee, activeLocation, activeDeviceId, activeTaxRate, activeStoreInfo, onSaveCustomerName, onSaveCustomer, onSaveProduct, onCommitStock, onCompleteSale }) {
   const [cart, setCart] = useState([]);
   const [scan, setScan] = useState("");
   const [scanMode, setScanMode] = useState(true);
@@ -6615,6 +6698,10 @@ function PosPage({ products, reports = [], storeLocations = [], activeEmployee, 
   const [splitPayment, setSplitPayment] = useState(false);
   const [splitSecondMethod, setSplitSecondMethod] = useState("");
   const [splitFirstInput, setSplitFirstInput] = useState("");
+  // Collect later stores the sale and texts a reminder on the chosen day.
+  const [collectLater, setCollectLater] = useState(false);
+  const [paymentDueAt, setPaymentDueAt] = useState("");
+  const [payRequest, setPayRequest] = useState("");
   const [outOfState, setOutOfState] = useState(false);
   const [notes, setNotes] = useState("");
   const [message, setMessage] = useState("");
@@ -6870,13 +6957,21 @@ function PosPage({ products, reports = [], storeLocations = [], activeEmployee, 
   // Add stock to a product straight from checkout (e.g. a scanned item that just
   // came in). Mirrors Inventory's restock so counts stay consistent.
   function addStock(product, { addQuantity, newImeis, location, barcode }) {
-    if (!onSaveProduct || !product) return;
+    if (!product) return;
     const store = location || activeLocation;
-    const barcodePatch = barcode && !product.barcode ? { barcode: String(barcode).trim() } : {};
-    const restocked = product.requiresImei
-      ? adjustStoreStock(product, store, { addImeis: newImeis })
-      : adjustStoreStock(product, store, { addQty: addQuantity });
-    onSaveProduct({ ...restocked, ...barcodePatch });
+    if (barcode && !product.barcode && onSaveProduct) onSaveProduct({ ...product, barcode: String(barcode).trim() });
+    const movementId = `restock:${crypto.randomUUID()}`;
+    onCommitStock?.([{
+      id: movementId,
+      productId: product.id,
+      location: store,
+      op: product.requiresImei ? "addImeis" : "addQty",
+      qty: Number(addQuantity) || 0,
+      imeis: newImeis || [],
+      requiresImei: Boolean(product.requiresImei),
+      sourceType: "restock",
+      sourceId: movementId,
+    }]);
     setMessage(`Restocked ${product.name} at ${store}.`);
   }
 
@@ -6976,11 +7071,12 @@ function PosPage({ products, reports = [], storeLocations = [], activeEmployee, 
   const canCheckout =
     cart.length > 0
     && !imeiIssue
-    && !splitIssue
-    && cardChargeComplete
-    // Paid entirely off the account: there is nothing left for a payment method
-    // to be chosen for.
-    && (dueAtTill === 0 || Boolean(paymentMethod));
+    && (collectLater
+      // The money is not being taken now, so no method or card charge is required.
+      ? Boolean(paymentDueAt) && localPhoneDigits(customerPhone).length >= 10
+      : !splitIssue
+        && cardChargeComplete
+        && (dueAtTill === 0 || Boolean(paymentMethod)));
 
   useEffect(() => {
     setCard((current) =>
@@ -7021,9 +7117,32 @@ function PosPage({ products, reports = [], storeLocations = [], activeEmployee, 
     return customerMatchesDigits(resolvedCustomer, localDigits) ? resolvedCustomer : null;
   }
 
+  async function textPaymentRequest() {
+    if (localPhoneDigits(customerPhone).length < 10) {
+      setPayRequest("Enter the customer's phone number first.");
+      return;
+    }
+    if (!total) {
+      setPayRequest("Add items before texting a payment request.");
+      return;
+    }
+    try {
+      setPayRequest("Sending…");
+      await sendReceiptSms(
+        customerPhone,
+        `Diamant Telecom: please pay ${formatMoney(total)}. Call ${COMPANY.phone} or come in to the store.`,
+      );
+      setPayRequest("Payment request texted.");
+    } catch (error) {
+      setPayRequest(error.message || "The text could not be sent.");
+    }
+  }
+
   function handleCheckout() {
     if (!canCheckout) {
       if (imeiIssue) setMessage(imeiIssue);
+      else if (collectLater && localPhoneDigits(customerPhone).length < 10) setMessage("Enter the customer's phone number so we can remind them.");
+      else if (collectLater && !paymentDueAt) setMessage("Choose the day this payment is due.");
       else if (!paymentMethod) setMessage("Choose a payment method before completing the sale.");
       else if (splitIssue) setMessage(splitIssue);
       else if (!cardChargeComplete) setMessage("Charge the card before completing the sale.");
@@ -7059,11 +7178,15 @@ function PosPage({ products, reports = [], storeLocations = [], activeEmployee, 
       location: activeLocation,
       customerPhone: customerPhone.trim(),
       paymentAmount: total.toFixed(2),
+      paymentDuePending: collectLater,
+      paymentDueAt: collectLater ? paymentDueAt : "",
       // Read off what was actually tendered, so a sale settled entirely from the
       // customer's account says "Account" rather than the blank payment select.
-      paymentMethod: payments.length
-        ? payments.map((entry) => entry.method).join(" + ")
-        : paymentMethod,
+      paymentMethod: collectLater
+        ? ""
+        : payments.length
+          ? payments.map((entry) => entry.method).join(" + ")
+          : paymentMethod,
       notes: notes.trim(),
       createdAt: new Date().toISOString(),
       details: {
@@ -7084,7 +7207,9 @@ function PosPage({ products, reports = [], storeLocations = [], activeEmployee, 
         taxAmount: taxAmount.toFixed(2),
         taxPaidBy,
         outOfState: outOfState ? "Yes" : "No",
-        payments,
+        payments: collectLater ? [] : payments,
+        paymentStatus: collectLater ? "Scheduled" : "Paid",
+        paymentDueAt: collectLater ? paymentDueAt : "",
         storeAddress: activeStoreInfo?.address || "",
         storeHours: activeStoreInfo?.hours || "",
         customerName: customerInfo?.name || "",
@@ -7122,6 +7247,9 @@ function PosPage({ products, reports = [], storeLocations = [], activeEmployee, 
     setSplitPayment(false);
     setSplitSecondMethod("");
     setSplitFirstInput("");
+    setCollectLater(false);
+    setPaymentDueAt("");
+    setPayRequest("");
     setAccountInput("");
     setOutOfState(false);
     setCard({ status: "idle", message: "", refNum: "" });
@@ -7515,6 +7643,33 @@ function PosPage({ products, reports = [], storeLocations = [], activeEmployee, 
                 ) : null}
               </div>
             ) : null}
+            <label className="checkbox-field full pos-split-toggle">
+              <input
+                type="checkbox"
+                checked={collectLater}
+                onChange={(event) => {
+                  setCollectLater(event.target.checked);
+                  if (event.target.checked) {
+                    setSplitPayment(false);
+                    setSplitSecondMethod("");
+                    setSplitFirstInput("");
+                  }
+                }}
+              />
+              <span>Collect this payment later</span>
+            </label>
+            {collectLater ? (
+              <label className="field">
+                <span>Payment due</span>
+                <input type="date" value={paymentDueAt} onChange={(event) => setPaymentDueAt(event.target.value)} required />
+              </label>
+            ) : null}
+            <div className="pos-form-actions form-actions-row">
+              <button className="secondary-button" type="button" onClick={textPaymentRequest} disabled={!total}>
+                Text payment request
+              </button>
+              {payRequest ? <p className="muted">{payRequest}</p> : null}
+            </div>
             <label className="field full">
               <span>Notes (optional)</span>
               <textarea value={notes} onChange={(event) => setNotes(event.target.value)} rows={1} />
@@ -7550,7 +7705,7 @@ function PosPage({ products, reports = [], storeLocations = [], activeEmployee, 
           </div>
           </div>
           <div className="pos-checkout-actions">
-            {requiresCardCharge ? (
+            {requiresCardCharge && !collectLater ? (
               <div className="payment-panel payment-panel-stack payment-panel-compact">
                 <div className="card-reader-row">
                   <span className="reader-dot connected" aria-hidden="true" />
@@ -7575,14 +7730,16 @@ function PosPage({ products, reports = [], storeLocations = [], activeEmployee, 
             ) : null}
             {imeiIssue ? <p className="pos-warning">{imeiIssue}</p> : null}
             {!imeiIssue && splitIssue ? <p className="pos-warning">{splitIssue}</p> : null}
-            {!imeiIssue && !splitIssue && requiresCardCharge && !cardChargeComplete ? (
+            {!imeiIssue && !splitIssue && !collectLater && requiresCardCharge && !cardChargeComplete ? (
               <p className="pos-warning">Charge the card before completing the sale.</p>
             ) : null}
             <button className="primary-button pos-complete-button" type="button" disabled={!canCheckout} onClick={handleCheckout}>
               {cart.length
-              ? accountApplied > 0
-                ? `Complete sale · ${formatMoney(dueAtTill)} now`
-                : `Complete sale · ${formatMoney(total)}`
+              ? collectLater
+                ? `Schedule payment · ${formatMoney(total)}`
+                : accountApplied > 0
+                  ? `Complete sale · ${formatMoney(dueAtTill)} now`
+                  : `Complete sale · ${formatMoney(total)}`
               : "Scan items to start"}
             </button>
           </div>
@@ -8012,9 +8169,11 @@ function receiptCustomerHtml(name, phone, mobile, address) {
 // With the browser's default printer set to the thermal printer (and Chrome
 // kiosk printing for no dialog at all), this is a true one-click receipt.
 function openThermalReceipt(title, css, bodyHtml) {
-  const printWindow = window.open("", "_blank", "width=360,height=640");
+  // about:blank, never the app. An empty URL can load this site into the print
+  // window, and printing the current page is what put the sidebar on the receipt.
+  const printWindow = window.open("about:blank", "_blank", "width=360,height=640");
   if (!printWindow) {
-    window.print();
+    window.alert("The receipt window was blocked. Allow pop-ups for this site, then print again.");
     return;
   }
   printWindow.document.write(`<!doctype html><html><head><meta charset="utf-8" />
@@ -8397,19 +8556,23 @@ function printRepairTicket(report, { note = "" } = {}) {
     .map(([label, value]) => `<tr><td>${escapeHtml(label)}</td><td style="text-align:right">${escapeHtml(String(value))}</td></tr>`)
     .join("");
 
+  const due = repairAmountDue(report);
   const css = `
     .eyebrow { text-align: center; font-size: 14px; font-weight: 700; text-transform: uppercase; letter-spacing: 1px; }
     .ticket { text-align: center; font-size: 28px; font-weight: 800; margin: 2mm 0; letter-spacing: 1px; }
+    .due { display: flex; justify-content: space-between; align-items: baseline; margin-top: 3mm; padding-top: 2mm; border-top: 2px solid #000; font-size: 18px; font-weight: 800; }
+    .due span:last-child { font-size: 22px; }
     .notes { font-size: 14px; font-weight: 600; margin-top: 3mm; line-height: 1.35; }`;
   const body = `
     ${receiptHeaderHtml(location, details.storeAddress)}
     <div class="divider"></div>
-    <div class="eyebrow">Repair ticket</div>
+    <div class="eyebrow">Customer copy</div>
     <div class="ticket">${escapeHtml(details.ticketNumber || "")}</div>
     <div class="meta">${escapeHtml(createdAt)}</div>
     ${receiptCustomerHtml(details.customerName, report.customerPhone, details.customerMobile, details.customerAddress)}
     <div class="divider"></div>
     <table>${rows}</table>
+    <div class="due"><span>${details.paymentStatus === "Paid" ? "Paid" : "Amount due"}</span><span>${escapeHtml(formatMoney(due))}</span></div>
     ${report.notes ? `<div class="notes">Notes: ${escapeHtml(report.notes)}</div>` : ""}
     <div class="divider"></div>
     <div class="thanks">Keep this ticket for pickup.</div>
@@ -8417,6 +8580,100 @@ function printRepairTicket(report, { note = "" } = {}) {
     ${receiptFooterHtml(details.storeHours)}`;
 
   openThermalReceipt(`Repair ticket ${details.ticketNumber || ""}`, css, body);
+}
+
+// What the customer owes at intake: the quoted jobs, plus tax once it has been
+// added at pickup. Shown on both copies so the amount is not only on the screen.
+function repairAmountDue(report) {
+  const details = report?.details || {};
+  const totals = repairTotals(report);
+  const tax = Number(details.taxAmount) || 0;
+  const base = totals.total || Number(details.finalPrice) || Number(details.estimatedPrice) || Number(report?.paymentAmount) || 0;
+  return base + tax;
+}
+
+// Intake prints both copies in one job: the customer keeps the first page, the
+// second page is the sticker that goes on the phone. One number on both.
+function printRepairIntake(report) {
+  const details = report.details || {};
+  const due = formatMoney(repairAmountDue(report));
+  const customer = [details.customerName, report.customerPhone].filter(Boolean).join(" · ");
+  const fixLines = cleanRepairFixes(details.additionalFixes).map((fix) => fix.description).filter(Boolean);
+  const label = `
+    <div class="eyebrow">Stick on phone</div>
+    <div class="ticket">${escapeHtml(details.ticketNumber || "")}</div>
+    ${customer ? `<div class="who">${escapeHtml(customer)}</div>` : ""}
+    <div class="divider"></div>
+    ${details.model ? `<div class="row"><strong>Model</strong> ${escapeHtml(details.model)}</div>` : ""}
+    ${details.imei ? `<div class="row"><strong>IMEI</strong> ${escapeHtml(details.imei)}</div>` : ""}
+    ${details.damage ? `<div class="issue">Issue: ${escapeHtml(details.damage)}</div>` : ""}
+    ${fixLines.map((line) => `<div class="issue">Also: ${escapeHtml(line)}</div>`).join("")}
+    <div class="due"><span>${details.paymentStatus === "Paid" ? "Paid" : "Amount due"}</span><span>${escapeHtml(due)}</span></div>
+    ${details.devicePin ? `<div class="pin">PIN: ${escapeHtml(details.devicePin)}</div>` : ""}
+    ${report.notes ? `<div class="label-notes">${escapeHtml(report.notes)}</div>` : ""}`;
+
+  const ticketCss = `
+    .eyebrow { text-align: center; font-size: 14px; font-weight: 700; text-transform: uppercase; letter-spacing: 1px; }
+    .ticket { text-align: center; font-size: 28px; font-weight: 800; margin: 2mm 0; letter-spacing: 1px; }
+    .who { text-align: center; font-size: 16px; font-weight: 700; }
+    .row { font-size: 15px; font-weight: 600; margin: 1mm 0; }
+    .row strong { display: inline-block; min-width: 14mm; font-weight: 800; }
+    .issue { font-size: 17px; font-weight: 800; margin-top: 2mm; }
+    .pin { font-size: 20px; font-weight: 800; margin-top: 2mm; letter-spacing: 1px; }
+    .due { display: flex; justify-content: space-between; align-items: baseline; margin-top: 3mm; padding-top: 2mm; border-top: 2px solid #000; font-size: 18px; font-weight: 800; }
+    .due span:last-child { font-size: 22px; }
+    .label-notes { font-size: 14px; font-weight: 600; margin-top: 2mm; line-height: 1.35; white-space: pre-wrap; }
+    .sheet { break-after: page; page-break-after: always; }
+    .sheet:last-child { break-after: auto; page-break-after: auto; }`;
+
+  const createdAt = (toJsDate(report.createdAt) || new Date()).toLocaleString();
+  const location = report.location || details.location || "";
+  const estimatedPrice = details.estimatedPrice || report.paymentAmount;
+  const rows = [
+    ["Phone", report.customerPhone],
+    ["Model", details.model],
+    ["IMEI", details.imei],
+    ["Issue", details.damage],
+    ...(details.additionalFixes || [])
+      .filter((fix) => fix?.description || fix?.price)
+      .map((fix) => [
+        "Also fixing",
+        `${fix.description || "Fix"}${fix.price ? ` - ${formatMoney(Number(fix.price) || 0)}` : ""}`,
+      ]),
+    ["Estimated price", estimatedPrice ? formatMoney(Number(estimatedPrice) || 0) : ""],
+    ["Final price", details.finalPrice ? formatMoney(Number(details.finalPrice) || 0) : ""],
+    ["SIM in phone", details.hadSim ? "Yes" : ""],
+    ["SD card in phone", details.hadSdCard ? "Yes" : ""],
+    ["Loaner phone given", details.borrowedTempPhone ? "Yes" : ""],
+    ["Paid", details.paymentStatus],
+    ["Expected ready", details.dueDate],
+    ["Served by", staffInitials(report.servedBy)],
+  ]
+    .filter(([, value]) => value)
+    .map(([labelText, value]) => `<tr><td>${escapeHtml(labelText)}</td><td style="text-align:right">${escapeHtml(String(value))}</td></tr>`)
+    .join("");
+
+  const customerPage = `
+    ${receiptHeaderHtml(location, details.storeAddress)}
+    <div class="divider"></div>
+    <div class="eyebrow">Customer copy</div>
+    <div class="ticket">${escapeHtml(details.ticketNumber || "")}</div>
+    <div class="meta">${escapeHtml(createdAt)}</div>
+    ${receiptCustomerHtml(details.customerName, report.customerPhone, details.customerMobile, details.customerAddress)}
+    <div class="divider"></div>
+    <table>${rows}</table>
+    <div class="due"><span>${details.paymentStatus === "Paid" ? "Paid" : "Amount due"}</span><span>${escapeHtml(due)}</span></div>
+    ${report.notes ? `<div class="notes">${escapeHtml(report.notes)}</div>` : ""}
+    <div class="divider"></div>
+    <div class="thanks">Keep this ticket for pickup.</div>
+    ${receiptNotesHtml("repair")}
+    ${receiptFooterHtml(details.storeHours)}`;
+
+  openThermalReceipt(
+    `Repair ${details.ticketNumber || ""}`,
+    ticketCss,
+    `<section class="sheet">${customerPage}</section><section class="sheet">${label}</section>`,
+  );
 }
 
 // Customer rental receipt: device + SIM, numbers, dates, total, return date and
@@ -8974,6 +9231,7 @@ function InventoryPage({
   activeLocation,
   sessionRole,
   onSaveProduct,
+  onCommitStock,
   onRemoveProduct,
   rentalPhones = [],
   onSaveRentalPhone,
@@ -8999,11 +9257,14 @@ function InventoryPage({
     imeis: [],
   };
   const [form, setForm] = useState(emptyForm);
+  const [stockTouched, setStockTouched] = useState(false);
   const [search, setSearch] = useState("");
   const [restock, setRestock] = useState(null);
   const [selectedKey, setSelectedKey] = useState("");
 
   function updateField(name, value) {
+    if (name === "quantity" || name === "imeis") setStockTouched(true);
+    if (name === "location") setStockTouched(false);
     setForm((current) => {
       // On an existing item the quantity box is one store's stock, so switching
       // the store shows that store's count instead of carrying the last one over.
@@ -9018,12 +9279,19 @@ function InventoryPage({
 
   function addStock(product, { addQuantity, newImeis, location, barcode }) {
     const store = location || activeLocation;
-    // If the item had no barcode, the restock dialog collected one — save it too.
-    const barcodePatch = barcode && !product.barcode ? { barcode: String(barcode).trim() } : {};
-    const restocked = product.requiresImei
-      ? adjustStoreStock(product, store, { addImeis: newImeis })
-      : adjustStoreStock(product, store, { addQty: addQuantity });
-    onSaveProduct({ ...restocked, ...barcodePatch });
+    if (barcode && !product.barcode) onSaveProduct({ ...product, barcode: String(barcode).trim() });
+    const movementId = `restock:${crypto.randomUUID()}`;
+    onCommitStock?.([{
+      id: movementId,
+      productId: product.id,
+      location: store,
+      op: product.requiresImei ? "addImeis" : "addQty",
+      qty: Number(addQuantity) || 0,
+      imeis: newImeis || [],
+      requiresImei: Boolean(product.requiresImei),
+      sourceType: "restock",
+      sourceId: movementId,
+    }]);
   }
 
   function submit(event) {
@@ -9054,8 +9322,24 @@ function InventoryPage({
     // chosen store's, so the other stores' counts are carried over untouched.
     const existing = form.id ? products.find((item) => item.id === form.id) : null;
     const { quantity, imeis, location, ...fields } = form;
-    const base = { ...(existing || {}), ...fields, stock: existing ? productStockMap(existing) : {} };
-    onSaveProduct(setStoreStock(base, location, { quantity, imeis }));
+    const id = form.id || crypto.randomUUID();
+    const base = { ...(existing || {}), ...fields, id, stock: existing ? productStockMap(existing) : {} };
+    onSaveProduct(base);
+    const opening = !form.id && ((Number(quantity) || 0) > 0 || (imeis || []).length > 0);
+    if (stockTouched || opening) {
+      onCommitStock?.([{
+        id: `count:${id}:${Date.now()}`,
+        productId: id,
+        location,
+        op: "set",
+        qty: Number(quantity) || 0,
+        imeis: imeis || [],
+        requiresImei: Boolean(form.requiresImei),
+        sourceType: "count",
+        sourceId: id,
+      }]);
+    }
+    setStockTouched(false);
     setForm({ ...emptyForm, location: form.location });
   }
 
@@ -9067,6 +9351,7 @@ function InventoryPage({
     // Opens on this register's store; the Store box switches to another one.
     const store = activeLocation || storeLocations[0] || "";
     const entry = storeStockEntry(product, store);
+    setStockTouched(false);
     setForm({
       ...emptyForm,
       ...product,

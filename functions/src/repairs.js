@@ -67,38 +67,93 @@ function phoneLookupVariants(digits) {
   return Array.from(variants);
 }
 
+// Tickets are 100001 and up. On the phone and at the counter the "100" is
+// noise, so a customer keys 185 for ticket 100185. Keep the raw digits too:
+// an older ticket may actually be stored as 185.
+function ticketLookupCandidates(digits) {
+  const candidates = new Set([digits]);
+  if (digits.length > 0 && digits.length < 6) {
+    const value = Number.parseInt(digits, 10);
+    if (Number.isFinite(value) && value > 0) {
+      candidates.add(String(value));
+      if (value < 100000) candidates.add(String(100000 + value));
+    }
+  }
+  return Array.from(candidates);
+}
+
+function reportLookupDigits(report) {
+  return new Set([
+    digitsOnly(report.ticketDigits),
+    digitsOnly(report.customerPhoneDigits),
+    digitsOnly(report.details?.ticketDigits),
+    digitsOnly(report.details?.ticketNumber),
+    digitsOnly(report.details?.ticketNumberWas),
+    ...(report.ticketDigitsAll || []).map(digitsOnly),
+    ...(report.details?.ticketDigitsAll || []).map(digitsOnly),
+  ].filter(Boolean));
+}
+
+// Exact match on what the caller entered beats a short number that was
+// expanded to a 6-digit ticket (185 → 100185). Otherwise the newest repair wins.
+function lookupRank(report, digits) {
+  const exact = reportLookupDigits(report).has(digits) ? 1 : 0;
+  return exact * 1e15 + toMillis(report.createdAt);
+}
+
 async function findRepairByLookup(db, lookupValue) {
   const digits = lookupDigits(lookupValue);
   if (!digits) return null;
 
   const phoneCandidates = phoneLookupVariants(digits);
+  const ticketCandidates = ticketLookupCandidates(digits);
+  const reports = db.collection("reports");
 
+  // Each query stands alone. One missing index used to reject the whole
+  // lookup, so the phone line said the repair did not exist.
   const queries = [
-    db.collection("reports")
+    reports
       .where("type", "==", "repair")
       .where("customerPhoneDigits", "in", phoneCandidates)
       .orderBy("createdAt", "desc")
-      .limit(1),
-    db.collection("reports")
-      .where("type", "==", "repair")
-      .where("ticketDigits", "==", digits)
-      .orderBy("createdAt", "desc")
-      .limit(1),
-    // A repair moved off a clashing number still has the first one stuck to the
-    // phone, and that is the number the customer reads out. Matching only the
-    // current one told them their repair did not exist.
-    db.collection("reports")
-      .where("type", "==", "repair")
-      .where("ticketDigitsAll", "array-contains", digits)
-      .orderBy("createdAt", "desc")
-      .limit(1),
+      .limit(5),
+    reports.where("ticketDigits", "in", ticketCandidates).limit(10),
+    // The number printed on the phone, including one this repair has since
+    // moved off of. array-contains-any needs no orderBy, so it does not depend
+    // on the composite index that took the whole lookup down with it.
+    reports.where("ticketDigitsAll", "array-contains-any", ticketCandidates).limit(10),
+    reports.where("details.ticketNumber", "in", ticketCandidates).limit(10),
+    reports.where("details.ticketDigits", "in", ticketCandidates).limit(10),
+    reports.where("details.ticketNumberWas", "in", ticketCandidates).limit(10),
   ];
 
-  const snapshots = await Promise.all(queries.map((query) => query.get()));
-  const matches = snapshots
-    .flatMap((snapshot) => snapshot.docs.map(normalizeReportDoc))
-    .sort((left, right) => toMillis(right.createdAt) - toMillis(left.createdAt));
+  const settled = await Promise.all(queries.map(async (query) => {
+    try {
+      return await query.get();
+    } catch (error) {
+      return error;
+    }
+  }));
 
+  const snapshots = settled.filter((result) => result && Array.isArray(result.docs));
+  if (!snapshots.length) {
+    const failure = settled.find((result) => result instanceof Error);
+    throw failure || new Error("Repair lookup failed");
+  }
+
+  const seen = new Set();
+  const matches = [];
+  for (const snapshot of snapshots) {
+    for (const doc of snapshot.docs) {
+      const report = normalizeReportDoc(doc);
+      if (report.type && report.type !== "repair") continue;
+      if (!report.id || seen.has(report.id)) continue;
+      seen.add(report.id);
+      matches.push(report);
+    }
+  }
+
+  matches.sort((left, right) => lookupRank(right, digits) - lookupRank(left, digits));
   return matches[0] || null;
 }
 
@@ -108,4 +163,5 @@ module.exports = {
   digitsOnly,
   findRepairByLookup,
   normalizeReportDoc,
+  ticketLookupCandidates,
 };

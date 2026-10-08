@@ -55,8 +55,25 @@ service cloud.firestore {
     }
 
     match /products/{productId} {
-      allow read, create, update: if signedIn();
+      allow read, create: if signedIn();
+      // Name, price, and barcode can change from a register. On-hand stock
+      // cannot: a sale updates one store through postStockMovements, which
+      // uses the admin SDK and does not go through these rules.
+      allow update: if signedIn()
+        && request.resource.data.get('stock', {}) == resource.data.get('stock', {})
+        && request.resource.data.get('quantity', 0) == resource.data.get('quantity', 0)
+        && request.resource.data.get('imeis', []) == resource.data.get('imeis', []);
       allow delete: if isAdmin();
+    }
+
+    match /stockMovements/{movementId} {
+      allow read: if signedIn();
+      allow write: if false;
+    }
+
+    match /inventoryBalances/{balanceId} {
+      allow read: if signedIn();
+      allow write: if false;
     }
 
     match /customers/{customerId} {
