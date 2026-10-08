@@ -392,6 +392,69 @@ export const InviteMemberCommand = z.object({
   storeId: Uuid.optional(),
 });
 
+// ---------------------------------------------------------------- read models
+export const CatalogItem = z.object({
+  variantId: Uuid,
+  productId: Uuid,
+  sku: z.string(),
+  name: z.string(),
+  category: z.string(),
+  barcode: z.string().nullable(),
+  priceCents: Cents,
+  serialized: z.boolean(),
+});
+export type CatalogItem = z.infer<typeof CatalogItem>;
+
+export const StockBalance = z.object({
+  variantId: Uuid,
+  storeId: Uuid,
+  sku: z.string(),
+  name: z.string(),
+  serialized: z.boolean(),
+  qty: z.number().int(),
+  version: z.number().int(),
+});
+export type StockBalance = z.infer<typeof StockBalance>;
+
+export const StockMovement = z.object({
+  id: Uuid,
+  storeId: Uuid,
+  variantId: Uuid,
+  kind: z.string(),
+  qtyDelta: z.number().int(),
+  balanceAfter: z.number().int(),
+  reason: z.string().nullable(),
+  sourceType: z.string().nullable(),
+  sourceId: z.string().nullable(),
+  createdAt: z.string(),
+});
+
+export const LedgerEntry = z.object({
+  id: Uuid,
+  amountCents: Cents,
+  kind: z.string(),
+  reason: z.string().nullable(),
+  orderId: Uuid.nullable(),
+  createdAt: z.string(),
+});
+export type LedgerEntry = z.infer<typeof LedgerEntry>;
+
+export const CreateSaleResult = z.object({
+  order: Order,
+  /** One per card tender: the register then calls /payments/:id/confirm to run the terminal. */
+  pendingPayments: z.array(Payment),
+});
+export type CreateSaleResult = z.infer<typeof CreateSaleResult>;
+
+export const WorkOrderPrint = z.object({
+  workOrder: WorkOrder,
+  devicePasscode: z.string().nullable(),
+  store: z.object({ name: z.string(), address: z.string(), phone: z.string(), hours: z.string(), timeZone: z.string() }),
+  company: z.object({ name: z.string(), phone: z.string(), web: z.string(), currency: z.string() }),
+  receiptNote: z.string().nullable(),
+});
+export type WorkOrderPrint = z.infer<typeof WorkOrderPrint>;
+
 export const Me = z.object({
   userId: Uuid,
   displayName: z.string(),
