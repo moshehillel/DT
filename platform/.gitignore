@@ -1,0 +1,12 @@
+node_modules/
+dist/
+coverage/
+.env
+.env.*
+!.env.example
+*.tsbuildinfo
+# Throwaway Postgres data dirs created by the integration test harness
+.pg-test/
+# Firestore exports contain customer data — never commit them
+tools/migrate-firestore/input/
+tools/migrate-firestore/output/
